@@ -61,3 +61,18 @@
   - 稀疏用户基线表现差（844/789 r2<0）如实记录为 M2 输入，不调指标口径粉饰
 - 未决问题：设备点位表与 CT/PT 倍率待确认；指南附件（日级指标/启动段契约）待补充；稀疏用户改善待 M2
 - 相关文件/分支：configs/default.yaml、configs/time_filters.json、nilm/preprocess/align.py、nilm/analysis/identifiability.py、nilm/data_io/{csv_source,validator}.py、outputs/（不入库）；分支 arena/019ffa35-nilm-new
+
+## [2026-08-13] 会话纪要（第 5 次）
+- 目标：根据 docs/多数据源用户数据批量合并脚本-功能需求文档.pdf 增加数据合并脚本
+- 完成项：
+  - 拉取最新版本（含用户推送的需求文档 c8cb164）；诊断并恢复被外部重置的本地分支指针（git reset --hard FETCH_HEAD）；重建 .venv 环境
+  - 实现 nilm/data_io/merge.py（两级串行：内源迭代两两合并 → 跨源同用户同通道合并）+ scripts/merge_user_data.py CLI（--sources 多源必填，--output-root/--log-dir/--no-keep-original 可选）
+  - 需求条款逐条落地：RE_BUS 正则复用（不放宽）、闭区间重叠即终止整组并告警（不强制合并/不覆盖）、新文件仅更新起止时间、输出复刻数据源/用户目录层级、原始数据只读
+  - 输出四件套：结构化合并 CSV、运行日志（区分内源/跨源）、告警日志（源路径/用户目录/文件名/冲突区间）、merge_report.json
+  - 验证：6 项合并专项测试 + 全量 71 项通过（含解耦守卫）；真实数据实测 trains+infers 两源：内源 10 组 OK，5 个跨源组全部检出完全重合并 SKIPPED_OVERLAP
+- 关键决策：
+  - 重叠跳过语义取「整组跳过不产出」（需求原文），中间产物一并清理；跨源产物独立 cross_source/ 分区
+  - 时间列名保持原样（event_time/time），重复时间戳去重保留先出现者
+  - 合并模块落位 data_io（数据接入域），只依赖 common，解耦守卫通过
+- 未决问题：点位表/倍率待确认（沿用上轮）；合并脚本暂无 M2 前置依赖，可随时用于多段数据预处理
+- 相关文件/分支：nilm/data_io/merge.py、scripts/merge_user_data.py、tests/test_merge.py、README；分支 arena/019ffa35-nilm-new

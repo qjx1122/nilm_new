@@ -25,8 +25,16 @@ python3 -m venv .venv
 .venv/bin/python scripts/run_batch_users.py --time-filter-config <cfg.json> --user-key <device>_<user>
 
 # 其他选项：--stage train|infer|all   --no-resume   --data-root   --output-root   --base-config
-.venv/bin/python -m pytest tests/ -q             # 65 项测试（含解耦守卫）
+
+# 多数据源用户数据批量合并（先内源合并、后跨源合并，重叠告警跳过，原始数据只读）
+.venv/bin/python scripts/merge_user_data.py --sources <源1> <源2> [<源3> ...] \
+    [--output-root outputs/merged] [--log-dir <日志目录>] [--no-keep-original]
+
+.venv/bin/python -m pytest tests/ -q             # 71 项测试（含解耦守卫与合并逻辑）
 ```
+
+合并脚本输出：`<output-root>/<数据源名>/<终端号_用户号>/` 复刻原层级（阶段一结果）+
+`cross_source/<终端号_用户号>/`（阶段二跨源结果）+ `logs/`（运行日志、告警日志、merge_report.json）。
 
 ## 数据目录结构（指南 §3.1，原始数据只读、不入库）
 
