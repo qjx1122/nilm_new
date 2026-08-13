@@ -74,13 +74,21 @@ def estimate_time_offset(pbus: pd.Series, target: pd.Series,
 
 
 def align_frames(bus: pd.DataFrame, branch_or_target, min_overlap: float = 0.5):
-    """把 15min 总线与分路（DataFrame 或 Series）对齐到同一时间网格（内连接）。"""
+    """把 15min 总线与分路（DataFrame 或 Series）对齐到同一时间网格（内连接）。
+
+    门禁口径（按实测数据修订，记录于 STATUS.md 决策记录）：
+    采用「分路标签点被总线覆盖率」= |交集|/|分路|，而非对称 Jaccard |∩|/|∪|——
+    总线稀疏度远高于分路时 Jaccard 会系统性偏低，但标签点全覆盖即满足训练需要；
+    真正的时钟错位（如 7min 偏移）会使该覆盖率趋近 0，仍可检出（§5.3）。
+    """
     b_index = branch_or_target.index
     inter = bus.index.intersection(b_index)
     union = bus.index.union(b_index)
-    overlap = float(len(inter) / len(union)) if len(union) else 0.0
-    if overlap < min_overlap:
-        raise ValueError(f"总线与分路时间重叠率仅 {overlap:.2%}（阈值 {min_overlap:.2%}），"
+    jaccard = float(len(inter) / len(union)) if len(union) else 0.0
+    branch_coverage = float(len(inter) / len(b_index)) if len(b_index) else 0.0
+    if branch_coverage < min_overlap:
+        raise ValueError(f"总线对分路标签点的重叠率仅 {branch_coverage:.2%}（阈值 {min_overlap:.2%}），"
                          "请检查时间同步/时区（指南 §5.3：先找证据，不改时间戳）")
-    log.info("对齐后公共时间点: %d（重叠率 %.2f%%）", len(inter), overlap * 100)
+    log.info("对齐后公共时间点: %d（分路覆盖率 %.2f%%，Jaccard %.2f%%）",
+             len(inter), branch_coverage * 100, jaccard * 100)
     return bus.loc[inter], branch_or_target.loc[inter]

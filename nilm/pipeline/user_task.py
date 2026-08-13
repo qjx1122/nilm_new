@@ -98,8 +98,12 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if not field_map:
             raise UserTaskError(Status.SCHEMA_UNCONFIRMED,
                                 "未配置 bus_field_map，Ch 字段物理含义未确认（§3.2/§4）")
-        bus_raw, bus_schema = CsvBusLoader().load(scan.bus_files, field_map)
-        branch_raw, branch_schema = CsvBranchLoader().load(scan.branch_files)
+        dcfg = base_cfg.get("data", {})
+        sentinels = dcfg.get("sentinel_values")
+        bus_raw, bus_schema = CsvBusLoader().load(
+            scan.bus_files, field_map, sentinels=sentinels,
+            derive_phase_from_ptotal=bool(dcfg.get("derive_phase_from_ptotal", False)))
+        branch_raw, branch_schema = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
         fatal = [i for i in bus_schema["issues"] if "SCHEMA_UNCONFIRMED" in i or "不存在" in i or "缺少列" in i]
         if fatal:
             raise UserTaskError(Status.SCHEMA_UNCONFIRMED, "; ".join(fatal))
@@ -125,7 +129,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         target = build_target(branch_c, target_cols)
 
         # —— 时间对齐（重叠率门禁；偏移只报告不改戳）
-        bus_al, branch_al = align_frames(bus15, branch_c)
+        bus_al, branch_al = align_frames(bus15, branch_c,
+                                         min_overlap=float(pp.get("min_overlap", 0.5)))
         target = target.loc[branch_al.index]
         _dump(out / "time_offset.json",
               estimate_time_offset(bus_total(bus_al), target))
@@ -255,7 +260,11 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
 
         field_map = base_cfg.get("bus_field_map") or user_cfg.get("bus_field_map") or {}
-        bus_raw, bus_schema = CsvBusLoader().load(scan.bus_files, field_map)
+        dcfg = base_cfg.get("data", {})
+        sentinels = dcfg.get("sentinel_values")
+        bus_raw, bus_schema = CsvBusLoader().load(
+            scan.bus_files, field_map, sentinels=sentinels,
+            derive_phase_from_ptotal=bool(dcfg.get("derive_phase_from_ptotal", False)))
         fatal = [i for i in bus_schema["issues"] if "SCHEMA_UNCONFIRMED" in i or "不存在" in i or "缺少列" in i]
         if fatal:
             raise UserTaskError(Status.SCHEMA_UNCONFIRMED, "; ".join(fatal))
@@ -273,6 +282,8 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         ispec = user_cfg.get("infer") or {}
         if ispec.get("include") or ispec.get("exclude"):
             bus15 = filter_dataframe(bus15, ispec.get("include"), ispec.get("exclude"))
+        if len(bus15) == 0:
+            raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, "infer 时间过滤后无数据")
 
         fc = base_cfg.get("features", {})
         feat = build_features(bus15, lags=tuple(fc.get("lags", [1, 2, 3, 4])),
@@ -306,7 +317,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         target_vals = pd.Series(np.nan, index=valid.index)
         offline_metrics = None
         if scan.branch_files:  # 分路仅用于离线评估，不参与生产推理（§3.1）
-            branch_raw, _ = CsvBranchLoader().load(scan.branch_files)
+            branch_raw, _ = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
             branch_c = Cleaner(clip_negative=not allow_negative).transform(branch_raw)
             tcols = resolve_target_cols(user_cfg.get("target_col"), branch_c)
             t = build_target(branch_c, tcols).reindex(valid.index)

@@ -31,10 +31,10 @@ class QualityError(RuntimeError):
 
 def quality_report(df: pd.DataFrame, kind: str, points_per_day: int,
                    allow_negative_power: bool = False) -> dict:
-    """生成 §6 四项指标 + 明细。"""
+    """生成 §6 四项指标 + 明细。覆盖率按真实日历跨度计算（含设备离线缺口）。"""
     n_rows = len(df)
-    n_days = max(1, n_rows / points_per_day)
-    expected = n_days * points_per_day
+    span_days = int((df.index.max() - df.index.min()).days) + 1 if n_rows else 0
+    expected = span_days * points_per_day
 
     missing_rate = float(df.isna().mean().mean()) if n_rows else 1.0
     coverage_rate = float(min(1.0, n_rows / expected)) if expected else 0.0
@@ -58,7 +58,7 @@ def quality_report(df: pd.DataFrame, kind: str, points_per_day: int,
     return {
         "kind": kind,
         "n_rows": n_rows,
-        "n_days_approx": round(float(n_days), 2),
+        "n_days_approx": span_days,
         "expected_points_per_day": points_per_day,
         "missing_rate": round(missing_rate, 6),
         "outlier_rate": round(outlier_rate, 6),

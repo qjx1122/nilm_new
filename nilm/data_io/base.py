@@ -25,5 +25,5 @@ class BranchLoader(ABC):
     """分路侧加载器：输出 time 索引 + p1..pN 列（§3.3）。"""
 
     @abstractmethod
-    def load(self, files: Sequence[Path]) -> tuple[pd.DataFrame, dict]:
+    def load(self, files: Sequence[Path], sentinels: list | None = None) -> tuple[pd.DataFrame, dict]:
         """返回 (标准 schema DataFrame[15min], schema 报告 dict)。"""

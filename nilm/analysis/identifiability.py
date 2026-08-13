@@ -88,8 +88,13 @@ def identifiability_report(bus: pd.DataFrame, target: pd.Series,
     rep["target_std"] = float(df["target"].std())
     if on_rate < 0.01:
         risks.append("BRANCH_LONG_OFF")          # 长期关闭
-    if float(df["target"].std()) < max(1e-3, 0.01 * mean_pbus):
-        risks.append("BRANCH_LOW_VARIANCE")      # 低方差
+    # 低方差 = 目标近似恒定（变异系数 CV < 5%）。
+    # 不用总线均值的绝对阈值：总线倍率未确认（DATA_UNIT_UNKNOWN）时绝对阈值失真，
+    # 且间歇性负荷（大量 0 值）天然 CV 高，不会误报（实测数据校准，见 STATUS.md）。
+    t_mean = float(df["target"].mean())
+    rep["target_cv"] = float(df["target"].std() / (abs(t_mean) + 1e-9))
+    if rep["target_cv"] < 0.05:
+        risks.append("BRANCH_LOW_VARIANCE")      # 低方差（近似恒定负荷）
     corr = rep["pearson"]
     if corr == corr and abs(corr) < 0.3:
         risks.append("WEAK_BUS_CORRELATION")     # 与总线弱相关（可能大量未监测负荷）
