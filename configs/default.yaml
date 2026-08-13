@@ -1,0 +1,47 @@
+# NILM 负荷辨识流水线 —— 默认实验配置
+# 一次实验 = 一份 YAML + 一个 outputs/<exp_name>/<timestamp>/ 产物目录
+
+experiment_name: default
+seed: 42
+output_dir: outputs
+
+data:
+  bus_path: data/raw/bus          # 母线原始时序（288 点/天，5min）：文件或含 *.csv 的目录
+  branch_path: data/raw/branch    # 分路原始时序（96 点/天，15min）
+  timestamp_col: timestamp
+  # 原始列名 -> 标准列名 的映射（上游格式变化只改这里，不改代码）
+  bus_column_map:
+    U_A: u_a
+    U_B: u_b
+    U_C: u_c
+    I_A: i_a
+    I_B: i_b
+    I_C: i_c
+    P: p_total
+    PF_A: pf_a
+    PF_B: pf_b
+    PF_C: pf_c
+  branch_column_map: {}           # 例如 { "回路1": "branch_1" }
+
+preprocess:
+  clip_negative: true
+  max_gap_interp: 2               # 允许插值的最长连续缺口（点数）
+  train_frac: 0.7
+  val_frac: 0.15                  # test = 1 - train - val（按时间顺序，防泄漏）
+
+features:
+  lags: [1, 2, 3, 4]
+  rolling_windows: ["1h", "6h", "24h"]
+
+# 多模型对比：新增模型 = 加一行（实现注册到 MODEL_REGISTRY 后）
+models:
+  - name: history_profile
+  - name: proportional
+  - name: ridge
+    params: { alpha: 1.0 }
+
+constraints:                      # 物理约束后处理（模型无关）
+  nonnegative: true
+  sum_consistency: true
+
+metrics: [mae, rmse, r2, sae]

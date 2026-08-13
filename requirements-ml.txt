@@ -1,0 +1,5 @@
+# 模型扩展依赖（M2 起按需安装：树模型 / 深度模型 / 绘图）
+scikit-learn>=1.3
+lightgbm>=4.0
+torch>=2.0
+matplotlib>=3.7
