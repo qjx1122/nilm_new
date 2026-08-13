@@ -1,7 +1,8 @@
 """common.contracts：文件名正则与 user_key 契约（指南 §3.2/§3.3，正则不得放宽）。"""
 
-from nilm.common.contracts import (RE_BR, RE_BUS, RE_USER_DIR, Status,
-                                   parse_branch_filename, parse_bus_filename,
+from nilm.common.contracts import (RE_BR, RE_BUS, RE_MERGE_FILE, RE_USER_DIR,
+                                   Status, parse_branch_filename,
+                                   parse_bus_filename, parse_merge_filename,
                                    split_user_key)
 
 
@@ -41,3 +42,23 @@ def test_user_key_and_status_codes():
                  "INVALID_FILENAME", "IDENTITY_MISMATCH", "INSUFFICIENT_TIME_RANGE",
                  "DATA_QUALITY_FAILED", "MODEL_NOT_FOUND"]:
         assert getattr(Status, code) == code
+
+
+def test_merge_filename_strict_format():
+    """合并脚本严格格式（需求文档 §2.2）：不允许任何后缀。"""
+    # 符合：无后缀标准格式
+    m = parse_merge_filename("e241_800080252844_4206894986488-Ch1-260604-260611.csv")
+    assert m is not None
+    assert (m.device, m.user, m.ch, m.start, m.end) == \
+        ("800080252844", "4206894986488", 1, "260604", "260611")
+    assert m.suffix == ""
+    # 不符合：带 -1 / -infer 后缀（指南 RE_BUS 允许，但合并契约不允许）
+    assert parse_merge_filename("e241_800080252844_4206894986488-Ch1-260604-260611-1.csv") is None
+    assert parse_merge_filename("e241_800080252844_4206894986488-Ch1-260604-260611-infer.csv") is None
+    assert RE_MERGE_FILE.match("e241_d_u-Ch1-260604-260611-1.csv") is None
+    # 不符合：其它畸形格式
+    assert parse_merge_filename("e241_d_u-Ch1-260604-260611.txt") is None
+    assert parse_merge_filename("e241_d_u-Ch1-260604.csv") is None
+    assert parse_merge_filename("4206602981958-250710-260628.csv") is None  # 分路文件
+    # 对照组：指南 RE_BUS 仍接受后缀（两个契约互不放宽）
+    assert parse_bus_filename("e241_d_u-Ch1-260604-260611-1.csv") is not None

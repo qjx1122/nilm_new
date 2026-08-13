@@ -60,10 +60,35 @@ def test_ranges_overlap():
 def test_discover_source(tmp_path):
     srcA, _, _ = _setup_sources(tmp_path)
     found, skipped = discover_source(srcA)
-    assert len(found) == 5                     # 5 个 RE_BUS 文件
+    assert len(found) == 5                     # 5 个严格格式文件
     assert len(skipped) == 1                   # 分路 CSV 不参与合并
     assert all(isinstance(f, BusFile) for f in found)
     assert {f.group_key for f in found} == {(UK, 1), (UK, 2), (("8002_9002"), 1)}
+
+
+def test_discover_rejects_suffixed_files(tmp_path):
+    """带 -1/-infer 后缀的文件不符合合并严格格式，必须排除在合并对象之外。"""
+    src = tmp_path / "srcS"
+    uk = src / UK
+    # 合规：严格格式
+    _write_bus_csv(uk, 1, "260101", "260110", _day_rows("2026-01-01", 3))
+    # 不合规：同区间但带后缀（若误入合并会造成重复数据）
+    _write_bus_csv(uk, 1, "260111", "260120", _day_rows("2026-01-11", 3), suffix="-1")
+    _write_bus_csv(uk, 2, "260101", "260105", _day_rows("2026-01-01", 2), suffix="-infer")
+
+    found, skipped = discover_source(src)
+    assert len(found) == 1                     # 只有严格格式文件是合并对象
+    assert found[0].ch == 1 and found[0].start.strftime("%y%m%d") == "260101"
+    assert len(skipped) == 2                   # 两个带后缀文件被跳过
+    assert all("-1.csv" in p.name or "-infer.csv" in p.name for p in skipped)
+
+    # 合并只消费严格格式文件：Ch1 组内只剩单文件，不会与 -1 后缀文件合并
+    out = tmp_path / "merged"
+    report = run_merge([src], output_root=out)
+    groups = report["phase1_intra_source"]["srcS"]
+    assert all(g["status"] == "OK" for g in groups)
+    merged_names = [p.name for p in (out / "srcS" / UK).glob("*.csv")]
+    assert merged_names == ["e241_8001_9001-Ch1-260101-260110.csv"]  # 原名保留，无合并产物
 
 
 def test_two_level_merge_end_to_end(tmp_path):

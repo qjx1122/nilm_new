@@ -76,3 +76,17 @@
   - 合并模块落位 data_io（数据接入域），只依赖 common，解耦守卫通过
 - 未决问题：点位表/倍率待确认（沿用上轮）；合并脚本暂无 M2 前置依赖，可随时用于多段数据预处理
 - 相关文件/分支：nilm/data_io/merge.py、scripts/merge_user_data.py、tests/test_merge.py、README；分支 arena/019ffa35-nilm-new
+
+## [2026-08-13] 会话纪要（第 6 次）
+- 目标：修改合并脚本——待合并文件名必须严格遵守 e241_<终端号>_<用户号>-Ch<通道号>-<起>-<止>.csv（不带后缀）；带 -1/-infer 后缀的文件不符合格式
+- 完成项：
+  - contracts.py 新增 RE_MERGE_FILE 严格正则（无后缀）与 parse_merge_filename；与指南 RE_BUS（允许后缀，流水线数据接入用）两契约并存、互不放宽
+  - merge.py discover_source 改用严格格式解析：带后缀文件告警「不符合合并严格格式（需求文档 §2.2）」并排除在合并对象之外
+  - 新增 2 项测试：严格格式契约对照（含与 RE_BUS 的行为差异）、后缀文件排除端到端（防止 -1 后缀重复数据混入合并）
+  - 验证：73 项测试全过；真实数据实测——10 个总线文件均带 -1 后缀，全部正确拒绝，0 合并产物
+- 关键决策：
+  - 采用独立严格契约而非改写 RE_BUS：指南 §0 规定 RE_BUS 不得放宽/改写，合并严格性是需求文档 §2.2 的独立契约，两者并存
+  - 不改名/不拷贝原始数据：带后缀文件只告警跳过（指南 §13 原始数据只读）
+- 未决问题：
+  - 当前 data/ 真实文件全部带 -1 后缀，若需实际合并，须由上游导出方改用严格格式命名（或对副本重命名后再入合并源目录）
+- 相关文件/分支：nilm/common/contracts.py、nilm/data_io/merge.py、tests/test_contracts.py、tests/test_merge.py、README；分支 arena/019ffa35-nilm-new

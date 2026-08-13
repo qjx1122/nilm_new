@@ -73,6 +73,25 @@ def parse_branch_filename(name: str) -> BranchFileName | None:
     return BranchFileName(m["user"], m["start"], m["end"], m["suffix"], name)
 
 
+# ---------------------------------------------------------------- 合并脚本文件名契约
+# 《多数据源用户数据批量合并脚本-功能需求文档》§2.2 严格格式：
+#   e241_<终端号>_<用户号>-Ch<通道号>-<起始时间>-<截止时间>.csv（无任何后缀）
+# 与 RE_BUS（指南 §3.2，允许可选后缀）是两个不同契约：合并脚本必须严格遵守本格式，
+# 带 -1 / -infer 等后缀的文件不是合并对象（示例：...-260604-260611-1.csv 不符合）。
+RE_MERGE_FILE = re.compile(
+    r"^e241_(?P<device>[^_]+)_(?P<user>[^-]+)"
+    r"-Ch(?P<ch>\d+)-(?P<start>\d{6})-(?P<end>\d{6})\.csv$"
+)
+
+
+def parse_merge_filename(name: str) -> BusFileName | None:
+    """严格合并格式解析：带后缀或不符格式一律返回 None。"""
+    m = RE_MERGE_FILE.match(name)
+    if not m:
+        return None
+    return BusFileName(m["device"], m["user"], int(m["ch"]), m["start"], m["end"], "", name)
+
+
 # ---------------------------------------------------------------- 状态码（§13 + 扩展）
 class Status:
     """批量执行状态码。前 8 个为指南 §13 原文规定，其余为工程扩展（见决策记录）。"""

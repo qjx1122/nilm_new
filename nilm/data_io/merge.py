@@ -24,7 +24,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from nilm.common.contracts import RE_USER_DIR, parse_bus_filename
+from nilm.common.contracts import (RE_USER_DIR, parse_bus_filename,
+                                   parse_merge_filename)
 from nilm.common.logging import get_logger
 
 log = get_logger("data_io.merge")
@@ -78,7 +79,7 @@ def discover_source(source: Path) -> tuple[list[BusFile], list[Path]]:
     """扫描单个数据源根目录（§2.1 层级）。
 
     返回 (合法待合并文件列表, 跳过的文件列表)。
-    只认「终端号_用户号」用户目录与 RE_BUS 命名文件；其余文件不参与合并。
+    只认「终端号_用户号」用户目录与**严格格式**文件名（无后缀）；其余文件不参与合并。
     """
     if not source.is_dir():
         raise FileNotFoundError(f"数据源目录不存在: {source}")
@@ -89,8 +90,11 @@ def discover_source(source: Path) -> tuple[list[BusFile], list[Path]]:
             log.warning("[%s] 跳过非法用户目录: %s", source.name, user_dir.name)
             continue
         for f in sorted(user_dir.glob("*.csv")):
-            meta = parse_bus_filename(f.name)
+            meta = parse_merge_filename(f.name)
             if meta is None:
+                if parse_bus_filename(f.name) is not None:
+                    log.warning("[%s] 文件名带后缀，不符合合并严格格式（需求文档 §2.2），不参与合并: %s",
+                                source.name, f.name)
                 skipped.append(f)
                 continue
             if user_dir.name != f"{meta.device}_{meta.user}":
