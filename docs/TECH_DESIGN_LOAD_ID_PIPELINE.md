@@ -320,3 +320,31 @@ class RidgeDisaggregator(BaseModel): ...
 | 缺失/坏点 | 指标虚高或训练不稳 | 质量门禁 + 缺口标记 + 长缺口剔除 |
 | 数据泄漏（滑窗/滞后） | 离线虚高、上线崩盘 | dataset 层强制窗口不跨 split、特征仅用过去信息 |
 | 分路数量/拓扑变更 | 输出维度漂移 | schema 与模型输出维度由配置声明，变更走配置而非改代码 |
+
+---
+
+## 11. V2.1 指南对齐修订（v1.1，2026-08-13）
+
+依据《工商业负荷辨识算法开发指南 V2.1》（docs/工商业负荷辨识算法开发指南.pdf，接口最高优先级约束）修订：
+
+| 指南条款 | 落地实现 |
+| --- | --- |
+| §3.1 数据目录 | `data/trains|infers/<device>_<user>/`，user_key=<device>_<user> 为独立训练/推理单元（`data_io/discovery.py`） |
+| §3.2/§3.3 文件名正则 | `common/contracts.py` 原文照抄 RE_BUS/RE_BR/RE_USER_DIR，代码不得放宽；身份一致性校验（IDENTITY_MISMATCH） |
+| §4 字段标准化 | 内部字段名 ua/…/pfc（`common/schema.py`）；ChN 物理含义由 `bus_field_map` 配置确认；倍率配置化；data_schema_report.json / data_quality_report.html |
+| §5 时间同步 | 15min 统一尺度；聚合策略可配置且落盘记录（agg_strategy.json）；τ 时滞仅报告证据不改时间戳；严禁分路标签上采样 |
+| §6 质量控制 | quality_score/missing_rate/outlier_rate/coverage_rate 四项指标 + 门禁 |
+| §8 特征工程 | 统计/差分/滚动/三相结构/日历 sin-cos；FFT/THD 禁用（代码中不存在） |
+| §9 可辨识性 | `analysis/identifiability.py` 训练前强制执行，产出 JSON 报告与 IDENTIFIABILITY_LOW 风险标记 |
+| §10 样本构建 | L=96 滑窗，默认 Seq2Seq 可配 Seq2Point；窗口索引/起止时间落盘 |
+| §11/§12.4 切分 | 四种策略（日粒度、不打散时间点）；include/exclude 闭区间、日期扩展、train→val→test 锚定优先；Scaler 仅 Train 拟合 |
+| §12 用户 JSON | `pipeline/user_config.py`：user_key 键优先级、`_` 前缀保留键、字段范围校验、user_id 显式映射层 |
+| §12 入口 | `scripts/run_batch_users.py --time-filter-config <json>`（原文入口）；`--user-key` 单用户同路径 |
+| §13 批量执行 | `pipeline/batch.py`：状态码（INVALID_USER_DIR/DATA_MISSING_BUS/…/MODEL_NOT_FOUND）、单用户失败隔离、_DONE 断点续跑、原始数据只读；状态表含 user_id 字段 |
+| §2.3/§0 输出契约 | `predictions/inference_result.csv`（timestamp/user_id/target/pred/pred_state）；开态后处理 on_thr_w/post_min_on/post_fill_short_off |
+| 解耦隔离 | 依赖方向静态守卫测试 `tests/test_decoupling.py`：业务模块只依赖 common，仅 pipeline 编排层组合全部 |
+
+**接口待确认项**（指南 §0 同口径处理）：
+- 日级指标「25 字段」与字段清单 23 项的差异，按已列 23 项之外的信息缺失处理，待附件补充；
+- 启动段字段 being_time 已按指南更正为 begin_time，但启动段完整字段契约待附件确认；
+- target_col 缺省回退链指南未明确，工程实现为 p1 → 首个 pN 列并记录日志。
