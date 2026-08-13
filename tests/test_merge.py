@@ -138,6 +138,49 @@ def test_cross_source_merge_when_no_overlap(tmp_path):
     assert g["status"] == "OK" and g["action"] == "merged"
 
 
+def test_single_source_user_passthrough_to_merged_dir(tmp_path):
+    """用户目录仅在 1 个源中存在（另一源无此用户目录）→ 其文件直接作为合并后用户数据文件。"""
+    srcA, srcB = tmp_path / "srcA", tmp_path / "srcB"
+    # userX：两源都有（走跨源合并）
+    _write_bus_csv(srcA / UK, 1, "260101", "260110", _day_rows("2026-01-01", 4))
+    _write_bus_csv(srcB / UK, 1, "260201", "260210", _day_rows("2026-02-01", 4))
+    # userB：仅 srcA 有（srcB 中不存在该用户目录）
+    _write_bus_csv(srcA / "8003_9003", 1, "260301", "260305", _day_rows("2026-03-01", 3),
+                   device="8003", user="9003")
+
+    out = tmp_path / "merged"
+    report = run_merge([srcA, srcB], output_root=out)
+
+    # userB 的文件原样直接进入合并后用户数据目录（原名、内容不变）
+    passed = out / "cross_source" / "8003_9003" / "e241_8003_9003-Ch1-260301-260305.csv"
+    assert passed.exists()
+    assert len(pd.read_csv(passed)) == 3
+    g = [g for g in report["phase2_cross_source"]["8003_9003"] if g["ch"] == 1][0]
+    assert g["status"] == "OK" and g["action"] == "copied_single_source"
+    assert g["sources"] == ["srcA"]
+
+    # userX 仍是真正的跨源合并
+    assert (out / "cross_source" / UK / f"e241_{DEV}_{USR}-Ch1-260101-260210.csv").exists()
+    gx = [g for g in report["phase2_cross_source"][UK] if g["ch"] == 1][0]
+    assert gx["action"] == "merged" and gx["sources"] == ["srcA", "srcB"]
+
+
+def test_single_source_passthrough_with_no_keep_original(tmp_path):
+    """--no-keep-original 时单源独有用户仍必须出现在合并后目录（透传不依赖单源保留选项）。"""
+    srcA, srcB = tmp_path / "srcA", tmp_path / "srcB"
+    _write_bus_csv(srcA / UK, 1, "260101", "260110", _day_rows("2026-01-01", 2))
+    _write_bus_csv(srcB / UK, 1, "260201", "260210", _day_rows("2026-02-01", 2))
+    _write_bus_csv(srcA / "8003_9003", 2, "260301", "260305", _day_rows("2026-03-01", 2),
+                   device="8003", user="9003")
+
+    out = tmp_path / "merged"
+    run_merge([srcA, srcB], output_root=out, keep_original=False)
+    # 单源独有用户（且为单文件组）依然透传到合并后目录
+    assert (out / "cross_source" / "8003_9003" / "e241_8003_9003-Ch2-260301-260305.csv").exists()
+    # 跨源合并照常
+    assert (out / "cross_source" / UK / f"e241_{DEV}_{USR}-Ch1-260101-260210.csv").exists()
+
+
 def test_original_sources_readonly(tmp_path):
     """原始数据源只读：合并后源目录文件清单不变（§5/指南 §13）。"""
     srcA, srcB, _ = _setup_sources(tmp_path)

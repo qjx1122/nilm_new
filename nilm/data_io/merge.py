@@ -204,7 +204,9 @@ def run_merge(sources: list[str | Path], output_root: str | Path,
     输出结构（§5 目录结构约束）::
 
         <output_root>/<数据源名>/<终端号_用户号>/...   # 阶段一：单源合并结果（复刻原层级）
-        <output_root>/cross_source/<终端号_用户号>/...  # 阶段二：跨源合并结果
+        <output_root>/cross_source/<终端号_用户号>/...  # 阶段二：合并后用户数据目录——
+                                                       #   跨源合并结果；仅存在于单一数据源的用户，
+                                                       #   其文件直接作为合并后用户数据文件放入
         <output_root>/logs/merge_run.log               # 运行日志（区分内源/跨源）
         <output_root>/logs/merge_warnings.log          # 异常告警日志
     """
@@ -259,6 +261,13 @@ def _run_merge_impl(sources: list[Path], output_root: Path, log_dir: Path,
                         path=out, device=meta.device, user=meta.user, ch=meta.ch,
                         start=_parse_ymd(meta.start), end=_parse_ymd(meta.end), source=src_name))
                     log.info("[%s][内源] %s Ch%d: %s -> %s", src_name, user_key, ch, info["action"], out.name)
+                elif info.get("action") == "single_skipped_by_option":
+                    # 单文件组未按选项保留到单源输出区，但仍需参与阶段二：
+                    # 若该用户仅存在于单一数据源，其文件将直接成为合并后用户数据文件
+                    m0 = members[0]
+                    stage1_files.append(BusFile(path=m0.path, device=m0.device, user=m0.user,
+                                                ch=m0.ch, start=m0.start, end=m0.end,
+                                                source=src_name))
                 report["phase1_intra_source"].setdefault(src_name, []).append(
                     {"user_key": user_key, "ch": ch, "status": "OK", **info})
             except OverlapError as e:
@@ -278,9 +287,17 @@ def _run_merge_impl(sources: list[Path], output_root: Path, log_dir: Path,
     for (user_key, ch), members in sorted(xgroups.items()):
         srcs = {m.source for m in members}
         if len(srcs) < 2:
-            log.info("[跨源] %s Ch%d 仅存在于 %s，无需跨源合并", user_key, ch, srcs.pop())
+            # 用户目录仅存在于单一数据源（其余源中不存在该用户目录）：
+            # 待合并文件直接作为合并后用户数据文件，放入合并后用户数据目录（用户要求）
+            src_name = members[0].source
+            out, info = merge_group(members, cross_dir / user_key, tmp_root / "cross",
+                                    phase=f"passthrough_{user_key}_Ch{ch}", keep_single=True)
+            log.info("[跨源] %s Ch%d 仅存在于数据源 %s（其余源无此用户目录），"
+                     "直接作为合并后用户数据文件 -> %s",
+                     user_key, ch, src_name, out.name if out else "-")
             report["phase2_cross_source"].setdefault(user_key, []).append(
-                {"ch": ch, "status": "OK", "action": "single_source_only", "sources": sorted(srcs)})
+                {**(info or {}), "ch": ch, "status": "OK", "action": "copied_single_source",
+                 "sources": sorted(srcs), "output": str(out) if out else None})
             continue
         try:
             out, info = merge_group(members, cross_dir / user_key, tmp_root / "cross",

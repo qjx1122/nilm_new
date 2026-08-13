@@ -90,3 +90,15 @@
 - 未决问题：
   - 当前 data/ 真实文件全部带 -1 后缀，若需实际合并，须由上游导出方改用严格格式命名（或对副本重命名后再入合并源目录）
 - 相关文件/分支：nilm/common/contracts.py、nilm/data_io/merge.py、tests/test_contracts.py、tests/test_merge.py、README；分支 arena/019ffa35-nilm-new
+
+## [2026-08-13] 会话纪要（第 7 次）
+- 目标：修改合并脚本——两源合并时，某用户目录只在其中 1 个源中存在（另一源无该用户目录），则该用户的待合并文件直接作为合并后用户数据文件
+- 完成项：
+  - merge.py 阶段二：单源独有用户（通道组）直接透传到合并后用户数据目录 cross_source/<user>/，原名原内容，action=copied_single_source
+  - 阶段一配套：--no-keep-original 场景下单文件组仍被跟踪（原始路径），保证阶段二透传不漏
+  - 新增 2 项测试（透传端到端、no-keep 组合），75 项全过；真实数据回归确认严格格式行为不变
+- 关键决策：
+  - 透传目标目录沿用 cross_source/（阶段二统一输出区），避免再造新层级；报告 action 区分 copied_single_source / merged
+  - 用户级「目录缺失」按其全部通道组均为单源组自然成立，无需额外用户级特判
+- 未决问题：真实数据文件名均带 -1 后缀（非合并对象），何时切换严格格式取决于上游导出约定
+- 相关文件/分支：nilm/data_io/merge.py、tests/test_merge.py、README；分支 arena/019ffa35-nilm-new
