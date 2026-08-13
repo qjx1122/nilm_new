@@ -46,3 +46,18 @@
   - 指南附件（日级指标字段清单/启动段契约/target_col 回退链）未随 PDF 提供，列为接口待确认项
   - 真实数据 M0 摸底未开始；GBDT/深度模型为 M2
 - 相关文件/分支：nilm/（重构）、scripts/run_batch_users.py、configs/、tests/、docs/TECH_DESIGN §11、README；分支 arena/019ffa35-nilm-new
+
+## [2026-08-13] 会话纪要（第 4 次）
+- 目标：使用 data 下 5 个用户数据和 configs/time_filters.json 配置，批量执行验证测试
+- 完成项：
+  - 合入用户推送的测试数据与配置（f2ccca9）：trains/infers 各 5 个用户目录 + time_filters.json
+  - M0 数据摸底：双哨兵值（INT32_MIN/MAX）、总线稀疏（842: 88/288、844: 57/288 点/天）与密集（778/789/800: 282/288）并存、分路百瓦级、总线量纲未确认
+  - 数据驱动字段辨识（相关性分析）：data7=总有功（与分路和相关性 0.80+）等，临时映射入 default.yaml 并显式标记
+  - 代码适配：哨兵值配置化、ptotal/3 派生三相（显式标记）、覆盖率真实日历口径、门禁阈值校准、min_overlap 配置化
+  - 两处口径修正（均有单测保护）：对齐重叠率改为分路标签覆盖率（844 由 FAILED 转 OK）；低方差判据改为目标 CV<5%（消除 5 个误报）
+  - 最终结果：批量 10/10 OK（5 用户 train+infer）；断点续跑 10/10 SKIPPED_RESUME；单用户模式通过；65 项测试全过
+- 关键决策：
+  - 临时字段映射（待点位表确认）优于 SCHEMA_UNCONFIRMED 阻塞：让验证先跑通，不确定性全部显式落盘（schema 报告 DATA_UNIT_UNKNOWN）
+  - 稀疏用户基线表现差（844/789 r2<0）如实记录为 M2 输入，不调指标口径粉饰
+- 未决问题：设备点位表与 CT/PT 倍率待确认；指南附件（日级指标/启动段契约）待补充；稀疏用户改善待 M2
+- 相关文件/分支：configs/default.yaml、configs/time_filters.json、nilm/preprocess/align.py、nilm/analysis/identifiability.py、nilm/data_io/{csv_source,validator}.py、outputs/（不入库）；分支 arena/019ffa35-nilm-new

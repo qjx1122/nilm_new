@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import pandas as pd
 
 from nilm.common.contracts import parse_branch_filename, parse_bus_filename
@@ -33,10 +34,12 @@ def _parse_ymd(s: str) -> pd.Timestamp | None:
         return None
 
 
-def _read_ts(path: Path, ts_col: str) -> pd.DataFrame:
+def _read_ts(path: Path, ts_col: str, sentinels: list | None = None) -> pd.DataFrame:
     df = pd.read_csv(path)
     if ts_col not in df.columns:
         raise ValueError(f"{path.name} 缺少时间列 {ts_col!r}（现有列: {list(df.columns)[:12]}…）")
+    if sentinels:  # 哨兵值（如 INT32_MIN/MAX）→ NaN，禁止静默当真实值（§4）
+        df = df.replace({s: np.nan for s in sentinels})
     df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
     df = df.dropna(subset=[ts_col]).set_index(ts_col).sort_index()
     return df[~df.index.duplicated(keep="first")]
@@ -50,9 +53,13 @@ class CsvBusLoader(BusLoader):
         {"ua": {"ch": 1, "column": "load_iden_data0", "multiplier": 1.0, "unit": "V"}, ...}
 
     未给出 multiplier 的字段按 1.0 处理并标记 DATA_UNIT_UNKNOWN 提示（§4：禁止静默转换）。
+    ``derive_phase_from_ptotal=True`` 时：无分相功率映射则按 ptotal/3 均分三相
+    （临时假设，报告中显式标记 DERIVED_EQUAL_SPLIT，待点位表确认）。
     """
 
-    def load(self, files: Sequence[Path], field_map: dict) -> tuple[pd.DataFrame, dict]:
+    def load(self, files: Sequence[Path], field_map: dict,
+             sentinels: list | None = None,
+             derive_phase_from_ptotal: bool = False) -> tuple[pd.DataFrame, dict]:
         report: dict = {"kind": "bus", "fields": {}, "issues": [], "file_time_check": []}
 
         # 1) 按 Ch 分组读入（同一 Ch 多个文件按时间拼接）
@@ -60,7 +67,7 @@ class CsvBusLoader(BusLoader):
         for f in files:
             meta = parse_bus_filename(f.name)
             assert meta is not None  # discovery 已校验
-            df = _read_ts(f, BUS_TIMESTAMP_COL)
+            df = _read_ts(f, BUS_TIMESTAMP_COL, sentinels)
             df.attrs["channel_id"] = meta.ch
             if meta.ch in ch_frames:
                 ch_frames[meta.ch] = pd.concat([ch_frames[meta.ch], df]).sort_index()
@@ -100,6 +107,19 @@ class CsvBusLoader(BusLoader):
             out[std] = frame[col] * mult
             report["fields"][std] = {"ch": ch, "column": col, "multiplier": mult,
                                      "unit": spec.get("unit", "UNKNOWN")}
+
+        # 3) 分相功率派生（临时假设，显式标记）：pa/pb/pc 缺失但 ptotal 存在时按 /3 均分
+        if derive_phase_from_ptotal and "ptotal" in out.columns:
+            for ph in ("pa", "pb", "pc"):
+                if ph not in out.columns:
+                    out[ph] = out["ptotal"] / 3.0
+                    report["fields"][ph] = {"derived": "ptotal/3 (DERIVED_EQUAL_SPLIT, 待点位表确认)"}
+                    report["issues"].append(f"{ph} 由 ptotal/3 均分派生（临时假设，DERIVED_EQUAL_SPLIT）")
+        # pa..pc 补齐后重判必备字段缺失问题
+        report["issues"] = [i for i in report["issues"]
+                            if not (i.startswith("字段映射缺失") and any(
+                                i.startswith(f"字段映射缺失: {ph}") and ph in out.columns
+                                for ph in ("pa", "pb", "pc")))]
         out.index.name = "timestamp"
         return out, report
 
@@ -107,13 +127,13 @@ class CsvBusLoader(BusLoader):
 class CsvBranchLoader(BranchLoader):
     """分路 CSV 加载器：time 索引 + p1..pN（单位 W）。"""
 
-    def load(self, files: Sequence[Path]) -> tuple[pd.DataFrame, dict]:
+    def load(self, files: Sequence[Path], sentinels: list | None = None) -> tuple[pd.DataFrame, dict]:
         report: dict = {"kind": "branch", "fields": {}, "issues": [], "file_time_check": []}
         frames = []
         for f in files:
             meta = parse_branch_filename(f.name)
             assert meta is not None
-            df = _read_ts(f, BR_TIMESTAMP_COL)
+            df = _read_ts(f, BR_TIMESTAMP_COL, sentinels)
             p_cols = branch_power_columns(df)
             if not p_cols:
                 report["issues"].append(f"{f.name} 缺少 pN 功率列")

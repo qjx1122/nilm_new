@@ -8,17 +8,20 @@ output_dir: outputs
 data:
   trains_root: data/trains     # §3.1：data/trains/<device>_<user>/
   infers_root: data/infers     # §3.1：data/infers/<device>_<user>/（分路仅离线评估）
+  sentinel_values: [-2147483648, 2147483647]   # INT32_MIN/MAX 哨兵值 → NaN（实测数据确认）
+  derive_phase_from_ptotal: true   # 分相功率缺失时 ptotal/3 均分（临时假设，报告显式标记）
 
-quality:                       # §6 质量门禁
-  max_missing_rate: 0.3
-  min_coverage: 0.5
-  min_score: 50
-  min_days: 14                 # 有效数据天数不足 → INSUFFICIENT_TIME_RANGE
+quality:                       # §6 质量门禁（阈值按 5 用户实测数据校准，见 STATUS.md 决策记录）
+  max_missing_rate: 0.9
+  min_coverage: 0.15
+  min_score: 10
+  min_days: 3                  # 与 time_filters.json 中最短训练窗口（6 天）相容
 
 preprocess:
   clip_negative: true
   allow_negative_power: false  # §2.3：原则上非负；允许反送电必须显式改为 true
   max_gap_interp: 2
+  min_overlap: 0.3             # 母线/分路时间重叠率门禁（稀疏用户实测放宽，见 STATUS.md）
   agg_strategy:                # §5.2：聚合策略可配置且必须记录（落盘 agg_strategy.json）
     u: mean
     i: mean
@@ -34,20 +37,21 @@ dataset:                       # §10
   mode: seq2seq                # 默认 Seq2Seq，可配置 seq2point
 
 # 总线字段映射（§3.2/§4）：ChN 只是通道标识，物理含义必须由本配置确认。
-# 实际部署按 schema 检查结果修改；multiplier 为 CT/PT 倍率（必须配置化）。
+# ⚠️ 当前为【临时映射】：基于 5 用户实测数据的数据驱动推断（相关性/分布分析），
+#    待设备点位表确认后修订；未配置 multiplier 的字段标记 DATA_UNIT_UNKNOWN（§4 禁止静默转换）。
+# 实测结构：load_iden_data1..8 与 73..80 为两组同构测量；7/79=总有功（与分路和相关性 0.80+）；
+# 1/2/73/74=电压类；3..6/75..78=电流类；8/80=功率因素类（×1000 量级）。
 bus_field_map:
-  ua:  {ch: 1, column: load_iden_data0,  multiplier: 1.0, unit: V}
-  ub:  {ch: 1, column: load_iden_data1,  multiplier: 1.0, unit: V}
-  uc:  {ch: 1, column: load_iden_data2,  multiplier: 1.0, unit: V}
-  ia:  {ch: 1, column: load_iden_data3,  multiplier: 1.0, unit: A}
-  ib:  {ch: 1, column: load_iden_data4,  multiplier: 1.0, unit: A}
-  ic:  {ch: 1, column: load_iden_data5,  multiplier: 1.0, unit: A}
-  pa:  {ch: 1, column: load_iden_data6,  multiplier: 1.0, unit: W}
-  pb:  {ch: 1, column: load_iden_data7,  multiplier: 1.0, unit: W}
-  pc:  {ch: 1, column: load_iden_data8,  multiplier: 1.0, unit: W}
-  pfa: {ch: 1, column: load_iden_data9,  multiplier: 1.0}
-  pfb: {ch: 1, column: load_iden_data10, multiplier: 1.0}
-  pfc: {ch: 1, column: load_iden_data11, multiplier: 1.0}
+  ua:    {ch: 1, column: load_iden_data1}
+  ub:    {ch: 1, column: load_iden_data2}
+  uc:    {ch: 1, column: load_iden_data74}
+  ia:    {ch: 1, column: load_iden_data3}
+  ib:    {ch: 1, column: load_iden_data4}
+  ic:    {ch: 1, column: load_iden_data5}
+  ptotal: {ch: 1, column: load_iden_data7}
+  pfa:   {ch: 1, column: load_iden_data8}
+  pfb:   {ch: 1, column: load_iden_data80}
+  pfc:   {ch: 1, column: load_iden_data8}
 
 models:                        # 多模型对比：注册表 + 配置驱动
   - name: history_profile

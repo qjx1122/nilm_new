@@ -33,3 +33,21 @@
   - 识别 3 项接口待确认项（日级指标字段清单 25vs23、启动段字段契约、target_col 回退链），按指南 §0 口径记录不擅自补充
 - 是否进入 REPORT.md（稳定结论）：否（工程重构专题，尚无真实数据实验结论）
 - 遗留问题：指南附件缺失（字段清单/启动段契约）；真实数据 M0；M2 多模型；天气特征数据源未接入
+
+## [2026-08-13] 专题：5 用户真实数据批量执行验证
+- 类型：验证专题
+- 目标与假设：用真实工商业数据（5 个 user_key，trains+infers）按指南 §12 入口批量执行，验证 V2.1 重构后的流水线在数据稀疏、哨兵值、量纲未确认等真实条件下可用、可诊断、可续跑
+- 方法 / 数据 / 参数：
+  - 数据：5 用户（842/844 稀疏 88/57 点/天，778/789/800 密集 282/288 点/天）；分路 4 列 p1..p4（842/844）或 2 列（其余）；配置 configs/time_filters.json（含复合目标 p1+p2、splits 锚定、train/infer include/exclude）
+  - 入口：python scripts/run_batch_users.py --time-filter-config configs/time_filters.json（指南原文入口）
+  - 模型：history_profile / proportional / ridge；指标 mae/rmse/r2/sae
+  - 摸底手段：全列统计 + 哨兵值识别 + 与分路和相关性排序辨识字段语义
+- 结果 / 结论：
+  - 批量 10/10 OK（train 5 + infer 5）；best 分布：ridge×2、proportional×2、history_profile×1
+  - 密集用户效果可用：842 ridge r2=0.629 sae=0.008；778 history_profile r2=0.826；800 ridge r2=0.716
+  - 稀疏用户 844（bus 57 点/天、分路 16 点/天）与复合目标用户 789 基线 r2<0 → M2 需 GBDT/序列模型（结论入下一步）
+  - 断点续跑：复跑 10/10 SKIPPED_RESUME；单用户模式同路径生效
+  - 可辨识性：5 用户 pearson 0.74–0.90 全部 identifiable=True
+  - 发现并修复 3 个真实数据暴露的问题：双哨兵值、对称重叠率口径对稀疏总线失真、低方差绝对阈值受未确认量纲污染（均固化单测）
+- 是否进入 REPORT.md（稳定结论）：否（字段映射为临时映射，待点位表确认后再沉淀稳定结论）
+- 遗留问题：点位表/倍率待确认；稀疏用户建模改善（M2）；指南附件字段契约待补充
