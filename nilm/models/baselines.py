@@ -53,12 +53,12 @@ class HistoryProfile(BaseModel):
 
 @MODEL_REGISTRY.register("proportional")
 class ProportionalAllocation(BaseModel):
-    """按训练集功率占比把母线 p_total 分摊到各分路。需要特征列 ``p_total``。"""
+    """按训练集功率占比把母线总有功 pbus 分摊到各目标。需要特征列 ``pbus``。"""
 
     name = "proportional"
 
     def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
-        self._p_idx = _col_index(feature_names, "p_total")
+        self._p_idx = _col_index(feature_names, "pbus")
         total = float(y.sum())
         self._shares = y.sum(axis=0) / total if total > 0 else np.full(y.shape[1], 1.0 / y.shape[1])
 
