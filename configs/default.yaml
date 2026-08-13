@@ -1,47 +1,60 @@
-# NILM 负荷辨识流水线 —— 默认实验配置
-# 一次实验 = 一份 YAML + 一个 outputs/<exp_name>/<timestamp>/ 产物目录
+# NILM 负荷辨识流水线 —— 基础配置（对齐《工商业负荷辨识算法开发指南 V2.1》）
+# 用户级配置在 --time-filter-config 指定的 JSON 中（指南 §12），优先级高于本文件默认值。
 
-experiment_name: default
+experiment_name: guide_v2_1
 seed: 42
 output_dir: outputs
 
 data:
-  bus_path: data/raw/bus          # 母线原始时序（288 点/天，5min）：文件或含 *.csv 的目录
-  branch_path: data/raw/branch    # 分路原始时序（96 点/天，15min）
-  timestamp_col: timestamp
-  # 原始列名 -> 标准列名 的映射（上游格式变化只改这里，不改代码）
-  bus_column_map:
-    U_A: u_a
-    U_B: u_b
-    U_C: u_c
-    I_A: i_a
-    I_B: i_b
-    I_C: i_c
-    P: p_total
-    PF_A: pf_a
-    PF_B: pf_b
-    PF_C: pf_c
-  branch_column_map: {}           # 例如 { "回路1": "branch_1" }
+  trains_root: data/trains     # §3.1：data/trains/<device>_<user>/
+  infers_root: data/infers     # §3.1：data/infers/<device>_<user>/（分路仅离线评估）
+
+quality:                       # §6 质量门禁
+  max_missing_rate: 0.3
+  min_coverage: 0.5
+  min_score: 50
+  min_days: 14                 # 有效数据天数不足 → INSUFFICIENT_TIME_RANGE
 
 preprocess:
   clip_negative: true
-  max_gap_interp: 2               # 允许插值的最长连续缺口（点数）
-  train_frac: 0.7
-  val_frac: 0.15                  # test = 1 - train - val（按时间顺序，防泄漏）
+  allow_negative_power: false  # §2.3：原则上非负；允许反送电必须显式改为 true
+  max_gap_interp: 2
+  agg_strategy:                # §5.2：聚合策略可配置且必须记录（落盘 agg_strategy.json）
+    u: mean
+    i: mean
+    p: mean
+    pf: recompute              # 优先 P/S 重算；禁止无说明直接平均
 
-features:
+features:                      # §8（FFT/THD 禁用，§8.5）
   lags: [1, 2, 3, 4]
   rolling_windows: ["1h", "6h", "24h"]
 
-# 多模型对比：新增模型 = 加一行（实现注册到 MODEL_REGISTRY 后）
-models:
+dataset:                       # §10
+  window: 96                   # L=96，过去 24 小时
+  mode: seq2seq                # 默认 Seq2Seq，可配置 seq2point
+
+# 总线字段映射（§3.2/§4）：ChN 只是通道标识，物理含义必须由本配置确认。
+# 实际部署按 schema 检查结果修改；multiplier 为 CT/PT 倍率（必须配置化）。
+bus_field_map:
+  ua:  {ch: 1, column: load_iden_data0,  multiplier: 1.0, unit: V}
+  ub:  {ch: 1, column: load_iden_data1,  multiplier: 1.0, unit: V}
+  uc:  {ch: 1, column: load_iden_data2,  multiplier: 1.0, unit: V}
+  ia:  {ch: 1, column: load_iden_data3,  multiplier: 1.0, unit: A}
+  ib:  {ch: 1, column: load_iden_data4,  multiplier: 1.0, unit: A}
+  ic:  {ch: 1, column: load_iden_data5,  multiplier: 1.0, unit: A}
+  pa:  {ch: 1, column: load_iden_data6,  multiplier: 1.0, unit: W}
+  pb:  {ch: 1, column: load_iden_data7,  multiplier: 1.0, unit: W}
+  pc:  {ch: 1, column: load_iden_data8,  multiplier: 1.0, unit: W}
+  pfa: {ch: 1, column: load_iden_data9,  multiplier: 1.0}
+  pfb: {ch: 1, column: load_iden_data10, multiplier: 1.0}
+  pfc: {ch: 1, column: load_iden_data11, multiplier: 1.0}
+
+models:                        # 多模型对比：注册表 + 配置驱动
   - name: history_profile
   - name: proportional
   - name: ridge
-    params: { alpha: 1.0 }
-
-constraints:                      # 物理约束后处理（模型无关）
-  nonnegative: true
-  sum_consistency: true
+    params: {alpha: 1.0}
 
 metrics: [mae, rmse, r2, sae]
+
+# infer_model: ridge           # 推理模型；缺省采用该用户训练对比的综合最优

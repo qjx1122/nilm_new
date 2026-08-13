@@ -1,34 +1,29 @@
-"""数据接入抽象接口。
+"""数据接入抽象接口（按指南 §3/§4 重构：面向「用户目录」而非单个文件）。
 
-实现方只需保证：输出的 DataFrame 符合 ``nilm.common.schema`` 定义的标准列模式。
-编排层（pipeline）只面向接口编程，不感知 CSV/Parquet/数据库等具体实现。
-
-接口按侧拆分（母线侧 / 分路侧），具体实现各取其一；``DataSource`` 为组合接口。
+实现方保证：输出符合 ``nilm.common.schema`` 标准列模式，并返回 schema 报告。
+编排层只面向接口编程，不感知 CSV/Parquet/数据库等具体实现（解耦点）。
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from pathlib import Path
+from typing import Sequence
 
 import pandas as pd
 
 
-class BusSource(ABC):
-    """母线侧数据源。"""
+class BusLoader(ABC):
+    """总线侧加载器：多个 Ch 文件按时间轴关联（§3.2），字段映射由配置给定。"""
 
     @abstractmethod
-    def load_bus(self, start: datetime | None = None, end: datetime | None = None) -> pd.DataFrame:
-        """加载母线时序，返回标准 schema DataFrame（DatetimeIndex，5min）。"""
+    def load(self, files: Sequence[Path], field_map: dict) -> tuple[pd.DataFrame, dict]:
+        """返回 (标准 schema DataFrame[5min], schema 报告 dict)。"""
 
 
-class BranchSource(ABC):
-    """分路侧数据源。"""
+class BranchLoader(ABC):
+    """分路侧加载器：输出 time 索引 + p1..pN 列（§3.3）。"""
 
     @abstractmethod
-    def load_branch(self, start: datetime | None = None, end: datetime | None = None) -> pd.DataFrame:
-        """加载分路时序，返回标准 schema DataFrame（DatetimeIndex，15min，列 branch_<id>）。"""
-
-
-class DataSource(BusSource, BranchSource):
-    """组合接口：同时提供母线与分路加载（编排层面向此接口）。"""
+    def load(self, files: Sequence[Path]) -> tuple[pd.DataFrame, dict]:
+        """返回 (标准 schema DataFrame[15min], schema 报告 dict)。"""
