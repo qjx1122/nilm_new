@@ -149,3 +149,19 @@
   - 各指标最优/综合最优模型挑选不受计数列影响（排序豁免生效）
 - 是否进入 REPORT.md（稳定结论）：否（诊断输出扩展，非算法结论）
 - 遗留问题：844 test 切分仅 2 点（时间过滤配置导致），分类指标统计意义弱；789/800 推理段 FN 全量的根因随 M2 多模型一并分析
+
+## [2026-08-14] 专题：三阶段+日级评估指标输出与推理状态真值/概率扩列
+- 类型：验证专题（含功能扩展）
+- 目标与假设：①训练每模型输出 train/val/test 三阶段指标及每天日级指标 CSV；②推理结果增加状态真值（target_state）与开态概率（pred_prob），并输出日级指标 CSV。假设：日级分组评估可复用 evaluate_all 注册表机制；伪概率可在无分类头模型下提供有意义的置信度参考
+- 方法 / 数据 / 参数：
+  - evaluate_daily：按自然日分组调 evaluate_all，输出 date/n_points/各指标宏平均
+  - state_probability：p=1/(1+exp(-4·(P−thr)/thr))，单调、阈值处 0.5、决策边界与 pred_state 一致
+  - 产物：train/metrics_by_split.csv（model×split）、train/metrics_daily.csv（model×split×date）、infer/metrics_daily.csv（model×date）、inference_result.csv 扩为 7 列
+  - 新增 5 项测试；真实数据 5 用户 --force 全量重跑
+- 结果 / 结论：
+  - 105 项测试全过；10/10 OK；5 用户产物全部齐备
+  - 三阶段指标揭示过拟合幅度：842 ridge r2 train 0.954 / val 0.864 / test 0.616；proportional 三阶段 r2 全负（模型太弱非过拟合）
+  - 日级指标定位问题天：842 ridge test 中 2026-06-12 r2=0、F1=0（全关日全误报），其余天 r2 0.5–0.8——整段指标掩盖的坏天被显式暴露
+  - 推理侧语义校验全过：pred_prob 决策边界与 pred_state 一致（p≥0.5 ⟺ P≥thr）、target_state 与真值二值化一致、无真值处为空
+- 是否进入 REPORT.md（稳定结论）：否（诊断能力扩展，非算法结论）
+- 遗留问题：pred_prob 为伪概率（非校准），M2 分类头模型引入后可替换；指南附件「日级指标 23 字段」契约仍未提供，当前日级 CSV 按现有指标集输出，待附件到位后对齐字段

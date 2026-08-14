@@ -24,11 +24,12 @@ from nilm.common.timefilter import filter_dataframe
 from nilm.data_io.csv_source import CsvBranchLoader, CsvBusLoader
 from nilm.data_io.validator import (QualityError, assert_quality, quality_report,
                                     write_quality_html, write_schema_report)
-from nilm.evaluation import build_comparison_table, evaluate_all, summarize
+from nilm.evaluation import (build_comparison_table, evaluate_all,
+                             evaluate_daily, summarize)
 from nilm.models import MODEL_REGISTRY
 from nilm.models.base import BaseModel
 from nilm.models.constraints import apply_constraints
-from nilm.postprocess.state import postprocess_state
+from nilm.postprocess.state import postprocess_state, state_probability
 from nilm.preprocess.align import align_frames, estimate_time_offset, resample_bus
 from nilm.preprocess.clean import Cleaner
 from nilm.preprocess.dataset import DEFAULT_WINDOW, build_windows, drop_invalid_rows
@@ -218,8 +219,13 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                                         scaled["train"][2], window=window, mode=wmode)
             wmeta.to_csv(out / "train_window_index.csv", index=False)
 
-        # —— 多模型训练与测试集评估（模块解耦：只经注册表接口）
-        results: dict[str, dict] = {}
+        # —— 多模型训练与三阶段（train/val/test）评估（模块解耦：只经注册表接口）
+        metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
+        on_thr = float(user_cfg["on_thr_w"])
+        pbus_col = names.index("pbus")
+        results: dict[str, dict] = {}          # {model: test 指标}（选型口径不变）
+        results_by_split: dict[str, dict] = {}  # {model: {split: 指标}} 三阶段全量
+        daily_rows: list[pd.DataFrame] = []     # 每模型×每阶段×每天 指标
         best = None
         for spec in base_cfg.get("models", []):
             name, params = spec["name"], spec.get("params", {})
@@ -227,15 +233,38 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             model.fit(scaled["train"][0], scaled["train"][1], feature_names=names,
                       X_val=scaled["val"][0], y_val=scaled["val"][1])
             model.save(out / "models" / f"{name}.pkl")
-            y_hat = model.predict(scaled["test"][0])
-            y_hat = apply_constraints(y_hat, splits["test"][0][:, names.index("pbus")],
-                                      nonnegative=not allow_negative, sum_consistency=False)
-            metrics = evaluate_all(scaled["test"][1], y_hat,
-                                   base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"]),
-                                   on_thr_w=float(user_cfg["on_thr_w"]))
-            results[name] = metrics
-            log.info("[%s] 模型 %s 测试指标: %s", user_key, name,
-                     {m: round(v["macro"], 4) for m, v in metrics.items()})
+
+            results_by_split[name] = {}
+            for split in ("train", "val", "test"):
+                if len(scaled[split][0]) == 0:
+                    continue
+                y_hat = model.predict(scaled[split][0])
+                y_hat = apply_constraints(y_hat, splits[split][0][:, pbus_col],
+                                          nonnegative=not allow_negative,
+                                          sum_consistency=False)
+                metrics = evaluate_all(scaled[split][1], y_hat, metric_names,
+                                       on_thr_w=on_thr)
+                results_by_split[name][split] = metrics
+                daily = evaluate_daily(scaled[split][1], y_hat, splits[split][2],
+                                       metric_names, on_thr_w=on_thr)
+                daily.insert(0, "split", split)
+                daily.insert(0, "model", name)
+                daily_rows.append(daily)
+                log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
+                         {m: round(v["macro"], 4) for m, v in metrics.items()})
+            results[name] = results_by_split[name]["test"]  # 选型口径：test（不变）
+
+        # 三阶段汇总 CSV：model × split 行 × 指标列
+        split_rows = [{"model": mname, "split": s,
+                       **{m: v["macro"] for m, v in mm.items()}}
+                      for mname, by in results_by_split.items()
+                      for s, mm in by.items()]
+        pd.DataFrame(split_rows).to_csv(out / "metrics_by_split.csv",
+                                        index=False, encoding="utf-8")
+        # 日级指标 CSV：model × split × date 行 × 指标列
+        pd.concat(daily_rows, ignore_index=True).to_csv(
+            out / "metrics_daily.csv", index=False, encoding="utf-8")
+
         table = build_comparison_table(results)
         table.to_csv(out / "comparison.csv", encoding="utf-8")
         summary = summarize(table)
@@ -352,25 +381,43 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             target_vals = t
             have = t.dropna()
             if len(have) > 0:
+                metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
+                pred_on_have = pd.Series(pred, index=valid.index).loc[have.index]
                 offline_metrics = evaluate_all(
-                    have.to_numpy()[:, None],
-                    pd.Series(pred, index=valid.index).loc[have.index].to_numpy()[:, None],
-                    base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"]),
-                    on_thr_w=float(user_cfg["on_thr_w"]))
+                    have.to_numpy()[:, None], pred_on_have.to_numpy()[:, None],
+                    metric_names, on_thr_w=float(user_cfg["on_thr_w"]))
                 _dump(out / "offline_metrics.json", offline_metrics)
+                # 日级离线指标 CSV（model × date 行 × 指标列）
+                daily = evaluate_daily(have.to_numpy()[:, None],
+                                       pred_on_have.to_numpy()[:, None],
+                                       have.index, metric_names,
+                                       on_thr_w=float(user_cfg["on_thr_w"]))
+                daily.insert(0, "model", model_name)
+                daily.to_csv(out / "metrics_daily.csv", index=False, encoding="utf-8")
 
-        pred_state = postprocess_state(pred, float(user_cfg["on_thr_w"]),
+        on_thr = float(user_cfg["on_thr_w"])
+        pred_state = postprocess_state(pred, on_thr,
                                        int(user_cfg["post_min_on"]),
                                        int(user_cfg["post_fill_short_off"]))
+        pred_prob = state_probability(pred, on_thr)
+        # 状态真值：分路真值按同一 on_thr_w 二值化；无真值处为空（NaN）
+        target_np = target_vals.to_numpy(dtype=np.float64)
+        target_state = np.where(np.isnan(target_np), np.nan,
+                                (target_np >= on_thr).astype(float))
         result_csv = out / INFERENCE_RESULT_REL
         result_csv.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({
+        df_result = pd.DataFrame({
             "timestamp": valid.index.strftime("%Y-%m-%d %H:%M:%S"),
             "user_id": user_id,
-            "target": target_vals.to_numpy(),
+            "target": target_np,
+            "target_state": pd.array(
+                [int(v) if not np.isnan(v) else None for v in target_state],
+                dtype="Int64"),
             "pred": pred,
             "pred_state": pred_state.astype(int),
-        })[INFER_RESULT_COLUMNS].to_csv(result_csv, index=False)
+            "pred_prob": np.round(pred_prob, 6),
+        })
+        df_result[INFER_RESULT_COLUMNS].to_csv(result_csv, index=False)
 
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "model": model_name,

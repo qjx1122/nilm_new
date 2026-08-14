@@ -60,3 +60,20 @@ def postprocess_state(power: np.ndarray, on_thr_w: float, min_on: int = 1,
     st = enforce_min_on(st, min_on)
     st = fill_short_off(st, fill_off)
     return st
+
+
+def state_probability(power: np.ndarray, on_thr_w: float,
+                      sharpness: float = 4.0) -> np.ndarray:
+    """开态概率（伪概率）：回归模型无原生概率输出，用以 on_thr_w 为中心的
+    sigmoid 把预测功率映射到 (0,1)：
+
+        p = 1 / (1 + exp(-sharpness · (power − thr) / thr))
+
+    - power = thr 时 p = 0.5（与 pred_state 判据一致的决策边界）；
+    - power = 0 时 p ≈ 0.018（sharpness=4）；power = 2·thr 时 p ≈ 0.982；
+    - sharpness 控制过渡陡峭度；单调性保证 p 与功率排序一致。
+    """
+    p = np.asarray(power, dtype=np.float64)
+    scale = max(abs(float(on_thr_w)), 1e-9)
+    z = sharpness * (p - float(on_thr_w)) / scale
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -60.0, 60.0)))

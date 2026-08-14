@@ -164,3 +164,31 @@ def evaluate_all(y_true: np.ndarray, y_pred: np.ndarray,
         raise ValueError(f"形状不一致: {y_true.shape} vs {y_pred.shape}")
     return {name: METRIC_REGISTRY.get(name)(y_true, y_pred, **kwargs)
             for name in metric_names}
+
+
+def evaluate_daily(y_true: np.ndarray, y_pred: np.ndarray, index,
+                   metric_names: list[str], **kwargs):
+    """按自然日分组评估：每个日期一行（date / n_points / 各指标宏平均）。
+
+    - index：与样本逐行对应的 DatetimeIndex（或可转换对象）；
+    - 单日样本量小（如 96 点）时 r2/sae 波动大，日级指标用于诊断趋势而非选型；
+    - 返回 pandas.DataFrame，可直接落盘 CSV。
+    """
+    import pandas as pd
+
+    y_true = np.atleast_2d(y_true)
+    y_pred = np.atleast_2d(y_pred)
+    if y_true.shape != y_pred.shape:
+        raise ValueError(f"形状不一致: {y_true.shape} vs {y_pred.shape}")
+    idx = pd.DatetimeIndex(index)
+    if len(idx) != y_true.shape[0]:
+        raise ValueError(f"index 长度 {len(idx)} 与样本数 {y_true.shape[0]} 不一致")
+
+    rows = []
+    dates = idx.normalize()
+    for day in dates.unique().sort_values():
+        m = (dates == day).to_numpy() if hasattr(dates == day, "to_numpy") else (dates == day)
+        res = evaluate_all(y_true[m], y_pred[m], metric_names, **kwargs)
+        rows.append({"date": day.strftime("%Y-%m-%d"), "n_points": int(m.sum()),
+                     **{name: res[name]["macro"] for name in metric_names}})
+    return pd.DataFrame(rows)

@@ -153,3 +153,46 @@ def test_count_metrics_registered_and_excluded_from_ranking():
     assert "tp" not in s["best_per_metric"]      # 计数不参与排序
     assert s["best_per_metric"]["f1"] == "A"
     assert s["overall_best"] == "A"
+
+
+def test_evaluate_daily_grouping_and_consistency():
+    """evaluate_daily：按自然日分组、行数=天数、点数守恒、与整段指标一致（均匀情形）。"""
+    import pandas as pd
+
+    from nilm.evaluation.metrics import evaluate_daily
+
+    idx = pd.date_range("2026-01-01", periods=96 * 3, freq="15min")  # 3 天
+    y_true = np.full((len(idx), 1), 100.0)
+    y_pred = y_true + 5.0  # 恒定误差 → 每天 mae 均为 5
+    df = evaluate_daily(y_true, y_pred, idx, ["mae", "tp", "fn"], on_thr_w=50.0)
+    assert list(df["date"]) == ["2026-01-01", "2026-01-02", "2026-01-03"]
+    assert (df["n_points"] == 96).all()
+    assert np.allclose(df["mae"], 5.0)
+    assert (df["tp"] == 96).all() and (df["fn"] == 0).all()
+
+
+def test_evaluate_daily_index_mismatch_raises():
+    import pandas as pd
+    import pytest
+
+    from nilm.evaluation.metrics import evaluate_daily
+
+    idx = pd.date_range("2026-01-01", periods=4, freq="15min")
+    with pytest.raises(ValueError):
+        evaluate_daily(np.zeros((5, 1)), np.zeros((5, 1)), idx, ["mae"])
+
+
+def test_state_probability_semantics():
+    """开态概率：阈值处 0.5、单调、决策边界与 pred_state 一致、值域 (0,1)。"""
+    from nilm.postprocess.state import state_probability
+
+    thr = 50.0
+    power = np.array([0.0, 25.0, 50.0, 75.0, 200.0])
+    p = state_probability(power, thr)
+    assert abs(p[2] - 0.5) < 1e-9                    # 阈值处 = 0.5
+    assert np.all(np.diff(p) > 0)                    # 单调递增
+    assert ((power >= thr) == (p >= 0.5)).all()      # 决策边界一致
+    assert np.all((p > 0.0) & (p < 1.0))             # 开区间
+    # 极端值不溢出
+    huge = state_probability(np.array([1e12, -1e12]), thr)
+    assert np.isfinite(huge).all()

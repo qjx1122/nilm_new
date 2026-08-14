@@ -57,16 +57,24 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
     result_csv = infer_dirs[-1] / INFERENCE_RESULT_REL
     assert result_csv.exists()
     res = pd.read_csv(result_csv)
-    assert list(res.columns) == ["timestamp", "user_id", "target", "pred", "pred_state"]
+    assert list(res.columns) == ["timestamp", "user_id", "target", "target_state",
+                                 "pred", "pred_state", "pred_prob"]
     assert (res["user_id"].astype(str) == USER_KEY.split("_")[1]).all()
     assert len(res) > 0
+    # 概率取值域 + 与 on_thr_w 决策边界一致（p>=0.5 ⟺ pred>=thr）
+    assert res["pred_prob"].between(0.0, 1.0).all()
+    # 状态真值：有 target 处为 0/1，与二值化口径一致
+    have = res.dropna(subset=["target"])
+    if len(have):
+        assert set(have["target_state"].unique()) <= {0, 1}
 
     # 训练产物完备性（§1/§4/§9：配置快照/schema 报告/质量报告/可辨识性/聚合策略）
     train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
     for fname in ["meta.json", "metrics.json", "comparison.csv", "comparison.md",
                   "data_schema_report.json", "data_quality_report.html",
                   "identifiability_report.json", "agg_strategy.json",
-                  "train_window_index.csv", "_DONE"]:
+                  "train_window_index.csv", "metrics_by_split.csv",
+                  "metrics_daily.csv", "_DONE"]:
         assert (train_dir / fname).exists(), fname
     ident = json.loads((train_dir / "identifiability_report.json").read_text(encoding="utf-8"))
     assert ident["identifiable"] is True            # 合成数据高相关，应可辨识
@@ -124,6 +132,66 @@ def test_force_overrides_resume_default(tmp_path, base_cfg_file, time_filter_fil
     table = pd.read_csv(info["status_csv"])
     r = table[(table["user_key"] == USER_KEY) & (table["mode"] == "train")].iloc[0]
     assert r["status"] == Status.OK, r["message"]
+
+
+def test_split_and_daily_metrics_csv(tmp_path, base_cfg_file, time_filter_file):
+    """训练：三阶段（train/val/test）指标 + 每模型每天指标落盘；推理：日级指标落盘。"""
+    data_root = _setup(tmp_path)
+    out_root = tmp_path / "outputs"
+    run_batch(time_filter_file, base_config_path=base_cfg_file,
+              data_root=data_root, output_root=out_root, stages=("train", "infer"),
+              user_keys=[USER_KEY])
+    train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
+    infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+    meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+    models = meta["models"]
+
+    # —— 三阶段汇总：每模型 train/val/test 各一行，指标列非空
+    by_split = pd.read_csv(train_dir / "metrics_by_split.csv")
+    assert set(by_split["model"]) == set(models)
+    for m in models:
+        assert set(by_split[by_split["model"] == m]["split"]) == {"train", "val", "test"}
+    assert {"mae", "rmse", "r2", "sae"} <= set(by_split.columns)
+    assert by_split["mae"].notna().all()
+
+    # —— 训练日级指标：model × split × date；每天点数总和 = 各切分样本数
+    daily = pd.read_csv(train_dir / "metrics_daily.csv")
+    assert {"model", "split", "date", "n_points"} <= set(daily.columns)
+    assert set(daily["model"]) == set(models)
+    for s, n in meta["split_sizes"].items():
+        one_model = daily[(daily["model"] == models[0]) & (daily["split"] == s)]
+        assert one_model["n_points"].sum() == n, (s, n)
+    # 日级与整段一致性：test 全段 mae 应落在该模型各日 mae 的 [min, max] 区间
+    t = daily[(daily["model"] == models[0]) & (daily["split"] == "test")]
+    whole = by_split[(by_split["model"] == models[0]) &
+                     (by_split["split"] == "test")]["mae"].iloc[0]
+    assert t["mae"].min() - 1e-9 <= whole <= t["mae"].max() + 1e-9
+
+    # —— 推理日级指标：单模型 × date
+    idaily = pd.read_csv(infer_dir / "metrics_daily.csv")
+    assert {"model", "date", "n_points"} <= set(idaily.columns)
+    assert idaily["model"].nunique() == 1
+    assert len(idaily) == idaily["date"].nunique()
+
+
+def test_infer_result_state_prob_semantics(tmp_path, base_cfg_file, time_filter_file):
+    """推理结果语义：pred_prob 与 on_thr_w 决策边界一致；target_state 与真值二值化一致。"""
+    data_root = _setup(tmp_path)
+    out_root = tmp_path / "outputs"
+    run_batch(time_filter_file, base_config_path=base_cfg_file,
+              data_root=data_root, output_root=out_root, stages=("train", "infer"),
+              user_keys=[USER_KEY])
+    infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+    res = pd.read_csv(infer_dir / INFERENCE_RESULT_REL)
+    cfg = json.loads(Path(time_filter_file).read_text(encoding="utf-8"))
+    thr = float(cfg.get(USER_KEY, {}).get("on_thr_w",
+                cfg.get("_default", {}).get("on_thr_w", 10.0)))
+    # 概率单调 & 决策边界：pred >= thr ⟺ prob >= 0.5
+    assert ((res["pred"] >= thr) == (res["pred_prob"] >= 0.5)).all()
+    # target_state 与 target 二值化一致（有真值处）
+    have = res.dropna(subset=["target"])
+    if len(have):
+        assert (have["target_state"] == (have["target"] >= thr).astype(int)).all()
 
 
 def test_cleaned_csv_saved(tmp_path, base_cfg_file, time_filter_file):

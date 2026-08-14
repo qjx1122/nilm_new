@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：训练三阶段（train/val/test）指标 + 每模型日级指标 CSV；推理结果增加状态真值/开态概率 + 日级指标 CSV
 - ✅ 已完成：清洗后数据落盘 CSV 功能（cleaned/{bus,branch}_cleaned.csv，配置可关）
 - ✅ 已完成：批量/单用户执行增加强制重新训练推理功能（--force，忽略 _DONE 重跑）
 - ✅ 已完成：分类指标输出增加混淆矩阵计数 TP/FP/FN/TN（tp/fp/fn/tn 指标注册 + 配置默认开启）
@@ -36,6 +37,10 @@
 - [x] 倍率规则落地（官方确认）：bus_field_map 全部字段 multiplier 0.001（实际值 = 原始/1000），PF 原始 916→0.916 归一无量纲；加载器 multiplier 机制零代码改动（配置驱动生效）
 - [x] 验证：84 项测试全过（新增倍率应用测试）；真实数据复验 10/10 OK——bus 质量分升至 98.7–100（缩放前 PF 原始值越界计为异常，缩放后消除）；模型指标不变（均匀缩放对 z-score 归一后的模型近似不变，符合预期）
 
+- [x] 训练三阶段评估：每个模型在 train/val/test 三个切分上分别评估（原先只评 test）——`metrics_by_split.csv`（model×split 行 × 指标列）；选型口径不变（仍按 test 指标挑 best_model，metrics.json/comparison 兼容）
+- [x] 日级指标落盘：新增 `evaluation.metrics.evaluate_daily`（按自然日分组评估，date/n_points/各指标宏平均）——训练 `metrics_daily.csv`（model×split×date）、推理 `metrics_daily.csv`（model×date，有分路真值时产出）
+- [x] 推理结果扩列：`inference_result.csv` 契约扩为 timestamp,user_id,target,**target_state**,pred,pred_state,**pred_prob**——target_state=分路真值按 on_thr_w 二值化（无真值为空，Int64 可空）；pred_prob=以 on_thr_w 为中心的 sigmoid 伪概率（阈值处 0.5，决策边界与 pred_state 判据一致），`postprocess.state.state_probability`
+- [x] 验证（2026-08-14）：105 项测试全过（新增 5 项：三阶段+日级 CSV 端到端、推理状态/概率语义、evaluate_daily 分组一致性、index 不匹配报错、state_probability 语义）；真实数据 --force 全量重跑 10/10 OK——842 用户抽查：三阶段汇总 9 行（3 模型×3 阶段）、训练日级 306 行、推理日级决策边界/真值状态一致性全部通过
 - [x] 清洗后数据落盘：user_task 新增 `_save_cleaned_csv`——train 保存 bus+branch、infer 保存 bus（+离线评估侧 branch）到运行目录 `cleaned/{bus,branch}_cleaned.csv`（时间索引列名 timestamp，UTF-8）；配置开关 `preprocess.save_cleaned_csv`（默认 true）；只写 outputs/ 不触碰原始数据（§13 只读）
 - [x] 验证（2026-08-14）：100 项测试全过（新增 2 项：产物存在性+清洗语义抽查【功率非负/时间戳唯一】、配置关闭不产出）；真实数据 --force 全量重跑 10/10 OK——5 用户 train+infer 共 20 个 cleaned CSV 全部产出，单用户 train cleaned 约 4.3MB
 - [x] 强制重跑功能（--force）：`run_batch(force=...)` + CLI `--force`——忽略已完成产物（_DONE）重新训练/推理，优先级高于断点续跑（resume）；产物写入新时间戳目录不覆盖历史；`_new_outdir` 同秒冲突追加序号保证唯一；可与 --user-key/--stage 任意组合
@@ -54,6 +59,11 @@
 4. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- 开态概率的实现选择：回归模型无原生概率输出，用以 on_thr_w 为中心的 sigmoid 伪概率（p=1/(1+exp(-4·(P−thr)/thr))）——单调、阈值处恰 0.5、与 pred_state 决策边界一致；不假称是校准概率（文档写明"伪概率"），M2 引入分类头模型后可替换为真概率
+- target_state 用 pandas Int64 可空整型：无分路真值处为空而非 0（避免把"未知"当"关态"误导下游）；真值二值化与 pred 同一 on_thr_w 口径
+- 三阶段评估不改选型口径：best_model 仍按 test 挑选（train 指标必然乐观、val 已用于早停/调参），train/val 指标用于过拟合诊断（如 ridge train r2 0.954 vs test 0.616 提示过拟合幅度）
+- 日级指标定位为诊断而非选型：单日 96 点上 r2/sae 波动大（如某天全关时 r2=0），metrics_daily.csv 用于定位"哪几天预测差"，选型仍看整段指标
+- evaluate_daily 放 evaluation 模块（不放 pipeline）：与 evaluate_all 同域复用注册表，pipeline 只负责组装与落盘
 - 清洗数据落盘位置选运行时间戳目录内（cleaned/ 子目录）而非独立顶层目录：与该次运行的配置快照/质量报告同域，可追溯「这份清洗数据是哪次运行、哪套参数产出的」；每次 force 重跑各有一份，不互相覆盖
 - 落盘时机选清洗后、重采样前（bus 保留原始 5min 粒度）：保证保存的是「清洗」这一步的产物本身；15min 聚合结果可由 agg_strategy.json + cleaned CSV 复现
 - 默认开启（save_cleaned_csv: true）：单用户产物约 4–5MB 可接受；数据量大时配置关闭即可，测试覆盖关闭路径

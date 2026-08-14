@@ -225,3 +225,18 @@
   - 默认开启，数据量大时可配置关闭
 - 未决问题：无新增
 - 相关文件/分支：nilm/pipeline/user_task.py、configs/default.yaml、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-14] 会话纪要（第 17 次）
+- 目标：训练阶段增加三阶段（train/val/test）+ 日级指标输出；推理阶段增加状态真值/开态概率 + 日级指标输出
+- 完成项：
+  - evaluation/metrics.py 新增 evaluate_daily（按自然日分组评估，date/n_points/各指标宏平均，返回 DataFrame）
+  - postprocess/state.py 新增 state_probability（以 on_thr_w 为中心的 sigmoid 伪概率，阈值处 0.5，决策边界与 pred_state 一致）
+  - user_task 训练：每模型在 train/val/test 三切分上评估 → metrics_by_split.csv（model×split）；每模型×每阶段×每天 → metrics_daily.csv；选型口径不变（test）
+  - user_task 推理：inference_result.csv 契约扩列 target_state（真值二值化，Int64 可空）+ pred_prob；离线评估增加日级 metrics_daily.csv（model×date）
+  - contracts.INFER_RESULT_COLUMNS 更新为 7 列；README 输出产物章节更新
+  - 新增 5 项测试，105 项全过；真实数据 --force 全量重跑 10/10 OK（842 抽查：9 行三阶段汇总、306 行训练日级、决策边界/真值状态一致性通过）
+- 关键决策：
+  - pred_prob 是 sigmoid 伪概率非校准概率（文档注明）；M2 分类头模型可替换为真概率
+  - target_state 可空整型：无真值为空而非 0；三阶段指标用于过拟合诊断，选型仍按 test；日级指标定位诊断非选型
+- 未决问题：无新增
+- 相关文件/分支：nilm/evaluation/metrics.py、nilm/postprocess/state.py、nilm/pipeline/user_task.py、nilm/common/contracts.py、tests/{test_batch,test_classification_metrics}.py、README.md；分支 arena/019ffeb6-nilm-new

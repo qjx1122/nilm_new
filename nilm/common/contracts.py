@@ -158,4 +158,7 @@ def is_reserved_config_key(key: str) -> bool:
 INFERENCE_RESULT_REL = "predictions/inference_result.csv"   # 最终预测 CSV（§2.3）
 # 注：日级指标 23 字段清单与启动段字段契约在指南附件中定义；附件未随 PDF 提供，
 #     当前按已知字段实现并记录为「接口待确认项」（指南 §0 同口径处理）。
-INFER_RESULT_COLUMNS = ["timestamp", "user_id", "target", "pred", "pred_state"]
+# target_state = 状态真值（target 按 on_thr_w 二值化；无分路真值时为空）；
+# pred_prob    = 开态概率（以 on_thr_w 为中心的 sigmoid 伪概率，见 postprocess.state）。
+INFER_RESULT_COLUMNS = ["timestamp", "user_id", "target", "target_state",
+                        "pred", "pred_state", "pred_prob"]

@@ -72,10 +72,14 @@ outputs/
     ├── train/<timestamp>/                    # 配置快照/schema 报告/质量报告/聚合策略记录/
     │   ├── cleaned/{bus,branch}_cleaned.csv  # 清洗后数据（去重/负功率裁剪/短缺口插值；
     │   │                                     #   preprocess.save_cleaned_csv: false 可关闭）
+    │   ├── metrics_by_split.csv              # 每模型 train/val/test 三阶段指标汇总
+    │   ├── metrics_daily.csv                 # 每模型×每阶段×每天 日级指标
     │   …                                     # 可辨识性报告/窗口索引/模型/指标/对比报告/_DONE
     └── infer/<timestamp>/
         ├── cleaned/{bus,branch}_cleaned.csv  # 同上（branch 仅当存在分路文件时产出）
-        └── predictions/inference_result.csv  # 输出契约：timestamp,user_id,target,pred,pred_state
+        ├── metrics_daily.csv                 # 推理离线评估日级指标（有分路真值时产出）
+        └── predictions/inference_result.csv  # 输出契约：timestamp,user_id,target,target_state,
+                                              #   pred,pred_state,pred_prob（真值状态与开态概率）
 ```
 
 ## 代码结构（按功能模块解耦，依赖方向单向）
