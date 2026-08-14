@@ -86,6 +86,46 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
         sorted(p.name for p in (data_root / "infers" / USER_KEY).iterdir())
 
 
+def test_force_rerun_ignores_done(tmp_path, base_cfg_file, time_filter_file):
+    """force=True：已有 _DONE 产物仍强制重新训练+推理，产物写入新时间戳目录。"""
+    data_root = _setup(tmp_path)
+    out_root = tmp_path / "outputs"
+
+    # 首次执行完成（产生 _DONE）
+    run_batch(time_filter_file, base_config_path=base_cfg_file,
+              data_root=data_root, output_root=out_root, stages=("train", "infer"),
+              user_keys=[USER_KEY])
+    n_train_1 = len(list((out_root / USER_KEY / "train").iterdir()))
+    n_infer_1 = len(list((out_root / USER_KEY / "infer").iterdir()))
+
+    # force 重跑：不得出现 SKIPPED_RESUME，全部重新执行为 OK
+    info = run_batch(time_filter_file, base_config_path=base_cfg_file,
+                     data_root=data_root, output_root=out_root, stages=("train", "infer"),
+                     user_keys=[USER_KEY], force=True)
+    table = pd.read_csv(info["status_csv"])
+    assert (table["status"] == Status.OK).all(), table
+    assert not (table["status"] == Status.SKIPPED_RESUME).any()
+
+    # 产物新增时间戳目录（历史产物不被覆盖删除）
+    assert len(list((out_root / USER_KEY / "train").iterdir())) == n_train_1 + 1
+    assert len(list((out_root / USER_KEY / "infer").iterdir())) == n_infer_1 + 1
+
+
+def test_force_overrides_resume_default(tmp_path, base_cfg_file, time_filter_file):
+    """force 优先级高于 resume：resume=True + force=True 仍重跑。"""
+    data_root = _setup(tmp_path)
+    out_root = tmp_path / "outputs"
+    run_batch(time_filter_file, base_config_path=base_cfg_file,
+              data_root=data_root, output_root=out_root, stages=("train",),
+              user_keys=[USER_KEY])
+    info = run_batch(time_filter_file, base_config_path=base_cfg_file,
+                     data_root=data_root, output_root=out_root, stages=("train",),
+                     user_keys=[USER_KEY], resume=True, force=True)
+    table = pd.read_csv(info["status_csv"])
+    r = table[(table["user_key"] == USER_KEY) & (table["mode"] == "train")].iloc[0]
+    assert r["status"] == Status.OK, r["message"]
+
+
 def test_single_user_mode(tmp_path, base_cfg_file, time_filter_file):
     """单用户执行 = users=[一个 key] 的批量（同一代码路径）。"""
     data_root = _setup(tmp_path)

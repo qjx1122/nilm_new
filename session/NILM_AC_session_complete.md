@@ -195,3 +195,18 @@
   - 计数不参与最优模型排序（COUNT_METRICS 豁免）
 - 未决问题：844 test 切分仅 2 点统计意义弱；789/800 推理段 FN 全量待 M2 分析
 - 相关文件/分支：nilm/evaluation/{metrics,compare}.py、configs/default.yaml、tests/test_classification_metrics.py、STATUS.md、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-14] 会话纪要（第 15 次）
+- 目标：批量/单用户执行增加强制重新训练推理功能（--force）
+- 完成项：
+  - pipeline/batch.py：run_batch 新增 force 参数，force=True 时忽略 _DONE 断点续跑判定强制重新训练/推理（优先级高于 resume），并打日志提示
+  - scripts/run_batch_users.py：新增 --force CLI 参数，可与 --user-key/--stage 任意组合
+  - user_task.py `_new_outdir`：同秒重复运行目录冲突时追加 _1/_2 序号（mkdir 不再 exist_ok），保证 force 重跑产物目录唯一、历史产物不被覆盖
+  - 新增 2 项测试（force 忽略 _DONE 且产物目录 +1、force 优先于 resume），98 项全过
+  - 真实数据三轮验证：无 force 二跑 SKIPPED_RESUME×10；单用户 --force OK×2（train+infer）；全量 --force OK×10
+  - README.md 运行命令章节新增 --force 用法（条件触发更新）
+- 关键决策：
+  - --force 与 --no-resume 行为等价但意图区分：--force 是「强制重跑」的显式入口且优先级最高，README 推荐使用
+  - force 不删除历史产物，写入新时间戳目录（审计可追溯）
+- 未决问题：无新增
+- 相关文件/分支：nilm/pipeline/{batch,user_task}.py、scripts/run_batch_users.py、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new

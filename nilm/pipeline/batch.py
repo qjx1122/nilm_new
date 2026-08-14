@@ -58,8 +58,13 @@ def run_batch(time_filter_config_path: str | Path,
               output_root: str | Path = "outputs",
               stages: tuple[str, ...] = ("train", "infer"),
               user_keys: list[str] | None = None,
-              resume: bool = True) -> dict:
-    """批量（或单用户）执行入口。返回 {'batch_dir','status_csv','rows'}。"""
+              resume: bool = True,
+              force: bool = False) -> dict:
+    """批量（或单用户）执行入口。返回 {'batch_dir','status_csv','rows'}。
+
+    force=True：强制重新训练/推理——忽略已完成产物（``_DONE``）重新执行，
+    优先级高于 resume；产物写入新的时间戳目录，不覆盖历史产物。
+    """
     data_root, output_root = Path(data_root), Path(output_root)
     tcfg = load_time_filter_config(time_filter_config_path)
     with open(base_config_path, "r", encoding="utf-8") as f:
@@ -76,6 +81,9 @@ def run_batch(time_filter_config_path: str | Path,
         Path(time_filter_config_path).read_text(encoding="utf-8"), encoding="utf-8")
     (batch_dir / "base_config.yaml").write_text(
         yaml.safe_dump(base_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    if force:
+        log.info("强制重跑模式（--force）：忽略已完成产物，全部重新训练/推理")
 
     cfg_keys = set(list_user_keys(tcfg))
     rows: list[BatchRow] = []
@@ -113,8 +121,8 @@ def run_batch(time_filter_config_path: str | Path,
                 rows.append(_row(uk, mode, Status.FAILED, f"配置错误: {e}"))
                 continue
 
-            # 断点续跑：已有 _DONE 的跳过（§13）
-            if resume:
+            # 断点续跑：已有 _DONE 的跳过（§13）；force 强制重跑（优先级更高）
+            if resume and not force:
                 done = latest_done_dir(output_root / uk / mode)
                 if done is not None:
                     rows.append(_row(uk, mode, Status.SKIPPED_RESUME, f"已完成: {done}", str(done)))

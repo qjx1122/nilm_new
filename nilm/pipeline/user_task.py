@@ -64,8 +64,15 @@ class UserTaskResult:
 
 
 def _new_outdir(output_root: Path, user_key: str, mode: str) -> Path:
-    out = Path(output_root) / user_key / mode / datetime.now().strftime("%Y%m%d_%H%M%S")
-    out.mkdir(parents=True, exist_ok=True)
+    """新建带时间戳的运行目录；同秒重复运行（如强制重跑）时追加序号保证唯一。"""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = Path(output_root) / user_key / mode
+    out = base / stamp
+    n = 1
+    while out.exists():  # 不覆盖既有产物（含同秒内的 force 重跑）
+        out = base / f"{stamp}_{n}"
+        n += 1
+    out.mkdir(parents=True)
     return out
 
 

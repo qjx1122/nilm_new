@@ -24,7 +24,10 @@ python3 -m venv .venv
 # 单用户执行（同一代码路径：单用户 = users=[一个 key] 的批量）
 .venv/bin/python scripts/run_batch_users.py --time-filter-config <cfg.json> --user-key <device>_<user>
 
-# 其他选项：--stage train|infer|all   --no-resume   --data-root   --output-root   --base-config
+# 强制重新训练/推理（忽略已完成产物 _DONE，产物写入新时间戳目录；可与 --user-key 组合）
+.venv/bin/python scripts/run_batch_users.py --time-filter-config <cfg.json> --force
+
+# 其他选项：--stage train|infer|all   --no-resume   --force   --data-root   --output-root   --base-config
 
 # 多数据源用户数据批量合并（先内源合并、后跨源合并，重叠告警跳过，原始数据只读）
 # ⚠️ 待合并文件名必须严格符合以下两种格式之一（均不带任何后缀，需求文档 §2.2）：
@@ -34,7 +37,7 @@ python3 -m venv .venv
 .venv/bin/python scripts/merge_user_data.py --sources <源1> <源2> [<源3> ...] \
     [--output-root outputs/merged] [--log-dir <日志目录>] [--no-keep-original]
 
-.venv/bin/python -m pytest tests/ -q             # 79 项测试（含解耦守卫与合并逻辑）
+.venv/bin/python -m pytest tests/ -q             # 98 项测试（含解耦守卫与合并逻辑）
 ```
 
 合并脚本输出：`<output-root>/<数据源名>/<终端号_用户号>/` 复刻原层级（阶段一结果）+
