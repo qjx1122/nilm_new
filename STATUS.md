@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：7 模型批量验证（transformer 临时注释）+ 日级指标达标分析（SAE<0.2 & F1>0.9，scripts/analyze_daily_metrics.py）
 - ✅ 已完成：配置说明文档 docs/CONFIG_GUIDE.md（default.yaml 逐项详解 + 8 模型训练效率因素）
 - ✅ 已完成：GPU 自动检测（device=auto：CUDA→MPS→CPU）+ 训练/推理前分路开机情况分析（branch_sessions.csv）
 - ✅ 已完成：M2 多模型——新增 random_forest / xgboost / lstm / cnn1d / transformer 五个模型（8 模型对比全通）
@@ -68,6 +69,9 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- transformer 临时注释而非删除（default.yaml 注释保留参数，恢复取消注释即可）：CPU 大户 ~25min 拖慢批跑 4 倍；恢复时机=GPU 环境或调参后
+- 日级达标分析发现 SAE 口径缺陷：真值全关日 Σtrue=0，SAE=|Σpred|/(0+eps) 出现 1e13 天文数字——建议正式口径对全关日只考核 F1，或 SAE 分母加下限保护
+- SAE 超标主因是训练/推理期负荷水平漂移（Σpred/Σtarget：800 低估 43%、778 低估 17%、842 低估 14%）而非开关误判（F1 多数完美）——改善方向是扩充训练时间范围，非换模型
 - 设备解析放模型层（resolve_device）而非 pipeline：fit/predict 各自独立解析——模型对象可跨设备迁移（GPU 训练 CPU 推理）；auto 语义进 params 持久化，载入后仍按当前机器解析
 - 采样间隔推断用 np.diff(idx.values)/timedelta64(1,'m')：新版 pandas DatetimeIndex 底层可能是 us 而非 ns，view(int64)/6e10 会算错 900 倍（踩坑：测试 duration 0.1min）——timedelta64 除法不依赖底层单位
 - 开机段跨午夜按天切开（groupby normalize 后逐日游程）：口径为「每天开机情况」，跨日会话拆成两天各自的段；电量按段内 Σ(P×Δt)/1000 kWh

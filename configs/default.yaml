@@ -71,8 +71,9 @@ models:                        # 多模型对比：注册表 + 配置驱动
     params: {window: 96, hidden_size: 64, epochs: 60, patience: 8}
   - name: cnn1d                # 1D-CNN 时序回归（卷积堆叠+全局池化）
     params: {window: 96, channels: 32, epochs: 60, patience: 8}
-  - name: transformer          # Transformer 时序回归（Encoder+位置编码）
-    params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 60, patience: 8}
+  # transformer 临时注释（CPU 大用户约 25min，批跑提速；恢复时取消注释即可，2026-08-14）
+  # - name: transformer        # Transformer 时序回归（Encoder+位置编码）
+  #   params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 60, patience: 8}
 
 # 指标：回归（mae/rmse/r2/sae）+ 状态分类（f1/accuracy/precision/recall，按 on_thr_w 二值化）
 #      + 混淆矩阵计数（tp/fp/fn/tn，同一二值化口径，诊断输出不参与最优模型排序）

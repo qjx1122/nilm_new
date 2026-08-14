@@ -279,3 +279,15 @@
 - 关键决策：配置说明独立成 docs/ 文档而非塞进 README（README 保持速查，详解可长文维护；配置结构变化时两处同步——收尾仪式条件触发项）
 - 未决问题：无新增
 - 相关文件/分支：docs/CONFIG_GUIDE.md、README.md、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-14] 会话纪要（第 21 次）
+- 目标：注释 transformer 重新批量验证；日级指标达标分析（SAE<0.2 且 F1>0.9）并归因不达标用户数据
+- 完成项：
+  - default.yaml models 注释 transformer（保留参数便于恢复）；--force 全量重跑 10/10 OK（~13min，提速 4 倍）
+  - 新增 scripts/analyze_daily_metrics.py（达标判定+原因归类+汇总 CSV，参数可调口径）
+  - 归因分析：346 行中 277 行不达标（80.1%）——842 全关日误报+边界 FP；844 推理期数据脱节全漏报；778 test 全达标/infer 仅 SAE 轻超（低估 17%）；789 阈值与负荷形态不匹配（TN=0）；800 训练期仅 6 天代表性不足（低估 43%）
+  - 共性结论：F1（开关判定）树模型已达标，SAE 缺口来自训练/推理期负荷漂移；SAE 全关日分母 0 口径缺陷
+  - 134 项测试全过
+- 关键决策：SAE 口径修订建议（全关日只考核 F1）；改善方向定为扩充训练时间范围而非换模型
+- 未决问题：正式达标口径待需求方确认；transformer 恢复时机
+- 相关文件/分支：configs/default.yaml、scripts/analyze_daily_metrics.py、outputs/analysis/（不入库）、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
