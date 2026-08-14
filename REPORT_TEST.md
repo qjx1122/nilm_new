@@ -165,3 +165,19 @@
   - 推理侧语义校验全过：pred_prob 决策边界与 pred_state 一致（p≥0.5 ⟺ P≥thr）、target_state 与真值二值化一致、无真值处为空
 - 是否进入 REPORT.md（稳定结论）：否（诊断能力扩展，非算法结论）
 - 遗留问题：pred_prob 为伪概率（非校准），M2 分类头模型引入后可替换；指南附件「日级指标 23 字段」契约仍未提供，当前日级 CSV 按现有指标集输出，待附件到位后对齐字段
+
+## [2026-08-14] 专题：M2 多模型落地（RF/XGB/LSTM/1D-CNN/Transformer）8 模型对比
+- 类型：实验专题
+- 目标与假设：新增随机森林/XGBoost/LSTM/1D-CNN/Transformer 五个回归模型，统一 BaseModel 接口接入 8 模型对比。假设：树模型在当前数据量（数千样本）上优于线性基线；DL 序列模型受样本量限制可能不占优
+- 方法 / 数据 / 参数：
+  - tree_models：RF（sklearn 原生 multioutput，n_est 200）、XGB（每分路一回归器，有 val 早停，n_est 400/depth 6/lr 0.05）
+  - seq_models：_SeqTorchModel 适配器基类（L=96 滑窗 Seq2Point 逐点输出、头部复制填充、Adam+MSE、val 早停回滚最优权重、state_dict 级持久化、种子可复现）；LSTM(h64)/CNN1D(ch32×3)/Transformer(d64/head4/layer2)
+  - 依赖惰性导入（未装 torch/xgboost 仅在实例化时报错）；requirements-ml.txt 增补 xgboost
+  - 19 项新测试；真实数据 5 用户 --force 全量重跑（train+infer）
+- 结果 / 结论：
+  - 124 项测试全过；批量 10/10 OK；best_model 分布：842 ridge(0.616)、844 proportional、778 xgboost(**0.951**，原 best 0.827)、789 cnn1d(-0.767，全员负但 DL 最不差)、800 random_forest(**0.768**，原 0.666)
+  - 树模型显著提效：778 r2 0.827→0.951（xgb），800 0.666→0.768（rf）——非线性+lag/rolling 特征组合有效
+  - DL 三兄弟未超越树模型：样本量数千级不足以喂饱序列模型，且时序信息已被 lag/rolling 扁平特征吸收；789 例外（cnn1d 相对最好）提示强噪声用户下平滑归纳偏置有价值
+  - 性能：树模型秒级；LSTM/CNN 分钟级；大用户 transformer CPU 约 25 min（可接受，后续可调）
+- 是否进入 REPORT.md（稳定结论）：否（首轮对比，超参未调优，结论未稳定）
+- 遗留问题：DL 调参与 GPU 加速；789/844 数据侧问题（无模型可救）；lightgbm(gbdt) 未实现（依赖已在 requirements-ml，需要时按同模式接入）

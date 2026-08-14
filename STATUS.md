@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：M2 多模型——新增 random_forest / xgboost / lstm / cnn1d / transformer 五个模型（8 模型对比全通）
 - ✅ 已完成：训练三阶段（train/val/test）指标 + 每模型日级指标 CSV；推理结果增加状态真值/开态概率 + 日级指标 CSV
 - ✅ 已完成：清洗后数据落盘 CSV 功能（cleaned/{bus,branch}_cleaned.csv，配置可关）
 - ✅ 已完成：批量/单用户执行增加强制重新训练推理功能（--force，忽略 _DONE 重跑）
@@ -37,6 +38,8 @@
 - [x] 倍率规则落地（官方确认）：bus_field_map 全部字段 multiplier 0.001（实际值 = 原始/1000），PF 原始 916→0.916 归一无量纲；加载器 multiplier 机制零代码改动（配置驱动生效）
 - [x] 验证：84 项测试全过（新增倍率应用测试）；真实数据复验 10/10 OK——bus 质量分升至 98.7–100（缩放前 PF 原始值越界计为异常，缩放后消除）；模型指标不变（均匀缩放对 z-score 归一后的模型近似不变，符合预期）
 
+- [x] M2 多模型支持：`tree_models.py` 实现 random_forest（sklearn 原生 multioutput）/ xgboost（每分路一回归器，有 val 早停）；`seq_models.py` 实现 `_SeqTorchModel` 适配器基类（滑窗构造/训练循环/早停/批推理/权重级持久化）+ lstm / cnn1d / transformer 三个时序回归；全部惰性导入依赖并注册进 MODEL_REGISTRY，configs/default.yaml models 扩为 8 项；requirements-ml.txt 增补 xgboost
+- [x] 验证（2026-08-14）：124 项测试全过（新增 19 项：注册/形状与学习能力/save-load 往返/DL 种子可复现/滑窗对齐）；真实数据 --force 全量重跑 10/10 OK——树模型显著提效：778 用户 xgboost r2 0.951（原 best history_profile 0.827）、800 用户 random_forest r2 0.768（原 ridge 0.666）；DL 模型在当前小数据量下未超越树模型（预期内，窗口模型需更多数据）
 - [x] 训练三阶段评估：每个模型在 train/val/test 三个切分上分别评估（原先只评 test）——`metrics_by_split.csv`（model×split 行 × 指标列）；选型口径不变（仍按 test 指标挑 best_model，metrics.json/comparison 兼容）
 - [x] 日级指标落盘：新增 `evaluation.metrics.evaluate_daily`（按自然日分组评估，date/n_points/各指标宏平均）——训练 `metrics_daily.csv`（model×split×date）、推理 `metrics_daily.csv`（model×date，有分路真值时产出）
 - [x] 推理结果扩列：`inference_result.csv` 契约扩为 timestamp,user_id,target,**target_state**,pred,pred_state,**pred_prob**——target_state=分路真值按 on_thr_w 二值化（无真值为空，Int64 可空）；pred_prob=以 on_thr_w 为中心的 sigmoid 伪概率（阈值处 0.5，决策边界与 pred_state 判据一致），`postprocess.state.state_probability`
@@ -53,12 +56,19 @@
 - 无
 
 ## 下一步（TODO）
-1. M2 多模型：GBDT/Seq2Point/LSTM，重点改善稀疏用户 844/789（当前基线 r2<0）
-2. 指南附件缺失项（日级指标字段清单/启动段契约）待补充
-3. 总线真实文件均带 -1 后缀（非合并对象），何时切换严格格式取决于上游导出约定
-4. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
+1. ~~M2 多模型：GBDT/Seq2Point/LSTM~~ 已落地 8 模型对比；稀疏用户 789 仍无正 r2 模型（数据侧问题为主），844 test 切分过小——需数据扩充或切分配置调整
+2. DL 模型调参/加速：大用户 transformer CPU 训练约 25 min，可下调 epochs/d_model 或引入 GPU；DL 当前未超越树模型，数据量增大后复评
+3. 指南附件缺失项（日级指标字段清单/启动段契约）待补充
+4. 总线真实文件均带 -1 后缀（非合并对象），何时切换严格格式取决于上游导出约定
+5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- DL 序列模型的窗口语义选 Seq2Point 逐点版（输入 [t-L+1,t] 特征、输出 t 时刻功率，头部复制首行填充）：保证 predict 输出行数=输入行数，与扁平模型对齐，评估/推理零改动；未复用 build_windows（其窗口不含头部填充，输出少 L-1 行）
+- torch 局部类 Net 不可 pickle：__getstate__/__setstate__ 只序列化 state_dict，load 时经 _build_net 重建结构再载权重——BaseModel.save/load 接口不变
+- DL 训练打乱用独立 np.random.default_rng(seed) 而非全局 np.random：保证同种子两次训练逐位一致（测试守卫）；float(loss) 改 float(loss.detach()) 消 torch 警告
+- xgboost 早停仅在有验证集时启用（early_stopping_rounds=None 关闭）：无 val 场景（如单元测试）不炸
+- 大用户 transformer CPU 训练约 25 分钟（5717 样本×L96）：当前可接受；后续可按需下调 epochs/d_model 或加 GPU
+- 8 模型真实数据结论：树模型（RF/XGB）在中等数据量用户上显著优于线性/画像基线；DL 三兄弟未超越树模型——样本量不足（数千级）+ 特征已含 lag/rolling（时序信息已被扁平特征吸收），M2 后续调参或数据扩充后再评估
 - 开态概率的实现选择：回归模型无原生概率输出，用以 on_thr_w 为中心的 sigmoid 伪概率（p=1/(1+exp(-4·(P−thr)/thr))）——单调、阈值处恰 0.5、与 pred_state 决策边界一致；不假称是校准概率（文档写明"伪概率"），M2 引入分类头模型后可替换为真概率
 - target_state 用 pandas Int64 可空整型：无分路真值处为空而非 0（避免把"未知"当"关态"误导下游）；真值二值化与 pred 同一 on_thr_w 口径
 - 三阶段评估不改选型口径：best_model 仍按 test 挑选（train 指标必然乐观、val 已用于早停/调参），train/val 指标用于过拟合诊断（如 ridge train r2 0.954 vs test 0.616 提示过拟合幅度）

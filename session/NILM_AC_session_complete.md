@@ -240,3 +240,18 @@
   - target_state 可空整型：无真值为空而非 0；三阶段指标用于过拟合诊断，选型仍按 test；日级指标定位诊断非选型
 - 未决问题：无新增
 - 相关文件/分支：nilm/evaluation/metrics.py、nilm/postprocess/state.py、nilm/pipeline/user_task.py、nilm/common/contracts.py、tests/{test_batch,test_classification_metrics}.py、README.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-14] 会话纪要（第 18 次）
+- 目标：新增随机森林/XGBoost/LSTM/1D-CNN/Transformer 五个回归模型
+- 完成项：
+  - tree_models.py：random_forest（sklearn multioutput）、xgboost（每分路一回归器+val 早停）
+  - seq_models.py：_SeqTorchModel 适配器基类（L=96 滑窗 Seq2Point 逐点输出/早停/批推理/state_dict 持久化/种子可复现）+ lstm/cnn1d/transformer
+  - 注册表接入 + default.yaml models 扩为 8 项 + requirements-ml.txt 增补 xgboost + README 更新
+  - 新增 19 项测试（注册/形状/学习能力优于均值基线/save-load 往返/DL 同种子复现/滑窗对齐），124 项全过
+  - 真实数据 --force 全量重跑 10/10 OK：778 xgboost r2 0.951（+0.124）、800 random_forest 0.768（+0.102）；DL 未超越树模型（预期内）
+- 关键决策：
+  - DL 窗口语义 Seq2Point 逐点版（头部复制填充，输出行数=输入行数），评估/推理零改动
+  - torch 局部类不可 pickle → __getstate__/__setstate__ 序列化 state_dict，load 时重建结构
+  - xgboost 早停仅有 val 时启用；DL 打乱用独立 RNG 保证同种子复现
+- 未决问题：DL 调参/GPU；大用户 transformer CPU 约 25 min
+- 相关文件/分支：nilm/models/{tree_models,seq_models,__init__}.py、configs/default.yaml、requirements-ml.txt、tests/test_ml_models.py、README.md；分支 arena/019ffeb6-nilm-new

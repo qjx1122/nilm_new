@@ -62,6 +62,16 @@ models:                        # 多模型对比：注册表 + 配置驱动
   - name: proportional
   - name: ridge
     params: {alpha: 1.0}
+  - name: random_forest        # 随机森林回归（sklearn，原生 multioutput）
+    params: {n_estimators: 200, min_samples_leaf: 2}
+  - name: xgboost              # XGBoost 回归（每分路一回归器；有 val 时早停）
+    params: {n_estimators: 400, max_depth: 6, learning_rate: 0.05}
+  - name: lstm                 # LSTM 时序回归（L=96 滑窗，Seq2Point 逐点输出）
+    params: {window: 96, hidden_size: 64, epochs: 60, patience: 8}
+  - name: cnn1d                # 1D-CNN 时序回归（卷积堆叠+全局池化）
+    params: {window: 96, channels: 32, epochs: 60, patience: 8}
+  - name: transformer          # Transformer 时序回归（Encoder+位置编码）
+    params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 60, patience: 8}
 
 # 指标：回归（mae/rmse/r2/sae）+ 状态分类（f1/accuracy/precision/recall，按 on_thr_w 二值化）
 #      + 混淆矩阵计数（tp/fp/fn/tn，同一二值化口径，诊断输出不参与最优模型排序）

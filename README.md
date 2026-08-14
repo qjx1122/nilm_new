@@ -12,7 +12,9 @@ NILM（Non-Intrusive Load Monitoring，非侵入式负荷监测）项目工作�
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt        # 核心：numpy/pandas/pyyaml/tabulate
-.venv/bin/pip install -r requirements-ml.txt     # 可选：M2 起的树模型/深度模型/绘图
+.venv/bin/pip install -r requirements-ml.txt     # M2 模型依赖：sklearn/xgboost/lightgbm/torch/绘图
+                                                 # （random_forest/xgboost/lstm/cnn1d/transformer 需要；
+                                                 #   仅跑 3 个基线模型可跳过，依赖均为惰性导入）
 ```
 
 ## 运行命令（指南 §12 规定入口）
@@ -102,5 +104,8 @@ scripts/run_batch_users.py   CLI 入口
 
 - 已对齐指南 V2.1：数据契约（RE_BUS/RE_BR/user_key）、用户 JSON 配置、时间过滤与切分锚定、
   可辨识性分析、批量执行（失败隔离/断点续跑/状态码）、单用户与多用户同路径执行
-- 内置 3 个基线/线性模型；GBDT/Seq2Point/LSTM 为 M2 计划（`nilm/models/tree_models.py`、`seq_models.py`）
+- 内置 8 个模型：3 基线/线性（history_profile/proportional/ridge，零 ML 依赖）+
+  2 树模型（random_forest/xgboost，`tree_models.py`）+
+  3 深度时序（lstm/cnn1d/transformer，`seq_models.py`，L=96 滑窗 Seq2Point 逐点输出）；
+  全部经 MODEL_REGISTRY 注册、configs/default.yaml `models:` 配置驱动
 - 待办：真实数据 M0 摸底；指南附件中「日级指标 23 字段 / 启动段字段」契约待确认（PDF 未含附件原文）
