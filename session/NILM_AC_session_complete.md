@@ -270,3 +270,12 @@
   - 开机段跨午夜按天切开；整天关机行 session_id=0；时间段取该日实际数据范围
 - 未决问题：无新增
 - 相关文件/分支：nilm/models/seq_models.py、nilm/analysis/branch_sessions.py、nilm/pipeline/user_task.py、tests/{test_branch_sessions,test_ml_models,test_batch}.py、README.md、configs/default.yaml；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-14] 会话纪要（第 20 次）
+- 目标：将 default.yaml 配置说明沉淀为文档
+- 完成项：
+  - 新增 docs/CONFIG_GUIDE.md v1.0：全局/data/quality/preprocess/features/dataset/bus_field_map/metrics/infer_model 逐项详解（以代码实际语义为准）；8 模型重点说明（原理/参数/训练效率因素/实测定位）；5 户实测结论速览与调优建议
+  - README「配置文件结构」章节添加文档链接
+- 关键决策：配置说明独立成 docs/ 文档而非塞进 README（README 保持速查，详解可长文维护；配置结构变化时两处同步——收尾仪式条件触发项）
+- 未决问题：无新增
+- 相关文件/分支：docs/CONFIG_GUIDE.md、README.md、STATUS.md；分支 arena/019ffeb6-nilm-new
