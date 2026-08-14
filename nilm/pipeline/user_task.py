@@ -84,6 +84,20 @@ def latest_done_dir(root: Path) -> Path | None:
     return done[-1] if done else None
 
 
+def _save_cleaned_csv(out: Path, name: str, df: pd.DataFrame, enabled: bool) -> None:
+    """清洗后数据落盘：cleaned/<name>_cleaned.csv（时间索引列名 timestamp）。
+
+    enabled 由配置 ``preprocess.save_cleaned_csv`` 控制（默认开启）；
+    只写产物目录 outputs/，不触碰原始数据（§13 只读约束）。
+    """
+    if not enabled or df is None or df.empty:
+        return
+    path = out / "cleaned" / f"{name}_cleaned.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index_label="timestamp", encoding="utf-8")
+    log.info("清洗后数据已保存: %s（%d 行 × %d 列）", path, len(df), df.shape[1])
+
+
 def _dump(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str),
@@ -126,6 +140,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         cleaner = Cleaner(clip_negative=not allow_negative,
                           max_gap_interp=int(pp.get("max_gap_interp", 2)))
         bus_c, branch_c = cleaner.transform(bus_raw), cleaner.transform(branch_raw)
+        save_cleaned = bool(pp.get("save_cleaned_csv", True))
+        _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
+        _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
 
         # —— §5 统一 15min（聚合策略可配置且记录）
         bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
@@ -283,6 +300,8 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         allow_negative = bool(pp.get("allow_negative_power", False))
         bus_c = Cleaner(clip_negative=not allow_negative,
                         max_gap_interp=int(pp.get("max_gap_interp", 2))).transform(bus_raw)
+        save_cleaned = bool(pp.get("save_cleaned_csv", True))
+        _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
         bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
         _dump(out / "agg_strategy.json", agg_record)
 
@@ -327,6 +346,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if scan.branch_files:  # 分路仅用于离线评估，不参与生产推理（§3.1）
             branch_raw, _ = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
             branch_c = Cleaner(clip_negative=not allow_negative).transform(branch_raw)
+            _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
             tcols = resolve_target_cols(user_cfg.get("target_col"), branch_c)
             t = build_target(branch_c, tcols).reindex(valid.index)
             target_vals = t

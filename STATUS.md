@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：清洗后数据落盘 CSV 功能（cleaned/{bus,branch}_cleaned.csv，配置可关）
 - ✅ 已完成：批量/单用户执行增加强制重新训练推理功能（--force，忽略 _DONE 重跑）
 - ✅ 已完成：分类指标输出增加混淆矩阵计数 TP/FP/FN/TN（tp/fp/fn/tn 指标注册 + 配置默认开启）
 - ✅ 已完成：全部 5 用户重新运行验证测试（train+infer 10/10 OK，96 项测试全过）
@@ -35,6 +36,8 @@
 - [x] 倍率规则落地（官方确认）：bus_field_map 全部字段 multiplier 0.001（实际值 = 原始/1000），PF 原始 916→0.916 归一无量纲；加载器 multiplier 机制零代码改动（配置驱动生效）
 - [x] 验证：84 项测试全过（新增倍率应用测试）；真实数据复验 10/10 OK——bus 质量分升至 98.7–100（缩放前 PF 原始值越界计为异常，缩放后消除）；模型指标不变（均匀缩放对 z-score 归一后的模型近似不变，符合预期）
 
+- [x] 清洗后数据落盘：user_task 新增 `_save_cleaned_csv`——train 保存 bus+branch、infer 保存 bus（+离线评估侧 branch）到运行目录 `cleaned/{bus,branch}_cleaned.csv`（时间索引列名 timestamp，UTF-8）；配置开关 `preprocess.save_cleaned_csv`（默认 true）；只写 outputs/ 不触碰原始数据（§13 只读）
+- [x] 验证（2026-08-14）：100 项测试全过（新增 2 项：产物存在性+清洗语义抽查【功率非负/时间戳唯一】、配置关闭不产出）；真实数据 --force 全量重跑 10/10 OK——5 用户 train+infer 共 20 个 cleaned CSV 全部产出，单用户 train cleaned 约 4.3MB
 - [x] 强制重跑功能（--force）：`run_batch(force=...)` + CLI `--force`——忽略已完成产物（_DONE）重新训练/推理，优先级高于断点续跑（resume）；产物写入新时间戳目录不覆盖历史；`_new_outdir` 同秒冲突追加序号保证唯一；可与 --user-key/--stage 任意组合
 - [x] 验证（2026-08-14）：98 项测试全过（新增 2 项：force 忽略 _DONE 重跑且产物目录 +1、force 优先于 resume）；真实数据三轮验证——无 force 二跑 SKIPPED_RESUME×10、单用户 --force OK×2、全量 --force OK×10
 - [x] 混淆矩阵计数指标（TP/FP/FN/TN）：`nilm/evaluation/metrics.py` 注册 tp/fp/fn/tn 四个计数指标（与 f1 等共用 `_confusion` + on_thr_w 二值化口径；per_branch=各分路计数，macro=跨分路总数）；`configs/default.yaml` metrics 列表默认追加；`compare.py` 新增 COUNT_METRICS——计数为诊断输出不参与最优模型排序（否则「FP 越小越好」会把全预测关态的退化模型评为最优）
@@ -51,6 +54,9 @@
 4. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- 清洗数据落盘位置选运行时间戳目录内（cleaned/ 子目录）而非独立顶层目录：与该次运行的配置快照/质量报告同域，可追溯「这份清洗数据是哪次运行、哪套参数产出的」；每次 force 重跑各有一份，不互相覆盖
+- 落盘时机选清洗后、重采样前（bus 保留原始 5min 粒度）：保证保存的是「清洗」这一步的产物本身；15min 聚合结果可由 agg_strategy.json + cleaned CSV 复现
+- 默认开启（save_cleaned_csv: true）：单用户产物约 4–5MB 可接受；数据量大时配置关闭即可，测试覆盖关闭路径
 - force 与 no-resume 语义区分：--no-resume 只是「本次不查 _DONE 跳过逻辑」的开关（历史语义保留），--force 是明确的「强制重跑」意图入口且优先级最高（`resume and not force`）；两者行为等价但 --force 意图清晰，README 推荐用 --force
 - force 重跑不删除历史产物：写入新时间戳目录（审计可追溯）；同秒内重复运行（测试/快速重跑场景）曾因目录同名 exist_ok=True 复用旧目录——`_new_outdir` 改为冲突时追加 `_1/_2` 序号并 mkdir(exist_ok=False)，保证每次运行目录唯一
 - TP/FP/FN/TN 作为「指标」注册进 METRIC_REGISTRY 而非改 evaluate_all 返回结构：零侵入——user_task/metrics.json/comparison 全链路自动带上，配置可开关；代价是 macro 语义对计数取「总和」而非平均（已在 docstring 说明）

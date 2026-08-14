@@ -210,3 +210,18 @@
   - force 不删除历史产物，写入新时间戳目录（审计可追溯）
 - 未决问题：无新增
 - 相关文件/分支：nilm/pipeline/{batch,user_task}.py、scripts/run_batch_users.py、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-14] 会话纪要（第 16 次）
+- 目标：增加清洗后数据保存 CSV 功能
+- 完成项：
+  - user_task.py 新增 `_save_cleaned_csv`：清洗（去重/负功率裁剪/短缺口插值）后的数据落盘到运行目录 cleaned/{bus,branch}_cleaned.csv（时间索引列 timestamp，UTF-8）
+  - 覆盖三处清洗点：train（bus+branch）、infer（bus）、infer 离线评估（branch，仅当存在分路文件）
+  - configs/default.yaml 新增 preprocess.save_cleaned_csv 开关（默认 true）
+  - 新增 2 项测试（产物存在性+清洗语义抽查【功率非负/时间戳唯一】、配置关闭不产出），100 项全过
+  - 真实数据 --force 全量重跑 10/10 OK：5 用户 train+infer 共 20 个 cleaned CSV 全部产出并抽查验证（负值 0、时间戳唯一）
+  - README.md 输出产物章节更新（条件触发）
+- 关键决策：
+  - 落盘位置在运行时间戳目录内（与配置快照/质量报告同域，可追溯）；时机在清洗后重采样前（bus 保留 5min 原始粒度）
+  - 默认开启，数据量大时可配置关闭
+- 未决问题：无新增
+- 相关文件/分支：nilm/pipeline/user_task.py、configs/default.yaml、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new

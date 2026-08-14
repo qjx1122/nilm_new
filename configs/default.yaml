@@ -21,6 +21,7 @@ preprocess:
   clip_negative: true
   allow_negative_power: false  # §2.3：原则上非负；允许反送电必须显式改为 true
   max_gap_interp: 2
+  save_cleaned_csv: true       # 清洗后数据落盘 cleaned/{bus,branch}_cleaned.csv（false 关闭）
   min_overlap: 0.3             # 母线/分路时间重叠率门禁（稀疏用户实测放宽，见 STATUS.md）
   agg_strategy:                # §5.2：聚合策略可配置且必须记录（落盘 agg_strategy.json）
     u: mean

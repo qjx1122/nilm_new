@@ -126,6 +126,49 @@ def test_force_overrides_resume_default(tmp_path, base_cfg_file, time_filter_fil
     assert r["status"] == Status.OK, r["message"]
 
 
+def test_cleaned_csv_saved(tmp_path, base_cfg_file, time_filter_file):
+    """清洗后数据落盘：train 保存 bus+branch，infer 保存 bus+branch（离线评估侧）。"""
+    data_root = _setup(tmp_path)
+    out_root = tmp_path / "outputs"
+    run_batch(time_filter_file, base_config_path=base_cfg_file,
+              data_root=data_root, output_root=out_root, stages=("train", "infer"),
+              user_keys=[USER_KEY])
+
+    train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
+    infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+    for d, names in ((train_dir, ["bus", "branch"]), (infer_dir, ["bus", "branch"])):
+        for name in names:
+            f = d / "cleaned" / f"{name}_cleaned.csv"
+            assert f.exists(), f
+            df = pd.read_csv(f)
+            assert df.columns[0] == "timestamp"
+            assert len(df) > 0
+
+    # 清洗语义抽查：功率列非负（clip_negative=True）、时间戳无重复
+    bus = pd.read_csv(train_dir / "cleaned" / "bus_cleaned.csv")
+    p_cols = [c for c in bus.columns if c.startswith("p") and not c.startswith("pf")]
+    assert p_cols and (bus[p_cols].fillna(0) >= 0).all().all()
+    assert bus["timestamp"].is_unique
+
+
+def test_cleaned_csv_disabled_by_config(tmp_path, base_cfg, time_filter_file):
+    """preprocess.save_cleaned_csv=false 时不产出 cleaned/ 目录。"""
+    import yaml
+    base_cfg["preprocess"]["save_cleaned_csv"] = False
+    cfg_file = tmp_path / "base_off.yaml"
+    cfg_file.write_text(yaml.safe_dump(base_cfg, allow_unicode=True, sort_keys=False),
+                        encoding="utf-8")
+    data_root = _setup(tmp_path)
+    out_root = tmp_path / "outputs"
+    run_batch(time_filter_file, base_config_path=cfg_file,
+              data_root=data_root, output_root=out_root, stages=("train", "infer"),
+              user_keys=[USER_KEY])
+    train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
+    infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+    assert not (train_dir / "cleaned").exists()
+    assert not (infer_dir / "cleaned").exists()
+
+
 def test_single_user_mode(tmp_path, base_cfg_file, time_filter_file):
     """单用户执行 = users=[一个 key] 的批量（同一代码路径）。"""
     data_root = _setup(tmp_path)

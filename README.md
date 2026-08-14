@@ -70,8 +70,11 @@ outputs/
 ├── batch/<timestamp>/batch_status.csv        # 批量状态表（user_id/user_key/mode/status/…）
 └── <user_key>/
     ├── train/<timestamp>/                    # 配置快照/schema 报告/质量报告/聚合策略记录/
+    │   ├── cleaned/{bus,branch}_cleaned.csv  # 清洗后数据（去重/负功率裁剪/短缺口插值；
+    │   │                                     #   preprocess.save_cleaned_csv: false 可关闭）
     │   …                                     # 可辨识性报告/窗口索引/模型/指标/对比报告/_DONE
     └── infer/<timestamp>/
+        ├── cleaned/{bus,branch}_cleaned.csv  # 同上（branch 仅当存在分路文件时产出）
         └── predictions/inference_result.csv  # 输出契约：timestamp,user_id,target,pred,pred_state
 ```
 
