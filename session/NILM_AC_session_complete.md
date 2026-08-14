@@ -131,3 +131,16 @@
   - 当前数据集整体缺电压类点位（data9/45/81）与 ib/pfb，置 0 后电压特征无信息，建议采集侧补齐
   - 稀疏用户 844/789 基线仍差（M2 方向）
 - 相关文件/分支：configs/default.yaml、nilm/data_io/csv_source.py、nilm/preprocess/align.py、tests/test_csv_source.py；分支 arena/019ffa35-nilm-new
+
+## [2026-08-14] 会话纪要（第 10 次）
+- 目标：实际三相 U/I/P/PF = 总线文件对应列原始数据 / 1000，修改代码落实倍率
+- 完成项：
+  - configs/default.yaml bus_field_map 全部 12 字段 multiplier 改为 0.001（加载器 multiplier 机制配置驱动生效，零代码改动）
+  - 新增倍率应用测试（220000→220V、PF 916→0.916 归一），84 项全过
+  - 真实数据复验 10/10 OK：bus 质量分 98.7–100（缩放前 PF 原始值 ~916 越界计异常，缩放后消除）；模型指标不变（均匀缩放 + z-score 归一的预期不变性）
+  - 量级验证（778 用户）：ia 756→0.756A、pa 56573→56.6W、pfa 692→0.692，全部合理
+- 关键决策：
+  - PF 重算策略保持 recompute：电压列缺失时自动回退文件 PF 均值，缩放后文件 PF 已是合法无量纲值，兜底路径正确
+  - 单位标注：PF unit 置空字符串（无量纲），U/I/P 按实际值单位 V/A/W
+- 未决问题：电压类点位（data9/45/81）全部用户缺失，建议采集侧补齐（沿用）
+- 相关文件/分支：configs/default.yaml、tests/test_csv_source.py；分支 arena/019ffa35-nilm-new

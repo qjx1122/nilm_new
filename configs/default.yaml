@@ -38,21 +38,23 @@ dataset:                       # §10
 
 # 总线字段映射（§3.2/§4）：ChN 只是通道标识，物理含义必须由本配置确认。
 # 官方点位表（2026-08-14 确认）：三相电压/电流/有功功率/功率因素 → load_iden_dataN。
+# 倍率规则（官方确认）：实际物理量 = 文件原始数据 / 1000（multiplier: 0.001），
+#   如 PF 原始 916 → 0.916；CT/PT 倍率统一经 multiplier 配置化（§4）。
 # 规则：文件中找不到对应列时，日志提示并将该列数据置 0（MISSING_COLUMN_ZERO_FILLED）。
 # 说明：不同设备文件列集合可能不同（如实测 842 缺 data9/45/81/37/44），置 0 规则保证流程可用。
 bus_field_map:
-  ua:    {ch: 1, column: load_iden_data9,  multiplier: 1.0, unit: V}
-  ub:    {ch: 1, column: load_iden_data45, multiplier: 1.0, unit: V}
-  uc:    {ch: 1, column: load_iden_data81, multiplier: 1.0, unit: V}
-  ia:    {ch: 1, column: load_iden_data1,  multiplier: 1.0, unit: A}
-  ib:    {ch: 1, column: load_iden_data37, multiplier: 1.0, unit: A}
-  ic:    {ch: 1, column: load_iden_data73, multiplier: 1.0, unit: A}
-  pa:    {ch: 1, column: load_iden_data7,  multiplier: 1.0, unit: W}
-  pb:    {ch: 1, column: load_iden_data43, multiplier: 1.0, unit: W}
-  pc:    {ch: 1, column: load_iden_data79, multiplier: 1.0, unit: W}
-  pfa:   {ch: 1, column: load_iden_data8,  multiplier: 1.0}
-  pfb:   {ch: 1, column: load_iden_data44, multiplier: 1.0}
-  pfc:   {ch: 1, column: load_iden_data80, multiplier: 1.0}
+  ua:    {ch: 1, column: load_iden_data9,  multiplier: 0.001, unit: V}
+  ub:    {ch: 1, column: load_iden_data45, multiplier: 0.001, unit: V}
+  uc:    {ch: 1, column: load_iden_data81, multiplier: 0.001, unit: V}
+  ia:    {ch: 1, column: load_iden_data1,  multiplier: 0.001, unit: A}
+  ib:    {ch: 1, column: load_iden_data37, multiplier: 0.001, unit: A}
+  ic:    {ch: 1, column: load_iden_data73, multiplier: 0.001, unit: A}
+  pa:    {ch: 1, column: load_iden_data7,  multiplier: 0.001, unit: W}
+  pb:    {ch: 1, column: load_iden_data43, multiplier: 0.001, unit: W}
+  pc:    {ch: 1, column: load_iden_data79, multiplier: 0.001, unit: W}
+  pfa:   {ch: 1, column: load_iden_data8,  multiplier: 0.001, unit: ""}
+  pfb:   {ch: 1, column: load_iden_data44, multiplier: 0.001, unit: ""}
+  pfc:   {ch: 1, column: load_iden_data80, multiplier: 0.001, unit: ""}
 
 models:                        # 多模型对比：注册表 + 配置驱动
   - name: history_profile

@@ -36,6 +36,24 @@ OFFICIAL_MAP = {
 }
 
 
+def test_multiplier_applied(tmp_path):
+    """倍率规则：实际物理量 = 原始数据 × multiplier（官方 /1000 → 0.001）。"""
+    fmap = {
+        "ua": {"ch": 1, "column": "load_iden_data9", "multiplier": 0.001, "unit": "V"},
+        "pa": {"ch": 1, "column": "load_iden_data7", "multiplier": 0.001, "unit": "W"},
+        "pfa": {"ch": 1, "column": "load_iden_data8", "multiplier": 0.001, "unit": ""},
+        "ia": {"ch": 1, "column": "load_iden_data1", "multiplier": 0.001, "unit": "A"},
+    }
+    f = _write_bus(tmp_path, {"load_iden_data9": 220000.0, "load_iden_data7": 56573.0,
+                              "load_iden_data8": 916.0, "load_iden_data1": 756.0})
+    df, report = CsvBusLoader().load([f], fmap)
+    assert np.allclose(df["ua"], 220.0)        # 220000/1000 = 220 V
+    assert np.allclose(df["pa"], 56.573)       # 56573/1000
+    assert np.allclose(df["pfa"], 0.916)       # PF 归一到无量纲
+    assert np.allclose(df["ia"], 0.756)
+    assert report["fields"]["ua"]["multiplier"] == 0.001
+
+
 def test_missing_columns_zero_filled(tmp_path):
     """文件中找不到映射列 → 该列置 0，日志/报告标记 MISSING_COLUMN_ZERO_FILLED。"""
     # 文件只有 data1(ia)/data7(pa)/data8(pfa)，缺 ua(data9) 及 b/c 相全部列
