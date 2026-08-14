@@ -92,6 +92,22 @@ def parse_merge_filename(name: str) -> BusFileName | None:
     return BusFileName(m["device"], m["user"], int(m["ch"]), m["start"], m["end"], "", name)
 
 
+# 分路用户数据文件严格合并格式（与 RE_BR 的差异：不允许任何后缀）：
+#   <用户号>-<起始时间>-<截止时间>.csv，时间格式 YYmmdd
+# 示例：4206894986488-260604-260611.csv（符合）；4206894986488-260604-260611-1.csv（不符合）
+RE_MERGE_BRANCH = re.compile(
+    r"^(?P<user>[^-]+)-(?P<start>\d{6})-(?P<end>\d{6})\.csv$"
+)
+
+
+def parse_merge_branch_filename(name: str) -> BranchFileName | None:
+    """分路严格合并格式解析：带后缀或不符格式一律返回 None。"""
+    m = RE_MERGE_BRANCH.match(name)
+    if not m:
+        return None
+    return BranchFileName(m["user"], m["start"], m["end"], "", name)
+
+
 # ---------------------------------------------------------------- 状态码（§13 + 扩展）
 class Status:
     """批量执行状态码。前 8 个为指南 §13 原文规定，其余为工程扩展（见决策记录）。"""

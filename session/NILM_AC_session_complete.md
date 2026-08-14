@@ -102,3 +102,16 @@
   - 用户级「目录缺失」按其全部通道组均为单源组自然成立，无需额外用户级特判
 - 未决问题：真实数据文件名均带 -1 后缀（非合并对象），何时切换严格格式取决于上游导出约定
 - 相关文件/分支：nilm/data_io/merge.py、tests/test_merge.py、README；分支 arena/019ffa35-nilm-new
+
+## [2026-08-14] 会话纪要（第 8 次）
+- 目标：合并脚本增加分路格式文件合并功能——文件名严格为 <用户号>-<起始时间>-<截止时间>.csv（YYmmdd，如 4206894986488-260604-260611.csv），合并规则与既有规则一致
+- 完成项：
+  - contracts.py 新增 RE_MERGE_BRANCH 严格契约 + parse_merge_branch_filename（与 RE_BR 并存、互不放宽）
+  - merge.py 泛化为两类文件：BusFile 增加 kind（bus 按用户+通道分组 / branch 按用户分组，无通道维度），发现、迭代合并、重叠跳过、跨源合并、单源透传、日志告警全部复用同一逻辑
+  - 新增 4 项测试（分路严格格式契约、分路两级合并端到端含重叠跳过、分路单源透传、分路带后缀拒绝），79 项全过
+  - 真实数据实测：5 用户分路文件均为严格格式 → 内源 single_kept；trains/infers 同区间跨源组正确判重叠 SKIPPED_OVERLAP×5；带后缀总线文件仍全部拒绝
+- 关键决策：
+  - 分路分组键 (user_key, "branch") 与总线 (user_key, ch) 并存不冲突；分路身份校验 = 文件名用户号 vs 用户目录用户号部分
+  - 合并产物命名 <用户号>-<最早>-<最晚>.csv（仅更新起止时间，遵守 §5 命名约束）
+- 未决问题：总线真实文件均带 -1 后缀（非合并对象），切换严格格式取决于上游导出约定
+- 相关文件/分支：nilm/common/contracts.py、nilm/data_io/merge.py、tests/test_contracts.py、tests/test_merge.py、README；分支 arena/019ffa35-nilm-new

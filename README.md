@@ -27,12 +27,14 @@ python3 -m venv .venv
 # 其他选项：--stage train|infer|all   --no-resume   --data-root   --output-root   --base-config
 
 # 多数据源用户数据批量合并（先内源合并、后跨源合并，重叠告警跳过，原始数据只读）
-# ⚠️ 待合并文件名必须严格为 e241_<终端号>_<用户号>-Ch<通道号>-<起>-<止>.csv（不带任何后缀，
-#    需求文档 §2.2）；带 -1/-infer 后缀的文件不参与合并（会告警提示）
+# ⚠️ 待合并文件名必须严格符合以下两种格式之一（均不带任何后缀，需求文档 §2.2）：
+#    总线：e241_<终端号>_<用户号>-Ch<通道号>-<起>-<止>.csv（如 e241_800080252844_4206894986488-Ch1-260604-260611.csv）
+#    分路：<用户号>-<起>-<止>.csv（如 4206894986488-260604-260611.csv）
+#    带 -1/-infer 后缀的文件不参与合并（会告警提示）；两类文件合并规则一致
 .venv/bin/python scripts/merge_user_data.py --sources <源1> <源2> [<源3> ...] \
     [--output-root outputs/merged] [--log-dir <日志目录>] [--no-keep-original]
 
-.venv/bin/python -m pytest tests/ -q             # 73 项测试（含解耦守卫与合并逻辑）
+.venv/bin/python -m pytest tests/ -q             # 79 项测试（含解耦守卫与合并逻辑）
 ```
 
 合并脚本输出：`<output-root>/<数据源名>/<终端号_用户号>/` 复刻原层级（阶段一结果）+

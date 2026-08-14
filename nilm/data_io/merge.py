@@ -24,7 +24,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from nilm.common.contracts import (RE_USER_DIR, parse_bus_filename,
+from nilm.common.contracts import (RE_USER_DIR, parse_branch_filename,
+                                   parse_bus_filename,
+                                   parse_merge_branch_filename,
                                    parse_merge_filename)
 from nilm.common.logging import get_logger
 
@@ -45,28 +47,39 @@ class OverlapError(RuntimeError):
 
 @dataclass
 class BusFile:
-    """RE_BUS 命名的待合并文件（文件名解析出的维度信息，§2.2）。"""
+    """待合并文件（文件名解析出的维度信息，§2.2）。
+
+    kind='bus'    : e241_<终端号>_<用户号>-Ch<通道号>-<起>-<止>.csv（有通道维度）
+    kind='branch' : <用户号>-<起>-<止>.csv（无通道维度，按用户目录分组）
+    """
     path: Path
     device: str
     user: str
-    ch: int
+    ch: int | None
     start: date
     end: date
     source: str = ""          # 所属数据源（展示/日志用）
+    kind: str = "bus"
 
     @property
     def user_key(self) -> str:
         return f"{self.device}_{self.user}"
 
     @property
-    def group_key(self) -> tuple[str, int]:
-        """合并匹配依据：终端号+用户号+通道号完全一致（§2.2）。"""
-        return (self.user_key, self.ch)
+    def group_key(self) -> tuple[str, int | str]:
+        """合并匹配依据：同终端号+同用户号+同通道（bus）/ 同用户（branch）（§2.2）。"""
+        return (self.user_key, self.ch if self.kind == "bus" else "branch")
+
+    @property
+    def group_label(self) -> str:
+        return f"Ch{self.ch}" if self.kind == "bus" else "branch"
 
     def standard_name(self, start: date | None = None, end: date | None = None) -> str:
         """标准命名（§5 命名约束）：仅更新起止时间字段，YYmmdd。"""
         s = (start or self.start).strftime("%y%m%d")
         e = (end or self.end).strftime("%y%m%d")
+        if self.kind == "branch":
+            return f"{self.user}-{s}-{e}.csv"
         return f"e241_{self.device}_{self.user}-Ch{self.ch}-{s}-{e}.csv"
 
 
@@ -75,11 +88,24 @@ def _parse_ymd(code: str) -> date:
     return date(2000 + int(code[0:2]), int(code[2:4]), int(code[4:6]))
 
 
+def _parse_any_merge_name(name: str):
+    """按两类严格格式解析文件名（bus 优先），返回 (meta, kind) 或 (None, None)。"""
+    m = parse_merge_filename(name)
+    if m is not None:
+        return m, "bus"
+    m = parse_merge_branch_filename(name)
+    if m is not None:
+        return m, "branch"
+    return None, None
+
+
 def discover_source(source: Path) -> tuple[list[BusFile], list[Path]]:
     """扫描单个数据源根目录（§2.1 层级）。
 
     返回 (合法待合并文件列表, 跳过的文件列表)。
-    只认「终端号_用户号」用户目录与**严格格式**文件名（无后缀）；其余文件不参与合并。
+    只认「终端号_用户号」用户目录与两类**严格格式**文件名（均无后缀）：
+    总线 e241_<终端号>_<用户号>-Ch<通道号>-<起>-<止>.csv、分路 <用户号>-<起>-<止>.csv；
+    其余文件（含带 -1/-infer 后缀者）不参与合并。
     """
     if not source.is_dir():
         raise FileNotFoundError(f"数据源目录不存在: {source}")
@@ -89,21 +115,31 @@ def discover_source(source: Path) -> tuple[list[BusFile], list[Path]]:
         if not RE_USER_DIR.match(user_dir.name):
             log.warning("[%s] 跳过非法用户目录: %s", source.name, user_dir.name)
             continue
+        dir_device, dir_user = user_dir.name.split("_", 1)
         for f in sorted(user_dir.glob("*.csv")):
-            meta = parse_merge_filename(f.name)
+            meta, kind = _parse_any_merge_name(f.name)
             if meta is None:
-                if parse_bus_filename(f.name) is not None:
+                if parse_bus_filename(f.name) is not None or parse_branch_filename(f.name) is not None:
                     log.warning("[%s] 文件名带后缀，不符合合并严格格式（需求文档 §2.2），不参与合并: %s",
                                 source.name, f.name)
                 skipped.append(f)
                 continue
-            if user_dir.name != f"{meta.device}_{meta.user}":
-                log.warning("[%s] 文件名身份与目录不一致，跳过: %s", source.name, f)
-                skipped.append(f)
-                continue
-            found.append(BusFile(path=f, device=meta.device, user=meta.user, ch=meta.ch,
-                                 start=_parse_ymd(meta.start), end=_parse_ymd(meta.end),
-                                 source=source.name))
+            if kind == "bus":
+                if user_dir.name != f"{meta.device}_{meta.user}":
+                    log.warning("[%s] 文件名身份与目录不一致，跳过: %s", source.name, f)
+                    skipped.append(f)
+                    continue
+                found.append(BusFile(path=f, device=meta.device, user=meta.user, ch=meta.ch,
+                                     start=_parse_ymd(meta.start), end=_parse_ymd(meta.end),
+                                     source=source.name, kind="bus"))
+            else:  # branch：<用户号> 必须与用户目录的用户号一致
+                if meta.user != dir_user:
+                    log.warning("[%s] 分路文件名身份与目录不一致，跳过: %s", source.name, f)
+                    skipped.append(f)
+                    continue
+                found.append(BusFile(path=f, device=dir_device, user=meta.user, ch=None,
+                                     start=_parse_ymd(meta.start), end=_parse_ymd(meta.end),
+                                     source=source.name, kind="branch"))
     return found, skipped
 
 
@@ -176,7 +212,7 @@ def merge_group(files: list[BusFile], out_dir: Path, tmp_dir: Path,
             raise OverlapError(
                 BusFile(current.path, files[0].device, files[0].user, files[0].ch,
                         current.start, current.end, files[0].source), f)
-        nxt = tmp_dir / f"{phase}_{files[0].user_key}_Ch{files[0].ch}_{len(consumed)}.csv"
+        nxt = tmp_dir / f"{phase}_{files[0].user_key}_{files[0].group_label}_{len(consumed)}.csv"
         merge_two_csvs(current.path, f.path, nxt)
         consumed.append(f.path)
         current = _TempArtifact(nxt, min(current.start, f.start), max(current.end, f.end))
@@ -245,34 +281,37 @@ def _run_merge_impl(sources: list[Path], output_root: Path, log_dir: Path,
     for src_name, src_path in src_dirs.items():
         found, skipped = discover_source(src_path)
         if skipped:
-            log.info("[%s][内源] 非合并目标文件 %d 个（如分路 CSV），不参与合并", src_name, len(skipped))
-        groups: dict[tuple[str, int], list[BusFile]] = {}
+            log.info("[%s][内源] 非合并目标文件 %d 个（带后缀或格式不符），不参与合并", src_name, len(skipped))
+        groups: dict[tuple[str, int | str], list[BusFile]] = {}
         for f in found:
             groups.setdefault(f.group_key, []).append(f)
 
-        for (user_key, ch), members in sorted(groups.items()):
+        for (user_key, ch), members in sorted(groups.items(), key=lambda kv: str(kv[0])):
+            label = members[0].group_label
             out_dir = output_root / src_name / user_key
             try:
                 out, info = merge_group(members, out_dir, tmp_root / src_name,
                                         phase=f"intra_{src_name}", keep_single=keep_original)
                 if out is not None:
-                    meta = parse_bus_filename(out.name)
+                    meta, kind = _parse_any_merge_name(out.name)
                     stage1_files.append(BusFile(
-                        path=out, device=meta.device, user=meta.user, ch=meta.ch,
-                        start=_parse_ymd(meta.start), end=_parse_ymd(meta.end), source=src_name))
-                    log.info("[%s][内源] %s Ch%d: %s -> %s", src_name, user_key, ch, info["action"], out.name)
+                        path=out, device=meta.device if kind == "bus" else members[0].device,
+                        user=meta.user, ch=meta.ch if kind == "bus" else None,
+                        start=_parse_ymd(meta.start), end=_parse_ymd(meta.end),
+                        source=src_name, kind=kind))
+                    log.info("[%s][内源] %s %s: %s -> %s", src_name, user_key, label, info["action"], out.name)
                 elif info.get("action") == "single_skipped_by_option":
                     # 单文件组未按选项保留到单源输出区，但仍需参与阶段二：
                     # 若该用户仅存在于单一数据源，其文件将直接成为合并后用户数据文件
                     m0 = members[0]
                     stage1_files.append(BusFile(path=m0.path, device=m0.device, user=m0.user,
                                                 ch=m0.ch, start=m0.start, end=m0.end,
-                                                source=src_name))
+                                                source=src_name, kind=m0.kind))
                 report["phase1_intra_source"].setdefault(src_name, []).append(
                     {"user_key": user_key, "ch": ch, "status": "OK", **info})
             except OverlapError as e:
                 report["warnings"] += 1
-                wlog.write(f"[内源][{src_name}] 用户目录={user_key} 通道=Ch{ch} {e}\n"
+                wlog.write(f"[内源][{src_name}] 用户目录={user_key} 组={label} {e}\n"
                            f"    组内文件: {', '.join(str(m.path) for m in members)}\n")
                 report["phase1_intra_source"].setdefault(src_name, []).append(
                     _warn_overlap("[内源]", e, [m.path for m in members]) |
@@ -280,35 +319,36 @@ def _run_merge_impl(sources: list[Path], output_root: Path, log_dir: Path,
 
     # ============ 阶段二：多数据源跨目录合并（§4.2） ============
     log.info("===== 阶段二：多数据源跨目录合并 =====")
-    xgroups: dict[tuple[str, int], list[BusFile]] = {}
+    xgroups: dict[tuple[str, int | str], list[BusFile]] = {}
     for f in stage1_files:
         xgroups.setdefault(f.group_key, []).append(f)
     cross_dir = output_root / "cross_source"
-    for (user_key, ch), members in sorted(xgroups.items()):
+    for (user_key, ch), members in sorted(xgroups.items(), key=lambda kv: str(kv[0])):
+        label = members[0].group_label
         srcs = {m.source for m in members}
         if len(srcs) < 2:
             # 用户目录仅存在于单一数据源（其余源中不存在该用户目录）：
             # 待合并文件直接作为合并后用户数据文件，放入合并后用户数据目录（用户要求）
             src_name = members[0].source
             out, info = merge_group(members, cross_dir / user_key, tmp_root / "cross",
-                                    phase=f"passthrough_{user_key}_Ch{ch}", keep_single=True)
-            log.info("[跨源] %s Ch%d 仅存在于数据源 %s（其余源无此用户目录），"
+                                    phase=f"passthrough_{user_key}_{label}", keep_single=True)
+            log.info("[跨源] %s %s 仅存在于数据源 %s（其余源无此用户目录），"
                      "直接作为合并后用户数据文件 -> %s",
-                     user_key, ch, src_name, out.name if out else "-")
+                     user_key, label, src_name, out.name if out else "-")
             report["phase2_cross_source"].setdefault(user_key, []).append(
                 {**(info or {}), "ch": ch, "status": "OK", "action": "copied_single_source",
                  "sources": sorted(srcs), "output": str(out) if out else None})
             continue
         try:
             out, info = merge_group(members, cross_dir / user_key, tmp_root / "cross",
-                                    phase=f"cross_{user_key}_Ch{ch}", keep_single=True)
-            log.info("[跨源] %s Ch%d: %s 个数据源合并 -> %s", user_key, ch, len(srcs),
+                                    phase=f"cross_{user_key}_{label}", keep_single=True)
+            log.info("[跨源] %s %s: %s 个数据源合并 -> %s", user_key, label, len(srcs),
                      out.name if out else "-")
             report["phase2_cross_source"].setdefault(user_key, []).append(
                 {"ch": ch, "status": "OK", "sources": sorted(srcs), **(info or {})})
         except OverlapError as e:
             report["warnings"] += 1
-            wlog.write(f"[跨源] 用户目录={user_key} 通道=Ch{ch} {e}\n"
+            wlog.write(f"[跨源] 用户目录={user_key} 组={label} {e}\n"
                        f"    数据源: {', '.join(sorted(srcs))}\n"
                        f"    组内文件: {', '.join(str(m.path) for m in members)}\n")
             report["phase2_cross_source"].setdefault(user_key, []).append(

@@ -1,9 +1,10 @@
 """common.contracts：文件名正则与 user_key 契约（指南 §3.2/§3.3，正则不得放宽）。"""
 
-from nilm.common.contracts import (RE_BR, RE_BUS, RE_MERGE_FILE, RE_USER_DIR,
-                                   Status, parse_branch_filename,
-                                   parse_bus_filename, parse_merge_filename,
-                                   split_user_key)
+from nilm.common.contracts import (RE_BR, RE_BUS, RE_MERGE_BRANCH,
+                                   RE_MERGE_FILE, RE_USER_DIR, Status,
+                                   parse_branch_filename, parse_bus_filename,
+                                   parse_merge_branch_filename,
+                                   parse_merge_filename, split_user_key)
 
 
 def test_re_bus_exact_match():
@@ -62,3 +63,21 @@ def test_merge_filename_strict_format():
     assert parse_merge_filename("4206602981958-250710-260628.csv") is None  # 分路文件
     # 对照组：指南 RE_BUS 仍接受后缀（两个契约互不放宽）
     assert parse_bus_filename("e241_d_u-Ch1-260604-260611-1.csv") is not None
+
+
+def test_merge_branch_filename_strict_format():
+    """分路用户数据文件严格格式（<用户号>-<起>-<止>.csv，YYmmdd，无后缀）。"""
+    m = parse_merge_branch_filename("4206894986488-260604-260611.csv")
+    assert m is not None
+    assert (m.user, m.start, m.end, m.suffix) == ("4206894986488", "260604", "260611", "")
+    # 不符合：带后缀
+    assert parse_merge_branch_filename("4206894986488-260604-260611-1.csv") is None
+    assert parse_merge_branch_filename("4206894986488-260604-260611-infer.csv") is None
+    assert RE_MERGE_BRANCH.match("4206894986488-260604-260611-1.csv") is None
+    # 不符合：其它畸形
+    assert parse_merge_branch_filename("4206894986488-260604.csv") is None
+    assert parse_merge_branch_filename("4206894986488-260604-260611.txt") is None
+    # 总线文件名不得被分路严格式误匹配
+    assert parse_merge_branch_filename("e241_d_u-Ch1-260604-260611.csv") is None
+    # 对照组：指南 RE_BR 仍接受后缀
+    assert parse_branch_filename("4206894986488-260604-260611-1.csv") is not None
