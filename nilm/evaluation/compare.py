@@ -8,6 +8,9 @@ import pandas as pd
 LOWER_IS_BETTER = {"mae": True, "rmse": True, "sae": True, "mape": True, "r2": False,
                    "f1": False, "accuracy": False, "precision": False, "recall": False}
 
+# 混淆矩阵计数（TP/FP/FN/TN）：诊断性输出，随样本量变化，不参与最优模型排序
+COUNT_METRICS = {"tp", "fp", "fn", "tn"}
+
 
 def build_comparison_table(results: dict[str, dict[str, dict]]) -> pd.DataFrame:
     """把 {model: {metric: {'macro': ...}}} 汇总为 模型×指标 的宏平均矩阵。"""
@@ -24,6 +27,8 @@ def summarize(table: pd.DataFrame) -> dict:
     best_per_metric: dict[str, str] = {}
     wins: dict[str, int] = {}
     for metric in table.columns:
+        if metric in COUNT_METRICS:  # 计数类指标不参与优劣排序
+            continue
         s = table[metric].dropna()
         if s.empty:
             continue

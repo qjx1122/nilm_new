@@ -94,3 +94,62 @@ def test_regression_metrics_ignore_on_thr_w():
 def test_registry_names():
     for name in ["f1", "accuracy", "precision", "recall"]:
         assert name in METRIC_REGISTRY.names()
+
+
+def test_confusion_count_metrics_hand_computed():
+    """TP/FP/FN/TN 计数指标与手算混淆矩阵一致（单分路）。"""
+    y_true, y_pred = _binary_case()
+    out = evaluate_all(y_true, y_pred, ["tp", "fp", "fn", "tn"], on_thr_w=10.0)
+    assert out["tp"]["macro"] == 1.0
+    assert out["fp"]["macro"] == 1.0
+    assert out["fn"]["macro"] == 1.0
+    assert out["tn"]["macro"] == 2.0
+    assert out["tp"]["per_branch"] == [1.0]
+
+
+def test_confusion_count_metrics_multi_branch_sum():
+    """多分路：per_branch 为各分路计数，macro 为跨分路总数（求和而非平均）。"""
+    # 分路0：true开/pred开 (TP)，true关/pred关 (TN)
+    # 分路1：true开/pred关 (FN)，true关/pred开 (FP)
+    y_true = np.array([[20., 20.], [0., 0.]])
+    y_pred = np.array([[20., 0.], [0., 20.]])
+    out = evaluate_all(y_true, y_pred, ["tp", "fp", "fn", "tn"], on_thr_w=10.0)
+    assert out["tp"]["per_branch"] == [1.0, 0.0]
+    assert out["fn"]["per_branch"] == [0.0, 1.0]
+    assert out["fp"]["per_branch"] == [0.0, 1.0]
+    assert out["tn"]["per_branch"] == [1.0, 0.0]
+    assert out["tp"]["macro"] == 1.0
+    assert out["fp"]["macro"] == 1.0
+    assert out["fn"]["macro"] == 1.0
+    assert out["tn"]["macro"] == 1.0
+    # 四类计数之和 = 样本数 × 分路数
+    total = sum(out[m]["macro"] for m in ("tp", "fp", "fn", "tn"))
+    assert total == y_true.size
+
+
+def test_confusion_counts_respect_threshold():
+    """计数指标同样受 on_thr_w 透传控制。"""
+    y_true = np.array([[20.], [0.]])
+    y_pred = np.array([[18.], [0.]])
+    lo = evaluate_all(y_true, y_pred, ["tp"], on_thr_w=10.0)["tp"]["macro"]
+    hi = evaluate_all(y_true, y_pred, ["tp"], on_thr_w=19.0)["tp"]["macro"]
+    assert lo == 1.0   # 阈值10：20/18 均为开 → TP
+    assert hi == 0.0   # 阈值19：pred 18 判关 → FN，无 TP
+
+
+def test_count_metrics_registered_and_excluded_from_ranking():
+    """tp/fp/fn/tn 已注册；且不参与 summarize 的最优模型排序。"""
+    import pandas as pd
+
+    from nilm.evaluation.compare import COUNT_METRICS, summarize
+
+    for name in ["tp", "fp", "fn", "tn"]:
+        assert name in METRIC_REGISTRY.names()
+        assert name in COUNT_METRICS
+    table = pd.DataFrame({"f1": [0.9, 0.5], "tp": [10, 999]},
+                         index=["A", "B"])
+    table.index.name = "model"
+    s = summarize(table)
+    assert "tp" not in s["best_per_metric"]      # 计数不参与排序
+    assert s["best_per_metric"]["f1"] == "A"
+    assert s["overall_best"] == "A"

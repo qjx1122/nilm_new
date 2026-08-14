@@ -3,6 +3,8 @@
 - 回归指标：mae / rmse / r2 / sae / mape（输入为功率矩阵）；
 - 状态分类指标：f1 / accuracy / precision / recall——按用户配置 ``on_thr_w``
   （指南 §12.3）把功率二值化为开/关态后计算混淆矩阵；
+- 混淆矩阵计数：tp / fp / fn / tn——同一二值化口径下的原始计数
+  （per_branch 为各分路计数，macro 为跨分路总数），仅作诊断输出不参与排序；
 - 额外参数（如 on_thr_w）经 ``evaluate_all(..., **kwargs)`` 透传，回归指标忽略。
 
 输入约定：y_true / y_pred 均为 (n_samples, n_branches)。
@@ -129,6 +131,28 @@ def f1(t: np.ndarray, p: np.ndarray, on_thr_w: float = DEFAULT_ON_THR_W, **_) ->
     """开态 F1 = 2·P·R/(P+R)。"""
     tp, fp, fn, _ = _confusion(t, p, on_thr_w)
     return _f1_of(_precision_of(tp, fp, fn), _recall_of(tp, fn))
+
+
+# ---------------------------------------------------------- 混淆矩阵计数（TP/FP/FN/TN）
+def _register_count_metric(name: str, idx: int) -> None:
+    """注册混淆矩阵单元计数指标：per_branch 为各分路计数，macro 为跨分路总数。
+
+    注意：计数是诊断性输出（样本量相关），不参与模型优劣排序（见 compare.COUNT_METRICS）。
+    """
+
+    def counter(y_true: np.ndarray, y_pred: np.ndarray,
+                on_thr_w: float = DEFAULT_ON_THR_W, **_) -> dict:
+        per = [float(_confusion(y_true[:, k], y_pred[:, k], on_thr_w)[idx])
+               for k in range(y_true.shape[1])]
+        return {"per_branch": per, "macro": float(sum(per))}
+
+    counter.__name__ = name
+    counter.__doc__ = f"混淆矩阵 {name.upper()} 计数（按 on_thr_w 二值化；macro=跨分路总数）。"
+    METRIC_REGISTRY.register(name)(counter)
+
+
+for _name, _idx in (("tp", 0), ("fp", 1), ("fn", 2), ("tn", 3)):
+    _register_count_metric(_name, _idx)
 
 
 def evaluate_all(y_true: np.ndarray, y_pred: np.ndarray,

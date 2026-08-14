@@ -1,6 +1,8 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：分类指标输出增加混淆矩阵计数 TP/FP/FN/TN（tp/fp/fn/tn 指标注册 + 配置默认开启）
+- ✅ 已完成：全部 5 用户重新运行验证测试（train+infer 10/10 OK，96 项测试全过）
 - ✅ 已完成：模型评估增加状态分类指标（F1/Accuracy/Precision/Recall，按 on_thr_w 二值化）
 - ✅ 已完成：用户 800080252842 更新数据验证（ridge R² 0.835）
 - ✅ 已完成：docs/ 技术方案文档更新至 v1.2 并存档
@@ -32,6 +34,8 @@
 - [x] 倍率规则落地（官方确认）：bus_field_map 全部字段 multiplier 0.001（实际值 = 原始/1000），PF 原始 916→0.916 归一无量纲；加载器 multiplier 机制零代码改动（配置驱动生效）
 - [x] 验证：84 项测试全过（新增倍率应用测试）；真实数据复验 10/10 OK——bus 质量分升至 98.7–100（缩放前 PF 原始值越界计为异常，缩放后消除）；模型指标不变（均匀缩放对 z-score 归一后的模型近似不变，符合预期）
 
+- [x] 混淆矩阵计数指标（TP/FP/FN/TN）：`nilm/evaluation/metrics.py` 注册 tp/fp/fn/tn 四个计数指标（与 f1 等共用 `_confusion` + on_thr_w 二值化口径；per_branch=各分路计数，macro=跨分路总数）；`configs/default.yaml` metrics 列表默认追加；`compare.py` 新增 COUNT_METRICS——计数为诊断输出不参与最优模型排序（否则「FP 越小越好」会把全预测关态的退化模型评为最优）
+- [x] 验证（2026-08-14）：96 项测试全过（新增 4 项：单分路手算计数、多分路求和与四类计数守恒 TP+FP+FN+TN=N、阈值透传、排序豁免）；全 5 用户 train+infer 重跑 10/10 OK——TP+FP+FN+TN 与 test 样本数逐户守恒（1622/2/670/96/96）；metrics.json、comparison.csv/md、offline_metrics.json 均带四类计数
 - [x] docs/ 文档更新存档：TECH_DESIGN v1.0→v1.2（版本头+修订记录），新增 §12 实施存档五节——12.1 真实数据 M0 摸底（哨兵值/对齐与覆盖率与可辨识性口径修正）、12.2 官方点位映射+倍率+缺列置 0+PF 兜底链、12.3 合并脚本全功能（两类严格格式/两级合并/重叠保护/单源透传/输出契约）、12.4 当前验证基线（5 用户指标表+10/10 OK+84 项测试）、12.5 遗留事项转 TODO
 
 ## 进行中
@@ -44,6 +48,8 @@
 4. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- TP/FP/FN/TN 作为「指标」注册进 METRIC_REGISTRY 而非改 evaluate_all 返回结构：零侵入——user_task/metrics.json/comparison 全链路自动带上，配置可开关；代价是 macro 语义对计数取「总和」而非平均（已在 docstring 说明）
+- 计数指标必须豁免 summarize 排序：LOWER_IS_BETTER 若给 fp/fn 设 True，会把「全预测关态」的退化模型（FP=0）评为最优——用 COUNT_METRICS 集合在 summarize 中直接跳过
 - 环境重置后 .venv 丢失（快照排除目录），按开局仪式重建 venv + requirements + pytest + pypdf
 - 本地分支指针曾被外部操作重置到初始提交（工作区文件仍在），用 `git reset --hard FETCH_HEAD` 恢复（远程含完整历史）——教训：合并异常先 `git rev-parse HEAD` 诊断，别盲目 stash/重提交
 - 合并脚本落位 `nilm/data_io/merge.py`：属于数据接入域，只依赖 common（解耦守卫通过）；CLI 在 scripts/，不入包

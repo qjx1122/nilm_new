@@ -182,3 +182,16 @@
   - 空真约定选择「1.0」而非 0：全关负荷的全对预测不应被记 0 分（文档化于 metrics.py docstring）
 - 未决问题：无新增
 - 相关文件/分支：nilm/evaluation/{metrics,compare}.py、nilm/pipeline/user_task.py、configs/default.yaml、tests/test_classification_metrics.py；分支 arena/019ffa35-nilm-new
+
+## [2026-08-14] 会话纪要（第 14 次）
+- 目标：分类指标输出增加 TP/FP/FN/TN；全 5 用户重跑验证测试
+- 完成项：
+  - metrics.py 注册 tp/fp/fn/tn 计数指标（同 on_thr_w 二值化口径；per_branch=各分路计数，macro=跨分路总数）；default.yaml metrics 扩为 12 项
+  - compare.py 新增 COUNT_METRICS，summarize 排序豁免计数指标（防退化模型因 FP=0 胜出）
+  - 新增 4 项测试，96 项全过；全 5 用户 train+infer 重跑 10/10 OK
+  - 守恒校验：TP+FP+FN+TN = test 样本数逐户成立（1622/2/670/96/96）；comparison.csv/md、metrics.json、offline_metrics.json 均输出四类计数
+- 关键决策：
+  - 计数走注册表指标而非改 evaluate_all 返回结构：零侵入全链路贯通，配置可开关；macro 对计数取总和（docstring 说明）
+  - 计数不参与最优模型排序（COUNT_METRICS 豁免）
+- 未决问题：844 test 切分仅 2 点统计意义弱；789/800 推理段 FN 全量待 M2 分析
+- 相关文件/分支：nilm/evaluation/{metrics,compare}.py、configs/default.yaml、tests/test_classification_metrics.py、STATUS.md、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
