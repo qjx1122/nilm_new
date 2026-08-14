@@ -115,3 +115,19 @@
   - 合并产物命名 <用户号>-<最早>-<最晚>.csv（仅更新起止时间，遵守 §5 命名约束）
 - 未决问题：总线真实文件均带 -1 后缀（非合并对象），切换严格格式取决于上游导出约定
 - 相关文件/分支：nilm/common/contracts.py、nilm/data_io/merge.py、tests/test_contracts.py、tests/test_merge.py、README；分支 arena/019ffa35-nilm-new
+
+## [2026-08-14] 会话纪要（第 9 次）
+- 目标：总线侧三相 U/I/P/PF 官方点位表落地（ua→data9、ub→data45、uc→data81、ia→data1、ib→data37、ic→data73、pa→data7、pb→data43、pc→data79、pfa→data8、pfb→data44、pfc→data80），并要求文件中找不到对应列时日志提示且该列数据置 0
+- 完成项：
+  - configs/default.yaml bus_field_map 更新为官方映射（含单位与倍率），废弃此前临时映射
+  - CsvBusLoader 缺列置 0：WARNING 日志 + 列置 0 + schema 报告标记 MISSING_COLUMN_ZERO_FILLED（非致命）
+  - PF 重算兜底：U·I=0 无法重算时回退文件 PF 均值，仍无数据置 0（防止 NaN 吞样本）
+  - 新增 4 项测试（缺列置 0 / 全列无置 0 / 哨兵+缺列组合 / PF 回退），83 项全过
+  - 真实数据复验 10/10 OK：置 0 字段 ua,ub,uc,ib,pfb 正确告警；800 用户 best=ridge r2 0.716→0.762（官方 pa/pb/pc 优于旧猜测）
+- 关键决策：
+  - 置 0 为「文件级」规则（某文件缺列即置 0），不同设备文件列集合差异被自然吸收
+  - 置 0 告警文案避开致命判定关键词，issue 标记与 SCHEMA_UNCONFIRMED 严格区分
+- 未决问题：
+  - 当前数据集整体缺电压类点位（data9/45/81）与 ib/pfb，置 0 后电压特征无信息，建议采集侧补齐
+  - 稀疏用户 844/789 基线仍差（M2 方向）
+- 相关文件/分支：configs/default.yaml、nilm/data_io/csv_source.py、nilm/preprocess/align.py、tests/test_csv_source.py；分支 arena/019ffa35-nilm-new

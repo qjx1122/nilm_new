@@ -42,11 +42,14 @@ def resample_bus(bus: pd.DataFrame, freq: str = FREQ_MAIN,
             agg[c] = agg_of("p")
     out = bus.resample(freq).agg(agg)
 
-    # PF 策略：recompute = 聚合后按 P/(U*I) 重算（§5.2 推荐）
+    # PF 策略：recompute = 聚合后按 P/(U*I) 重算（§5.2 推荐）；
+    # 无法重算时（如电压列置 0）回退文件 PF 均值，仍无数据则置 0（与点位表置 0 规则一致）
     if st.get("pf") == "recompute":
         for ph in ("a", "b", "c"):
             s = out[f"u{ph}"] * out[f"i{ph}"]
-            out[f"pf{ph}"] = (out[f"p{ph}"] / s.where(s > 0)).clip(-1.0, 1.0)
+            recomp = (out[f"p{ph}"] / s.where(s > 0)).clip(-1.0, 1.0)
+            fallback = out[f"pf{ph}"]  # 原始 PF 的窗口均值（agg 阶段已算）
+            out[f"pf{ph}"] = recomp.where(recomp.notna(), fallback).fillna(0.0)
     elif st.get("pf") != "mean":
         raise ValueError(f"不支持的 PF 聚合策略: {st.get('pf')}（禁止无说明直接平均以外的黑盒策略）")
 

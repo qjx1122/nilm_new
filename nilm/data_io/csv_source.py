@@ -94,17 +94,23 @@ class CsvBusLoader(BusLoader):
                     report["issues"].append(f"字段映射缺失: {std}（SCHEMA_UNCONFIRMED）")
                 continue
             ch, col = int(spec["ch"]), spec["column"]
-            if ch not in ch_frames:
-                report["issues"].append(f"字段 {std} 指向不存在的通道 Ch{ch}")
-                continue
-            frame = ch_frames[ch]
-            if col not in frame.columns:
-                report["issues"].append(f"Ch{ch} 缺少列 {col!r}（字段 {std}）")
+            frame = ch_frames.get(ch)
+            series = frame[col] if (frame is not None and col in frame.columns) else None
+            if series is None:
+                # 点位表规则：文件中找不到对应列 → 日志提示并将该列数据置 0
+                where = "文件" if frame is not None else f"通道 Ch{ch} 文件"
+                log.warning("字段 %s 在%s中未找到列 %r，该列数据置 0（MISSING_COLUMN_ZERO_FILLED）",
+                            std, where, col)
+                report["issues"].append(
+                    f"字段 {std} 在{where}中未找到列 {col!r}，已置 0（MISSING_COLUMN_ZERO_FILLED）")
+                out[std] = 0.0
+                report["fields"][std] = {"ch": ch, "column": col, "zero_filled": True,
+                                         "unit": spec.get("unit", "UNKNOWN")}
                 continue
             mult = float(spec.get("multiplier", 1.0))
             if "multiplier" not in spec:
                 report["issues"].append(f"字段 {std} 未配置倍率/单位，标记 DATA_UNIT_UNKNOWN")
-            out[std] = frame[col] * mult
+            out[std] = series * mult
             report["fields"][std] = {"ch": ch, "column": col, "multiplier": mult,
                                      "unit": spec.get("unit", "UNKNOWN")}
 
