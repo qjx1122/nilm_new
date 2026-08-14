@@ -207,7 +207,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             y_hat = apply_constraints(y_hat, splits["test"][0][:, names.index("pbus")],
                                       nonnegative=not allow_negative, sum_consistency=False)
             metrics = evaluate_all(scaled["test"][1], y_hat,
-                                   base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"]))
+                                   base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"]),
+                                   on_thr_w=float(user_cfg["on_thr_w"]))
             results[name] = metrics
             log.info("[%s] 模型 %s 测试指标: %s", user_key, name,
                      {m: round(v["macro"], 4) for m, v in metrics.items()})
@@ -327,7 +328,8 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 offline_metrics = evaluate_all(
                     have.to_numpy()[:, None],
                     pd.Series(pred, index=valid.index).loc[have.index].to_numpy()[:, None],
-                    base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"]))
+                    base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"]),
+                    on_thr_w=float(user_cfg["on_thr_w"]))
                 _dump(out / "offline_metrics.json", offline_metrics)
 
         pred_state = postprocess_state(pred, float(user_cfg["on_thr_w"]),

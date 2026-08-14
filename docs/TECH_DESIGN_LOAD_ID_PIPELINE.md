@@ -268,6 +268,7 @@ class RidgeDisaggregator(BaseModel): ...
 | 逐分路 | MAE、RMSE、R² | 主指标；按分路输出并给出宏平均 |
 | 逐分路 | SAE | NILM 惯例信号聚合误差 `|Σŷ-Σy|/Σy`（按评估天） |
 | 逐分路 | MAPE(ε) | 分母加 ε 保护，近零负荷仅作参考 |
+| 逐分路（状态分类） | F1、Accuracy、Precision、Recall | 按 on_thr_w 把功率二值化为开/关态后计算混淆矩阵（§12.3 阈值）；空真约定见 metrics.py |
 | 系统级 | 重构误差 | `Σ_k ŷ_k` 对 `P_bus` 的偏差（一致性诊断） |
 | 系统级 | 总分解 R² | 全分路拼接后的整体拟合度 |
 | 事件级（预留） | 检出率/误报率 | 依赖 events 模块 |

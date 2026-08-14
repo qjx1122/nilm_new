@@ -62,6 +62,7 @@ models:                        # 多模型对比：注册表 + 配置驱动
   - name: ridge
     params: {alpha: 1.0}
 
-metrics: [mae, rmse, r2, sae]
+# 指标：回归（mae/rmse/r2/sae）+ 状态分类（f1/accuracy/precision/recall，按 on_thr_w 二值化）
+metrics: [mae, rmse, r2, sae, f1, accuracy, precision, recall]
 
 # infer_model: ridge           # 推理模型；缺省采用该用户训练对比的综合最优

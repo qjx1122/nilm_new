@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-# 指标方向：True = 越小越好
-LOWER_IS_BETTER = {"mae": True, "rmse": True, "sae": True, "mape": True, "r2": False}
+# 指标方向：True = 越小越好（分类指标均为越大越好）
+LOWER_IS_BETTER = {"mae": True, "rmse": True, "sae": True, "mape": True, "r2": False,
+                   "f1": False, "accuracy": False, "precision": False, "recall": False}
 
 
 def build_comparison_table(results: dict[str, dict[str, dict]]) -> pd.DataFrame:

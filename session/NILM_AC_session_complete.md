@@ -167,3 +167,18 @@
 - 关键决策：无新增（纯验证轮）
 - 未决问题：该用户总线文件已转严格格式，成为合并对象；其余 4 用户仍带 -1 后缀
 - 相关文件/分支：outputs/800080252842_4206894986488/（不入库）；分支 arena/019ffa35-nilm-new
+
+## [2026-08-14] 会话纪要（第 13 次）
+- 目标：模型评估增加分类指标（F1/Accuracy/Precision/Recall）
+- 完成项：
+  - evaluation/metrics.py 新增 4 个状态分类指标：按 on_thr_w（§12.3，经 evaluate_all kwargs 透传）把功率二值化为开/关态，逐分路混淆矩阵 + 宏平均；空真约定显式定义（无开态标签 recall=1.0；无开态预测且无漏报 precision=1.0）
+  - compare.py LOWER_IS_BETTER 扩展（分类指标均为越大越好），对比报告/最优模型挑选自动适配
+  - configs/default.yaml metrics 扩为 8 项；user_task train/infer 两处评估透传 on_thr_w
+  - 新增 8 项测试（手算混淆矩阵/阈值透传/空真约定/FP-only/多分路宏平均/回归指标不受影响），92 项全过
+  - 真实数据复验（800080252842）：ridge 测试集 F1 0.825 / Acc 0.808 / P 0.714 / R 0.977；infer 离线 F1 0.931 / Acc 0.925 / P 0.872 / R 0.999；对比报告 8 指标矩阵与逐指标最优正常
+  - 技术方案 §7.1 指标体系表更新（v1.2 文档内）
+- 关键决策：
+  - 分类指标落在评估模块（不新建模块），阈值来自用户配置 on_thr_w，训练/推理同口径
+  - 空真约定选择「1.0」而非 0：全关负荷的全对预测不应被记 0 分（文档化于 metrics.py docstring）
+- 未决问题：无新增
+- 相关文件/分支：nilm/evaluation/{metrics,compare}.py、nilm/pipeline/user_task.py、configs/default.yaml、tests/test_classification_metrics.py；分支 arena/019ffa35-nilm-new
