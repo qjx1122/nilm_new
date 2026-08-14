@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from nilm.analysis import identifiability_report
+from nilm.analysis import analyze_branch_sessions, identifiability_report
 from nilm.common.contracts import (INFER_RESULT_COLUMNS, INFERENCE_RESULT_REL,
                                    Status, split_user_key)
 from nilm.common.logging import get_logger
@@ -144,6 +144,10 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         save_cleaned = bool(pp.get("save_cleaned_csv", True))
         _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
         _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
+
+        # —— 训练前分路开机情况分析（逐分路逐天开机段/时长/功率统计/电量）
+        sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]))
+        sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
 
         # —— §5 统一 15min（聚合策略可配置且记录）
         bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
@@ -334,6 +338,15 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
         _dump(out / "agg_strategy.json", agg_record)
 
+        # —— 推理前分路开机情况分析（有分路文件时；branch_c 供后续离线评估复用）
+        branch_c = None
+        if scan.branch_files:
+            branch_raw, _ = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
+            branch_c = Cleaner(clip_negative=not allow_negative).transform(branch_raw)
+            _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
+            sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]))
+            sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
+
         # §12.4 infer 时间过滤
         ispec = user_cfg.get("infer") or {}
         if ispec.get("include") or ispec.get("exclude"):
@@ -372,10 +385,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         _, user_id = split_user_key(user_key)
         target_vals = pd.Series(np.nan, index=valid.index)
         offline_metrics = None
-        if scan.branch_files:  # 分路仅用于离线评估，不参与生产推理（§3.1）
-            branch_raw, _ = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
-            branch_c = Cleaner(clip_negative=not allow_negative).transform(branch_raw)
-            _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
+        if branch_c is not None:  # 分路仅用于离线评估，不参与生产推理（§3.1）；已在推理前加载
             tcols = resolve_target_cols(user_cfg.get("target_col"), branch_c)
             t = build_target(branch_c, tcols).reindex(valid.index)
             target_vals = t

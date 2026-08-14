@@ -91,3 +91,36 @@ def test_padded_windows_alignment():
     assert W.shape == (10, 4, 2)
     assert np.array_equal(W[:, -1, :], X)          # 每窗末行 = 该时刻特征
     assert np.array_equal(W[0, 0], X[0])           # 头部复制首行填充
+
+
+def test_resolve_device_auto_and_fallback(monkeypatch):
+    """GPU 自动检测：auto 依可用性返回 cuda/cpu；显式 cuda 不可用时回退 cpu。"""
+    import torch
+
+    from nilm.models.seq_models import resolve_device
+
+    # 真实环境：auto 结果必属合法集合且与 CUDA 可用性一致
+    dev = resolve_device("auto")
+    if torch.cuda.is_available():
+        assert dev == "cuda"
+    else:
+        assert dev in ("cpu", "mps")
+
+    # 模拟无 CUDA：auto→cpu（或 mps），显式 cuda→回退 cpu
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert resolve_device("cuda") == "cpu"
+    # 显式 cpu 永远尊重
+    assert resolve_device("cpu") == "cpu"
+
+    # 模拟有 CUDA：auto→cuda
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda i: "FakeGPU")
+    assert resolve_device("auto") == "cuda"
+    assert resolve_device("cuda") == "cuda"
+
+
+def test_seq_model_default_device_auto():
+    """序列模型默认 device=auto（自动检测），实例化不触发 torch 导入错误。"""
+    for name in DL_MODELS:
+        m = MODEL_REGISTRY.create(name, **{**EXTRA[name]})
+        assert m.params["device"] == "auto"

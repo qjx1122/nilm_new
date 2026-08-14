@@ -23,6 +23,28 @@ from nilm.models.registry import MODEL_REGISTRY
 log = get_logger("models.seq")
 
 
+def resolve_device(device: str = "auto") -> str:
+    """设备解析：'auto' 自动检测——有 CUDA 用 cuda，其次 Apple MPS，否则 cpu；
+    显式传 'cuda'/'cpu'/'mps' 则尊重配置（cuda 不可用时回退 cpu 并告警）。"""
+    import torch
+
+    if device == "auto":
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            log.info("检测到 GPU（CUDA）: %s，深度模型将使用 GPU 训练/推理", name)
+            return "cuda"
+        if getattr(torch.backends, "mps", None) is not None and \
+                torch.backends.mps.is_available():
+            log.info("检测到 Apple MPS，深度模型将使用 MPS 训练/推理")
+            return "mps"
+        log.info("未检测到 GPU，深度模型使用 CPU 训练/推理")
+        return "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        log.warning("配置指定 cuda 但 CUDA 不可用，回退 CPU")
+        return "cpu"
+    return device
+
+
 def _padded_windows(X: np.ndarray, window: int) -> np.ndarray:
     """(n, f) → (n, window, f) 滑窗视图；头部复制首行填充（零拷贝 stride 视图）。"""
     pad = np.repeat(X[:1], window - 1, axis=0)
@@ -37,7 +59,7 @@ class _SeqTorchModel(BaseModel):
     name = "seq_base"
 
     def __init__(self, window: int = 96, epochs: int = 60, batch_size: int = 256,
-                 lr: float = 1e-3, patience: int = 8, device: str = "cpu",
+                 lr: float = 1e-3, patience: int = 8, device: str = "auto",
                  random_state: int = 42, **params) -> None:
         super().__init__(window=window, epochs=epochs, batch_size=batch_size,
                          lr=lr, patience=patience, device=device,
@@ -54,7 +76,7 @@ class _SeqTorchModel(BaseModel):
         torch.manual_seed(seed)
         rng = np.random.default_rng(seed)   # 打乱用独立 RNG（同种子可复现）
         window = int(self.params["window"])
-        device = torch.device(self.params["device"])
+        device = torch.device(resolve_device(self.params["device"]))
         self._n_feat, self._n_out = X.shape[1], y.shape[1]
         self._net = self._build_net(self._n_feat, self._n_out).to(device)
 
@@ -120,7 +142,9 @@ class _SeqTorchModel(BaseModel):
     def predict(self, X) -> np.ndarray:
         import torch
 
-        device = torch.device(self.params["device"])
+        # 每次推理独立解析设备：GPU 机器训练的模型可在 CPU 机器加载推理（反之亦然）
+        device = torch.device(resolve_device(self.params["device"]))
+        self._net.to(device)
         Xw = _padded_windows(np.asarray(X, np.float32), int(self.params["window"]))
         self._net.eval()
         with torch.no_grad():

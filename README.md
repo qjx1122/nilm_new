@@ -76,9 +76,13 @@ outputs/
     │   │                                     #   preprocess.save_cleaned_csv: false 可关闭）
     │   ├── metrics_by_split.csv              # 每模型 train/val/test 三阶段指标汇总
     │   ├── metrics_daily.csv                 # 每模型×每阶段×每天 日级指标
+    │   ├── branch_sessions.csv               # 分路开机分析：逐分路逐天开机段（起止/时长/
+    │   │                                     #   最小/平均/峰值功率/电量kWh/状态；整天关机
+    │   │                                     #   输出整天一行 state=0）
     │   …                                     # 可辨识性报告/窗口索引/模型/指标/对比报告/_DONE
     └── infer/<timestamp>/
         ├── cleaned/{bus,branch}_cleaned.csv  # 同上（branch 仅当存在分路文件时产出）
+        ├── branch_sessions.csv               # 分路开机分析（同 train，有分路文件时产出）
         ├── metrics_daily.csv                 # 推理离线评估日级指标（有分路真值时产出）
         └── predictions/inference_result.csv  # 输出契约：timestamp,user_id,target,target_state,
                                               #   pred,pred_state,pred_prob（真值状态与开态概率）
@@ -106,6 +110,8 @@ scripts/run_batch_users.py   CLI 入口
   可辨识性分析、批量执行（失败隔离/断点续跑/状态码）、单用户与多用户同路径执行
 - 内置 8 个模型：3 基线/线性（history_profile/proportional/ridge，零 ML 依赖）+
   2 树模型（random_forest/xgboost，`tree_models.py`）+
-  3 深度时序（lstm/cnn1d/transformer，`seq_models.py`，L=96 滑窗 Seq2Point 逐点输出）；
+  3 深度时序（lstm/cnn1d/transformer，`seq_models.py`，L=96 滑窗 Seq2Point 逐点输出；
+  device 默认 `auto` 自动检测——有 CUDA GPU 用 GPU、其次 Apple MPS、否则 CPU，
+  显式配置 `params: {device: cpu|cuda}` 可覆盖）；
   全部经 MODEL_REGISTRY 注册、configs/default.yaml `models:` 配置驱动
 - 待办：真实数据 M0 摸底；指南附件中「日级指标 23 字段 / 启动段字段」契约待确认（PDF 未含附件原文）

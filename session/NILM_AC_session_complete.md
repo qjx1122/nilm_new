@@ -255,3 +255,18 @@
   - xgboost 早停仅有 val 时启用；DL 打乱用独立 RNG 保证同种子复现
 - 未决问题：DL 调参/GPU；大用户 transformer CPU 约 25 min
 - 相关文件/分支：nilm/models/{tree_models,seq_models,__init__}.py、configs/default.yaml、requirements-ml.txt、tests/test_ml_models.py、README.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-14] 会话纪要（第 19 次）
+- 目标：①GPU 自动检测（有 GPU 用 GPU 否则 CPU）；②训练/推理前分路开机情况分析并落盘 CSV
+- 完成项：
+  - seq_models.resolve_device：device 默认 auto（CUDA→MPS→CPU 优先级），显式 cuda 不可用回退 cpu 并告警；predict 每次独立解析设备并 net.to(device)（跨设备加载可用）
+  - nilm/analysis/branch_sessions.py：analyze_branch_sessions——逐分路逐天按 on_thr_w 切开机段，输出起止/时长(min)/最小/平均/峰值功率(W)/电量(kWh)/state；整天无开机输出整天一行 state=0 统计整天数据；采样间隔中位差推断
+  - pipeline 接入：train 清洗后、infer 特征前（有分路文件时）各落盘 branch_sessions.csv；infer 分路数据加载提前复用（离线评估不再二次加载）
+  - README/default.yaml 文档更新；新增 10 项测试，134 项全过
+  - 真实数据验证：800 用户 train 3 分路×71 天（118 开机段/129 全关天）、infer 3 分路×53 天，统计量一致性通过；GPU 检测日志正常（无 GPU→CPU）
+- 关键决策：
+  - 设备解析放模型层，fit/predict 独立解析（模型跨设备迁移）
+  - 采样间隔用 timedelta64 除法（新版 pandas us 底层，view(int64) 会错 900 倍——踩坑记录）
+  - 开机段跨午夜按天切开；整天关机行 session_id=0；时间段取该日实际数据范围
+- 未决问题：无新增
+- 相关文件/分支：nilm/models/seq_models.py、nilm/analysis/branch_sessions.py、nilm/pipeline/user_task.py、tests/{test_branch_sessions,test_ml_models,test_batch}.py、README.md、configs/default.yaml；分支 arena/019ffeb6-nilm-new

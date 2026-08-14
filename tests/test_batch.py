@@ -74,7 +74,7 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
                   "data_schema_report.json", "data_quality_report.html",
                   "identifiability_report.json", "agg_strategy.json",
                   "train_window_index.csv", "metrics_by_split.csv",
-                  "metrics_daily.csv", "_DONE"]:
+                  "metrics_daily.csv", "branch_sessions.csv", "_DONE"]:
         assert (train_dir / fname).exists(), fname
     ident = json.loads((train_dir / "identifiability_report.json").read_text(encoding="utf-8"))
     assert ident["identifiable"] is True            # 合成数据高相关，应可辨识
@@ -172,6 +172,30 @@ def test_split_and_daily_metrics_csv(tmp_path, base_cfg_file, time_filter_file):
     assert {"model", "date", "n_points"} <= set(idaily.columns)
     assert idaily["model"].nunique() == 1
     assert len(idaily) == idaily["date"].nunique()
+
+
+def test_branch_sessions_artifact(tmp_path, base_cfg_file, time_filter_file):
+    """训练与推理前的分路开机分析产物：结构、状态取值、整天关机行覆盖整天。"""
+    data_root = _setup(tmp_path)
+    out_root = tmp_path / "outputs"
+    run_batch(time_filter_file, base_config_path=base_cfg_file,
+              data_root=data_root, output_root=out_root, stages=("train", "infer"),
+              user_keys=[USER_KEY])
+    for mode in ("train", "infer"):
+        d = sorted((out_root / USER_KEY / mode).iterdir())[-1]
+        f = d / "branch_sessions.csv"
+        assert f.exists(), f
+        df = pd.read_csv(f)
+        assert {"branch", "date", "session_id", "state", "start_time", "end_time",
+                "duration_min", "p_min_w", "p_mean_w", "p_max_w",
+                "energy_kwh", "n_points"} <= set(df.columns)
+        assert set(df["state"].unique()) <= {0, 1}
+        assert (df["duration_min"] > 0).all()
+        assert (df["p_max_w"] >= df["p_mean_w"]).all()
+        assert (df["p_mean_w"] >= df["p_min_w"]).all()
+        # 开机段行 session_id 从 1 起；整天关机行 session_id=0
+        assert (df.loc[df["state"] == 1, "session_id"] >= 1).all()
+        assert (df.loc[df["state"] == 0, "session_id"] == 0).all()
 
 
 def test_infer_result_state_prob_semantics(tmp_path, base_cfg_file, time_filter_file):

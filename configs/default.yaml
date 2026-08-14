@@ -66,6 +66,7 @@ models:                        # 多模型对比：注册表 + 配置驱动
     params: {n_estimators: 200, min_samples_leaf: 2}
   - name: xgboost              # XGBoost 回归（每分路一回归器；有 val 时早停）
     params: {n_estimators: 400, max_depth: 6, learning_rate: 0.05}
+  # 深度模型 device 默认 auto：自动检测 GPU（CUDA→MPS→CPU）；可显式 {device: cpu|cuda}
   - name: lstm                 # LSTM 时序回归（L=96 滑窗，Seq2Point 逐点输出）
     params: {window: 96, hidden_size: 64, epochs: 60, patience: 8}
   - name: cnn1d                # 1D-CNN 时序回归（卷积堆叠+全局池化）

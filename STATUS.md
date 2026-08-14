@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：GPU 自动检测（device=auto：CUDA→MPS→CPU）+ 训练/推理前分路开机情况分析（branch_sessions.csv）
 - ✅ 已完成：M2 多模型——新增 random_forest / xgboost / lstm / cnn1d / transformer 五个模型（8 模型对比全通）
 - ✅ 已完成：训练三阶段（train/val/test）指标 + 每模型日级指标 CSV；推理结果增加状态真值/开态概率 + 日级指标 CSV
 - ✅ 已完成：清洗后数据落盘 CSV 功能（cleaned/{bus,branch}_cleaned.csv，配置可关）
@@ -38,6 +39,9 @@
 - [x] 倍率规则落地（官方确认）：bus_field_map 全部字段 multiplier 0.001（实际值 = 原始/1000），PF 原始 916→0.916 归一无量纲；加载器 multiplier 机制零代码改动（配置驱动生效）
 - [x] 验证：84 项测试全过（新增倍率应用测试）；真实数据复验 10/10 OK——bus 质量分升至 98.7–100（缩放前 PF 原始值越界计为异常，缩放后消除）；模型指标不变（均匀缩放对 z-score 归一后的模型近似不变，符合预期）
 
+- [x] GPU 自动检测：`seq_models.resolve_device`——device 默认 auto（CUDA 可用→cuda 并打日志显卡名；其次 Apple MPS；否则 cpu）；显式 cuda 但不可用时回退 cpu 并告警；predict 每次独立解析设备（GPU 机器训练的模型可在 CPU 机器加载推理，net.to(device) 迁移）
+- [x] 分路开机情况分析：新增 `nilm/analysis/branch_sessions.py`（analyze_branch_sessions）——逐分路逐天按 on_thr_w 切开机段，每段输出起止时间/时长(min)/最小/平均/峰值功率(W)/电量(kWh)/state=1；整天无开机输出整天一行 state=0（统计整天数据）；采样间隔从时间戳中位差推断（5/15min 兼容）；train 与 infer（有分路文件时）均在建模前执行，落盘 branch_sessions.csv
+- [x] 验证（2026-08-14）：134 项测试全过（新增 10 项：单段统计手算/多段切分/整天关机行/跨午夜按天切/5min 间隔推断/NaN 剔除/设备解析与回退/默认 auto 等）；真实数据 800 用户实测——train 3 分路×71 天（开机段 118、全关天 129）、infer 3 分路×53 天，统计量一致性校验通过；GPU 检测日志正常（本机无 GPU→CPU）
 - [x] M2 多模型支持：`tree_models.py` 实现 random_forest（sklearn 原生 multioutput）/ xgboost（每分路一回归器，有 val 早停）；`seq_models.py` 实现 `_SeqTorchModel` 适配器基类（滑窗构造/训练循环/早停/批推理/权重级持久化）+ lstm / cnn1d / transformer 三个时序回归；全部惰性导入依赖并注册进 MODEL_REGISTRY，configs/default.yaml models 扩为 8 项；requirements-ml.txt 增补 xgboost
 - [x] 验证（2026-08-14）：124 项测试全过（新增 19 项：注册/形状与学习能力/save-load 往返/DL 种子可复现/滑窗对齐）；真实数据 --force 全量重跑 10/10 OK——树模型显著提效：778 用户 xgboost r2 0.951（原 best history_profile 0.827）、800 用户 random_forest r2 0.768（原 ridge 0.666）；DL 模型在当前小数据量下未超越树模型（预期内，窗口模型需更多数据）
 - [x] 训练三阶段评估：每个模型在 train/val/test 三个切分上分别评估（原先只评 test）——`metrics_by_split.csv`（model×split 行 × 指标列）；选型口径不变（仍按 test 指标挑 best_model，metrics.json/comparison 兼容）
@@ -63,6 +67,10 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- 设备解析放模型层（resolve_device）而非 pipeline：fit/predict 各自独立解析——模型对象可跨设备迁移（GPU 训练 CPU 推理）；auto 语义进 params 持久化，载入后仍按当前机器解析
+- 采样间隔推断用 np.diff(idx.values)/timedelta64(1,'m')：新版 pandas DatetimeIndex 底层可能是 us 而非 ns，view(int64)/6e10 会算错 900 倍（踩坑：测试 duration 0.1min）——timedelta64 除法不依赖底层单位
+- 开机段跨午夜按天切开（groupby normalize 后逐日游程）：口径为「每天开机情况」，跨日会话拆成两天各自的段；电量按段内 Σ(P×Δt)/1000 kWh
+- 整天关机行 session_id=0 与开机段（≥1）区分；时间段取该日实际数据范围（非日历 00:00–24:00，避免数据缺失时虚报时长）
 - DL 序列模型的窗口语义选 Seq2Point 逐点版（输入 [t-L+1,t] 特征、输出 t 时刻功率，头部复制首行填充）：保证 predict 输出行数=输入行数，与扁平模型对齐，评估/推理零改动；未复用 build_windows（其窗口不含头部填充，输出少 L-1 行）
 - torch 局部类 Net 不可 pickle：__getstate__/__setstate__ 只序列化 state_dict，load 时经 _build_net 重建结构再载权重——BaseModel.save/load 接口不变
 - DL 训练打乱用独立 np.random.default_rng(seed) 而非全局 np.random：保证同种子两次训练逐位一致（测试守卫）；float(loss) 改 float(loss.detach()) 消 torch 警告
