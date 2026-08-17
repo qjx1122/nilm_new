@@ -78,6 +78,14 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
         assert (train_dir / fname).exists(), fname
     ident = json.loads((train_dir / "identifiability_report.json").read_text(encoding="utf-8"))
     assert ident["identifiable"] is True            # 合成数据高相关，应可辨识
+    # 质量报告带清洗后数据统计（总天数/全关天数量/全关天清单）
+    meta_q = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))["quality"]
+    for kind in ("bus", "branch"):
+        cs = meta_q[kind]["cleaned_stats"]
+        assert cs["total_days"] > 0
+        assert cs["all_off_days"] == len(cs["all_off_dates"])
+    html = (train_dir / "data_quality_report.html").read_text(encoding="utf-8")
+    assert "清洗后数据统计" in html
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
     assert meta["best_model"] in meta["models"]
 

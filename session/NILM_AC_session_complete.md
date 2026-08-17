@@ -305,3 +305,14 @@
 - 关键决策：详析结论落 REPORT_TEST；proportional 修复列 TODO 高优先（倾向 pbus 移出 scale_cols），待修复后重跑再更新 best_model 结论
 - 未决问题：proportional 修复方案确认；789 阈值复核或 best 换 xgboost
 - 相关文件/分支：outputs/analysis/（不入库）、REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-17] 会话纪要（第 23 次）
+- 目标：数据质量报告增加清洗后数据统计（总天数/全关天数量/全关天日期清单）
+- 完成项：
+  - validator.cleaned_daily_stats：行级最大功率按天聚合，日峰值 < on_thr_w 判全关天；输出 total_days/all_off_days/all_off_dates
+  - quality_report 增加可选 on_thr_w 参数（附加 cleaned_stats，不传向后兼容）；write_quality_html 新增「清洗后数据统计」表与全关天日期清单段
+  - pipeline train 侧 bus/branch 质量报告传入用户 on_thr_w（meta.json quality 同步携带）
+  - 新增 6 项测试，140 项全过；真实数据 800 户验证（bus 71 天全关 4 天、branch 全关 18 天，与 branch_sessions 交叉吻合）
+- 关键决策：全关天口径=日峰值<on_thr_w（与状态判据/branch_sessions 同口径三处互证）；on_thr_w 可选参数保持向后兼容
+- 未决问题：无新增
+- 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new

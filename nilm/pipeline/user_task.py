@@ -164,8 +164,10 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         _dump(out / "time_offset.json",
               estimate_time_offset(bus_total(bus_al), target))
 
-        q_bus = quality_report(bus_al, "bus", 96, allow_negative)
-        q_br = quality_report(branch_al, "branch", 96, allow_negative)
+        q_bus = quality_report(bus_al, "bus", 96, allow_negative,
+                               on_thr_w=float(user_cfg["on_thr_w"]))
+        q_br = quality_report(branch_al, "branch", 96, allow_negative,
+                              on_thr_w=float(user_cfg["on_thr_w"]))
         write_quality_html(out / "data_quality_report.html", [q_bus, q_br])
         assert_quality(q_bus, qcfg.get("max_missing_rate", 0.3),
                        qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
