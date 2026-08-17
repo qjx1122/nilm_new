@@ -73,3 +73,35 @@ def test_quality_html_contains_cleaned_section(tmp_path):
     # 无 cleaned_stats 时不渲染该段
     p2 = write_quality_html(tmp_path / "q2.html", [quality_report(df, "bus", 96)])
     assert "清洗后数据统计" not in p2.read_text(encoding="utf-8")
+
+
+def test_series_daily_stats():
+    """单序列（切分目标功率）日级统计：口径与 cleaned_daily_stats 一致。"""
+    from nilm.data_io.validator import series_daily_stats
+
+    idx = pd.date_range("2026-01-01", periods=96 * 2, freq="15min")
+    s = pd.Series(0.0, index=idx)
+    s.iloc[40:48] = 100.0                       # 第 1 天开机，第 2 天全关
+    st = series_daily_stats(s, on_thr_w=50.0)
+    assert st["total_days"] == 2
+    assert st["all_off_days"] == 1
+    assert st["all_off_dates"] == ["2026-01-02"]
+    # NaN 剔除后统计（整天 NaN 不计入总天数）
+    s2 = s.copy(); s2.iloc[96:] = np.nan
+    st2 = series_daily_stats(s2, on_thr_w=50.0)
+    assert st2["total_days"] == 1 and st2["all_off_days"] == 0
+
+
+def test_quality_html_renders_split_stats(tmp_path):
+    """split_stats 键存在时 HTML 渲染切分级行与清单段。"""
+    df = _frame(days=3, on_days=[0])
+    rep = quality_report(df, "branch", 96, on_thr_w=50.0)
+    rep["split_stats"] = {
+        "train": {"total_days": 2, "all_off_days": 1,
+                  "all_off_dates": ["2026-01-02"]},
+        "test": {"total_days": 1, "all_off_days": 0, "all_off_dates": []},
+    }
+    html = write_quality_html(tmp_path / "q.html", [rep]).read_text(encoding="utf-8")
+    assert "branch·train" in html and "branch·test" in html
+    assert "branch·train 全关天日期清单（1 天）" in html
+    assert "（无）" in html                       # test 无全关天

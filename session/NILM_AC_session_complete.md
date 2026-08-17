@@ -316,3 +316,14 @@
 - 关键决策：全关天口径=日峰值<on_thr_w（与状态判据/branch_sessions 同口径三处互证）；on_thr_w 可选参数保持向后兼容
 - 未决问题：无新增
 - 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-17] 会话纪要（第 24 次）
+- 目标：①训练质量报告增加 train/val/test 切分级总天数/全关天统计；②推理阶段（有分路数据）增加同构质量报告
+- 完成项：
+  - validator：新增 series_daily_stats + _daily_stats_from_pmax 共用内核；write_quality_html 渲染 split_stats（「数据集·切分」行 + 逐切分全关天清单）
+  - train：切分完成后 branch 质量报告附 split_stats（目标功率口径）并重写 HTML；infer：bus15+branch 质量报告（不设门禁）+ 评估段 split_stats.infer + meta.json quality 键
+  - 新增 2 项单元测试 + 批量端到端断言扩展，142 项全过
+  - 真实数据 800 户验证：infer 评估段全关 3 天（7-29/30/31）与此前 F1 误报日归因完全吻合
+- 关键决策：切分级统计用目标功率口径（标签视角）；推理质量报告只报告不阻断；infer bus 用 15min 口径与训练可比
+- 未决问题：无新增
+- 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new

@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：质量报告切分级统计（train/val/test 各自总天数/全关天）+ 推理阶段质量报告（有分路数据时，与训练同构）
 - ✅ 已完成：数据质量报告增加清洗后数据统计（总天数/全关天数量/全关天日期清单，按 on_thr_w 口径）
 - ✅ 已完成：逐用户×逐模型日级指标详析 + F1 不达标日形态学归因（发现 proportional×Scaler 工程缺陷）
 - ✅ 已完成：7 模型批量验证（transformer 临时注释）+ 日级指标达标分析（SAE<0.2 & F1>0.9，scripts/analyze_daily_metrics.py）
@@ -18,6 +19,9 @@
 - ✅ 已完成：5 用户真实数据批量执行验证测试（train+infer 全通）
 
 ## 已完成
+- [x] 质量报告切分级统计：validator 新增 `series_daily_stats`（单序列口径同 cleaned_daily_stats）+ 抽出 `_daily_stats_from_pmax` 共用内核；train 质量报告 branch 段附 `split_stats`（train/val/test 各自总天数/全关天/清单，目标功率口径，切分后重写 HTML）；HTML 渲染「数据集·切分」行与逐切分全关天清单
+- [x] 推理阶段质量报告：有分路数据时产出 data_quality_report.html（bus15+branch 四项指标+清洗后统计，与训练同构；只报告不设门禁）；离线评估段附 split_stats.infer（评估交集口径）；infer meta.json 新增 quality 键
+- [x] 验证（2026-08-17）：142 项测试全过（新增 2 项+批量端到端断言扩展）；真实数据 800 户——train 切分级 4/1/1 天全关 0；infer 评估段 28 天全关 3 天（7-29/30/31）**与此前 F1 归因的误报日完全吻合**（质量报告直接暴露该类问题）
 - [x] 质量报告清洗后统计：validator 新增 `cleaned_daily_stats`（行级最大功率按天聚合，日峰值 < on_thr_w 判全关天）；quality_report 增加可选 on_thr_w 参数附加 cleaned_stats（不传保持旧行为向后兼容）；HTML 报告新增「清洗后数据统计」表 + 逐数据集全关天日期清单段；pipeline train 侧 bus/branch 质量报告均传入用户 on_thr_w（meta.json quality 键同步携带）
 - [x] 验证（2026-08-17）：140 项测试全过（新增 6 项：计数与日期清单/阈值口径/pf 列不计功率/空表与无功率列/quality_report 嵌入与兼容/HTML 渲染与不渲染）；真实数据 800 户实测——bus 71 天全关 4 天、branch 71 天全关 18 天（与 branch_sessions 分析交叉吻合），HTML 统计段渲染正常
 - [x] 需求文档获取：用户推送（c8cb164），docs/多数据源用户数据批量合并脚本-功能需求文档.pdf，全文解析
@@ -74,6 +78,9 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- 切分级统计用「目标功率序列」口径（splits y 值）而非整表 branch：切分是样本级概念，目标列才是训练标签；与整表 cleaned_stats（所有分路任一开机）口径不同属预期——前者回答"标签里有没有停机日"，后者回答"该户有没有全停日"
+- 推理质量报告只报告不设门禁：推理数据不满足训练门禁时仍应出结果（生产语义），质量问题由报告呈现而非阻断
+- infer 的 bus 质量报告用 bus15（15min 重采样后）：与训练阶段同一时间粒度，覆盖率/天数可比
 - 全关天判定用「行级最大功率的日峰值 < on_thr_w」：任一相/分路瞬时开机即不算全关天（比逐列平均更严格且物理直观）；与状态判据/branch_sessions 同一二值化口径，三处结论可互相印证
 - quality_report 的 on_thr_w 设为可选参数：不传不产生 cleaned_stats——保持旧调用（含测试）零破坏，向后兼容
 - 【缺陷发现 2026-08-17】proportional 基线自 Scaler 引入后失效：模型用特征列 pbus×share，但 pbus 在 scale_cols 中被标准化（中位≈0），clip(0) 后预测恒≈0——F1 不达标形态学分析（A 全漏报 47 行全来自 proportional）暴露；教训：基线模型按列名取原始物理量时必须校验该列是否被縮放

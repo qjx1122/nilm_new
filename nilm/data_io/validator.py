@@ -29,6 +29,19 @@ class QualityError(RuntimeError):
     """质量门禁不通过（映射为状态码 DATA_QUALITY_FAILED）。"""
 
 
+def _daily_stats_from_pmax(pmax: pd.Series, on_thr_w: float) -> dict:
+    """由「行级最大功率」序列出日级统计：总天数 / 全关天数量 / 全关天日期清单。"""
+    if len(pmax) == 0:
+        return {"total_days": 0, "all_off_days": 0, "all_off_dates": []}
+    daily_max = pmax.groupby(pmax.index.normalize()).max()
+    all_off = daily_max[daily_max.fillna(0.0) < float(on_thr_w)]
+    return {
+        "total_days": int(daily_max.size),
+        "all_off_days": int(all_off.size),
+        "all_off_dates": [d.strftime("%Y-%m-%d") for d in all_off.index],
+    }
+
+
 def cleaned_daily_stats(df: pd.DataFrame, on_thr_w: float) -> dict:
     """清洗后数据的逐天统计：总天数 / 全关天数量 / 全关天日期清单。
 
@@ -39,14 +52,13 @@ def cleaned_daily_stats(df: pd.DataFrame, on_thr_w: float) -> dict:
               if is_power_column(c) and np.issubdtype(df[c].dtype, np.number)]
     if len(df) == 0 or not p_cols:
         return {"total_days": 0, "all_off_days": 0, "all_off_dates": []}
-    pmax = df[p_cols].max(axis=1)          # 行级最大功率（任一相/分路开即视为开）
-    daily_max = pmax.groupby(pmax.index.normalize()).max()
-    all_off = daily_max[daily_max.fillna(0.0) < float(on_thr_w)]
-    return {
-        "total_days": int(daily_max.size),
-        "all_off_days": int(all_off.size),
-        "all_off_dates": [d.strftime("%Y-%m-%d") for d in all_off.index],
-    }
+    # 行级最大功率（任一相/分路开即视为开）
+    return _daily_stats_from_pmax(df[p_cols].max(axis=1), on_thr_w)
+
+
+def series_daily_stats(s: pd.Series, on_thr_w: float) -> dict:
+    """单条功率序列（如切分后的目标功率）的日级统计，口径同 cleaned_daily_stats。"""
+    return _daily_stats_from_pmax(s.dropna(), on_thr_w)
 
 
 def quality_report(df: pd.DataFrame, kind: str, points_per_day: int,
@@ -143,6 +155,16 @@ def write_quality_html(path: str | Path, reports: list[dict]) -> Path:
         off_sections.append(
             f"<h3>{r['kind']} 全关天日期清单（{cs['all_off_days']} 天）</h3>"
             f"<p>{listing}</p>")
+        # 切分级统计（train/val/test 或 infer，split_stats 键存在才渲染）
+        for split, ss in (r.get("split_stats") or {}).items():
+            cleaned_rows.append(
+                f"<tr><td>{r['kind']}·{split}</td><td>{ss['total_days']}</td>"
+                f"<td>{ss['all_off_days']}</td></tr>")
+            s_dates = ss["all_off_dates"]
+            s_listing = "、".join(s_dates) if s_dates else "（无）"
+            off_sections.append(
+                f"<h3>{r['kind']}·{split} 全关天日期清单（{ss['all_off_days']} 天）</h3>"
+                f"<p>{s_listing}</p>")
     cleaned_html = ""
     if cleaned_rows:
         cleaned_html = f"""

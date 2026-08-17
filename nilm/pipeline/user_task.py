@@ -23,7 +23,8 @@ from nilm.common.schema import bus_total
 from nilm.common.timefilter import filter_dataframe
 from nilm.data_io.csv_source import CsvBranchLoader, CsvBusLoader
 from nilm.data_io.validator import (QualityError, assert_quality, quality_report,
-                                    write_quality_html, write_schema_report)
+                                    series_daily_stats, write_quality_html,
+                                    write_schema_report)
 from nilm.evaluation import (build_comparison_table, evaluate_all,
                              evaluate_daily, summarize)
 from nilm.models import MODEL_REGISTRY
@@ -213,6 +214,13 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if split_sizes["test"] == 0 or split_sizes["train"] < window:
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, f"切分后样本不足: {split_sizes}")
 
+        # —— 质量报告补充切分级清洗后统计（train/val/test 各自的总天数/全关天，目标功率口径）
+        q_br["split_stats"] = {
+            k: series_daily_stats(pd.Series(splits[k][1][:, 0], index=splits[k][2]),
+                                  float(user_cfg["on_thr_w"]))
+            for k in ("train", "val", "test") if split_sizes.get(k, 0) > 0}
+        write_quality_html(out / "data_quality_report.html", [q_bus, q_br])  # 重写含切分统计
+
         # Scaler 只由 Train 拟合（§11）；日历列不缩放
         scale_cols = [i for i, c in enumerate(names) if c not in NON_SCALED_COLS]
         scaler = TrainFitScaler().fit(splits["train"][0], cols=scale_cols)
@@ -342,12 +350,20 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         # —— 推理前分路开机情况分析（有分路文件时；branch_c 供后续离线评估复用）
         branch_c = None
+        infer_quality = None
         if scan.branch_files:
             branch_raw, _ = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
             branch_c = Cleaner(clip_negative=not allow_negative).transform(branch_raw)
             _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
             sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]))
             sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
+            # 数据质量报告（与训练阶段同构：bus+branch 四项指标 + 清洗后统计；只报告不设门禁）
+            q_bus_i = quality_report(bus15, "bus", 96, allow_negative,
+                                     on_thr_w=float(user_cfg["on_thr_w"]))
+            q_br_i = quality_report(branch_c, "branch", 96, allow_negative,
+                                    on_thr_w=float(user_cfg["on_thr_w"]))
+            infer_quality = {"bus": q_bus_i, "branch": q_br_i}
+            write_quality_html(out / "data_quality_report.html", [q_bus_i, q_br_i])
 
         # §12.4 infer 时间过滤
         ispec = user_cfg.get("infer") or {}
@@ -399,6 +415,12 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     have.to_numpy()[:, None], pred_on_have.to_numpy()[:, None],
                     metric_names, on_thr_w=float(user_cfg["on_thr_w"]))
                 _dump(out / "offline_metrics.json", offline_metrics)
+                # 质量报告补充推理评估段切分级统计（目标功率口径，与训练同构）
+                if infer_quality is not None:
+                    infer_quality["branch"]["split_stats"] = {
+                        "infer": series_daily_stats(have, float(user_cfg["on_thr_w"]))}
+                    write_quality_html(out / "data_quality_report.html",
+                                       [infer_quality["bus"], infer_quality["branch"]])
                 # 日级离线指标 CSV（model × date 行 × 指标列）
                 daily = evaluate_daily(have.to_numpy()[:, None],
                                        pred_on_have.to_numpy()[:, None],
@@ -434,6 +456,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "model": model_name,
             "train_dir": str(train_dir), "n_points": len(valid),
+            "quality": infer_quality,
             "finished_at": datetime.now().isoformat(timespec="seconds"),
         })
         (out / DONE_MARKER).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")

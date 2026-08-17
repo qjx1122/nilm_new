@@ -84,8 +84,25 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
         cs = meta_q[kind]["cleaned_stats"]
         assert cs["total_days"] > 0
         assert cs["all_off_days"] == len(cs["all_off_dates"])
+    # 训练切分级统计：train/val/test 各自总天数/全关天（目标功率口径）
+    ss = meta_q["branch"]["split_stats"]
+    assert set(ss) == {"train", "val", "test"}
+    for k in ("train", "val", "test"):
+        assert ss[k]["total_days"] > 0
+        assert ss[k]["all_off_days"] == len(ss[k]["all_off_dates"])
     html = (train_dir / "data_quality_report.html").read_text(encoding="utf-8")
     assert "清洗后数据统计" in html
+    assert "branch·train" in html and "branch·test" in html
+
+    # 推理侧质量报告（有分路数据时产出，与训练同构 + infer 切分统计）
+    infer_dir2 = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+    assert (infer_dir2 / "data_quality_report.html").exists()
+    meta_i = json.loads((infer_dir2 / "meta.json").read_text(encoding="utf-8"))
+    qi = meta_i["quality"]
+    assert qi["bus"]["cleaned_stats"]["total_days"] > 0
+    assert qi["branch"]["split_stats"]["infer"]["total_days"] > 0
+    html_i = (infer_dir2 / "data_quality_report.html").read_text(encoding="utf-8")
+    assert "清洗后数据统计" in html_i and "branch·infer" in html_i
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
     assert meta["best_model"] in meta["models"]
 
