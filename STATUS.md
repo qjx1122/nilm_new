@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：分路通道范围审计与修正——开机分析/质量门禁改为只针对配置目标分路（branch_target 子表报告）
 - ✅ 已完成：质量报告切分级统计（train/val/test 各自总天数/全关天）+ 推理阶段质量报告（有分路数据时，与训练同构）
 - ✅ 已完成：数据质量报告增加清洗后数据统计（总天数/全关天数量/全关天日期清单，按 on_thr_w 口径）
 - ✅ 已完成：逐用户×逐模型日级指标详析 + F1 不达标日形态学归因（发现 proportional×Scaler 工程缺陷）
@@ -19,6 +20,9 @@
 - ✅ 已完成：5 用户真实数据批量执行验证测试（train+infer 全通）
 
 ## 已完成
+- [x] 分路通道范围审计（2026-08-17）：核心建模链路（目标/训练/指标/推理评估）已严格限定 target_col；发现两处整表口径——branch_sessions 开机分析（全部 pN）与质量门禁 assert_quality（整表缺失率，非目标分路缺失可误杀任务）
+- [x] 修正（经用户确认）：①开机分析限定目标分路（analyze_branch_sessions 传 columns=target_cols，train/infer 两侧）；②新增 branch_target 目标子表质量报告（kind=branch_target，含 cleaned_stats）——门禁改按目标子表判定，整表 branch 报告保留作全景参考；split_stats 迁移至 branch_target（口径归位）；infer 侧同构（target_quality + split_stats.infer 挂目标子表）
+- [x] 验证（2026-08-17）：142 项测试全过（端到端断言更新：sessions 分路⊆target_cols、branch_target·train/test/infer HTML 渲染）；真实数据 789 户（4 分路配 p1+p2）——sessions 只含 p1/p2；整表全关 0 天 vs 目标子表全关 11 天，两口径差异直观证明区分价值
 - [x] 质量报告切分级统计：validator 新增 `series_daily_stats`（单序列口径同 cleaned_daily_stats）+ 抽出 `_daily_stats_from_pmax` 共用内核；train 质量报告 branch 段附 `split_stats`（train/val/test 各自总天数/全关天/清单，目标功率口径，切分后重写 HTML）；HTML 渲染「数据集·切分」行与逐切分全关天清单
 - [x] 推理阶段质量报告：有分路数据时产出 data_quality_report.html（bus15+branch 四项指标+清洗后统计，与训练同构；只报告不设门禁）；离线评估段附 split_stats.infer（评估交集口径）；infer meta.json 新增 quality 键
 - [x] 验证（2026-08-17）：142 项测试全过（新增 2 项+批量端到端断言扩展）；真实数据 800 户——train 切分级 4/1/1 天全关 0；infer 评估段 28 天全关 3 天（7-29/30/31）**与此前 F1 归因的误报日完全吻合**（质量报告直接暴露该类问题）
@@ -78,6 +82,7 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- 分路范围三层口径定型：①branch 整表报告=全景参考（该户有没有全停日）；②branch_target 子表=门禁与切分统计口径（训练标签视角）；③branch_sessions=只分析目标分路（与训练目标一致）。门禁从整表改为目标子表：消除非目标分路缺失误杀任务的隐患（审计发现，用户确认修正）
 - 切分级统计用「目标功率序列」口径（splits y 值）而非整表 branch：切分是样本级概念，目标列才是训练标签；与整表 cleaned_stats（所有分路任一开机）口径不同属预期——前者回答"标签里有没有停机日"，后者回答"该户有没有全停日"
 - 推理质量报告只报告不设门禁：推理数据不满足训练门禁时仍应出结果（生产语义），质量问题由报告呈现而非阻断
 - infer 的 bus 质量报告用 bus15（15min 重采样后）：与训练阶段同一时间粒度，覆盖率/天数可比

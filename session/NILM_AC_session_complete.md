@@ -327,3 +327,13 @@
 - 关键决策：切分级统计用目标功率口径（标签视角）；推理质量报告只报告不阻断；infer bus 用 15min 口径与训练可比
 - 未决问题：无新增
 - 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-17] 会话纪要（第 25 次）
+- 目标：审计各功能是否只针对配置指定的分路通道，并修正越界处
+- 完成项：
+  - 审计结论：核心建模链路（resolve_target_cols → build_target → 训练/指标/推理评估/切分统计）已严格限定 target_col（含 p1+p2 复合）；两处整表口径——branch_sessions 开机分析、质量门禁 assert_quality（整表缺失率）
+  - 修正（用户确认方案）：开机分析限定目标分路（train/infer 均传 columns=target_cols）；新增 branch_target 目标子表质量报告，门禁改按子表判定（整表报告保留全景参考）；split_stats 迁移至 branch_target；infer 同构
+  - 142 项测试全过；真实数据 789 户（4 分路配 p1+p2）验证：sessions 只含 p1/p2，整表全关 0 天 vs 目标子表全关 11 天（口径区分价值直观呈现）
+- 关键决策：三层口径定型（整表全景/目标子表门禁/目标分路 sessions）
+- 未决问题：无新增
+- 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py；分支 arena/019ffeb6-nilm-new

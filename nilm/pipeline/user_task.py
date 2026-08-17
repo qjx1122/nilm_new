@@ -146,17 +146,18 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
         _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
 
-        # —— 训练前分路开机情况分析（逐分路逐天开机段/时长/功率统计/电量）
-        sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]))
+        # —— §3.3/§12.3 目标列契约（提前解析：开机分析/质量门禁按目标分路口径）
+        target_cols = resolve_target_cols(user_cfg.get("target_col"), branch_c)
+        target = build_target(branch_c, target_cols)
+
+        # —— 训练前分路开机情况分析（只针对配置的目标分路，逐天开机段/时长/功率/电量）
+        sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]),
+                                           columns=target_cols)
         sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
 
         # —— §5 统一 15min（聚合策略可配置且记录）
         bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
         _dump(out / "agg_strategy.json", agg_record)
-
-        # —— §3.3/§12.3 目标列契约
-        target_cols = resolve_target_cols(user_cfg.get("target_col"), branch_c)
-        target = build_target(branch_c, target_cols)
 
         # —— 时间对齐（重叠率门禁；偏移只报告不改戳）
         bus_al, branch_al = align_frames(bus15, branch_c,
@@ -169,10 +170,17 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                                on_thr_w=float(user_cfg["on_thr_w"]))
         q_br = quality_report(branch_al, "branch", 96, allow_negative,
                               on_thr_w=float(user_cfg["on_thr_w"]))
-        write_quality_html(out / "data_quality_report.html", [q_bus, q_br])
+        # 门禁按配置的目标分路子表计算（整表口径会被非目标分路缺失误杀任务）
+        q_br_target = quality_report(branch_al[target_cols], "branch_target", 96,
+                                     allow_negative,
+                                     on_thr_w=float(user_cfg["on_thr_w"]))
+        q_br["target_cols"] = target_cols
+        q_br["target_quality"] = q_br_target
+        write_quality_html(out / "data_quality_report.html",
+                           [q_bus, q_br, q_br_target])
         assert_quality(q_bus, qcfg.get("max_missing_rate", 0.3),
                        qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
-        assert_quality(q_br, qcfg.get("max_missing_rate", 0.3),
+        assert_quality(q_br_target, qcfg.get("max_missing_rate", 0.3),
                        qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
 
         # —— §12.4 train 时间过滤
@@ -215,11 +223,12 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, f"切分后样本不足: {split_sizes}")
 
         # —— 质量报告补充切分级清洗后统计（train/val/test 各自的总天数/全关天，目标功率口径）
-        q_br["split_stats"] = {
+        q_br_target["split_stats"] = {
             k: series_daily_stats(pd.Series(splits[k][1][:, 0], index=splits[k][2]),
                                   float(user_cfg["on_thr_w"]))
             for k in ("train", "val", "test") if split_sizes.get(k, 0) > 0}
-        write_quality_html(out / "data_quality_report.html", [q_bus, q_br])  # 重写含切分统计
+        write_quality_html(out / "data_quality_report.html",
+                           [q_bus, q_br, q_br_target])  # 重写含切分统计
 
         # Scaler 只由 Train 拟合（§11）；日历列不缩放
         scale_cols = [i for i, c in enumerate(names) if c not in NON_SCALED_COLS]
@@ -355,15 +364,24 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             branch_raw, _ = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
             branch_c = Cleaner(clip_negative=not allow_negative).transform(branch_raw)
             _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
-            sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]))
+            # 目标列契约（与训练同口径）：开机分析/质量统计只针对配置的目标分路
+            tcols_i = resolve_target_cols(user_cfg.get("target_col"), branch_c)
+            sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]),
+                                               columns=tcols_i)
             sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
-            # 数据质量报告（与训练阶段同构：bus+branch 四项指标 + 清洗后统计；只报告不设门禁）
+            # 数据质量报告（与训练阶段同构：bus+branch+目标子表；只报告不设门禁）
             q_bus_i = quality_report(bus15, "bus", 96, allow_negative,
                                      on_thr_w=float(user_cfg["on_thr_w"]))
             q_br_i = quality_report(branch_c, "branch", 96, allow_negative,
                                     on_thr_w=float(user_cfg["on_thr_w"]))
+            q_br_t_i = quality_report(branch_c[tcols_i], "branch_target", 96,
+                                      allow_negative,
+                                      on_thr_w=float(user_cfg["on_thr_w"]))
+            q_br_i["target_cols"] = tcols_i
+            q_br_i["target_quality"] = q_br_t_i
             infer_quality = {"bus": q_bus_i, "branch": q_br_i}
-            write_quality_html(out / "data_quality_report.html", [q_bus_i, q_br_i])
+            write_quality_html(out / "data_quality_report.html",
+                               [q_bus_i, q_br_i, q_br_t_i])
 
         # §12.4 infer 时间过滤
         ispec = user_cfg.get("infer") or {}
@@ -415,12 +433,14 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     have.to_numpy()[:, None], pred_on_have.to_numpy()[:, None],
                     metric_names, on_thr_w=float(user_cfg["on_thr_w"]))
                 _dump(out / "offline_metrics.json", offline_metrics)
-                # 质量报告补充推理评估段切分级统计（目标功率口径，与训练同构）
+                # 质量报告补充推理评估段切分级统计（目标功率口径，挂目标子表报告）
                 if infer_quality is not None:
-                    infer_quality["branch"]["split_stats"] = {
+                    q_br_t = infer_quality["branch"]["target_quality"]
+                    q_br_t["split_stats"] = {
                         "infer": series_daily_stats(have, float(user_cfg["on_thr_w"]))}
                     write_quality_html(out / "data_quality_report.html",
-                                       [infer_quality["bus"], infer_quality["branch"]])
+                                       [infer_quality["bus"], infer_quality["branch"],
+                                        q_br_t])
                 # 日级离线指标 CSV（model × date 行 × 指标列）
                 daily = evaluate_daily(have.to_numpy()[:, None],
                                        pred_on_have.to_numpy()[:, None],
