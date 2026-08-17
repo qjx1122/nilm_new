@@ -60,20 +60,20 @@ bus_field_map:
   pfc:   {ch: 1, column: load_iden_data80, multiplier: 0.001, unit: ""}
 
 models:                        # 多模型对比：注册表 + 配置驱动
+  # 当前只保留 3 个基线/线性模型（2026-08-17 用户要求，其余临时注释；恢复取消注释即可）
   - name: history_profile
   - name: proportional
   - name: ridge
     params: {alpha: 1.0}
-  - name: random_forest        # 随机森林回归（sklearn，原生 multioutput）
-    params: {n_estimators: 200, min_samples_leaf: 2}
-  - name: xgboost              # XGBoost 回归（每分路一回归器；有 val 时早停）
-    params: {n_estimators: 400, max_depth: 6, learning_rate: 0.05}
+  # - name: random_forest      # 随机森林回归（sklearn，原生 multioutput）
+  #   params: {n_estimators: 200, min_samples_leaf: 2}
+  # - name: xgboost            # XGBoost 回归（每分路一回归器；有 val 时早停）
+  #   params: {n_estimators: 400, max_depth: 6, learning_rate: 0.05}
   # 深度模型 device 默认 auto：自动检测 GPU（CUDA→MPS→CPU）；可显式 {device: cpu|cuda}
-  - name: lstm                 # LSTM 时序回归（L=96 滑窗，Seq2Point 逐点输出）
-    params: {window: 96, hidden_size: 64, epochs: 60, patience: 8}
-  - name: cnn1d                # 1D-CNN 时序回归（卷积堆叠+全局池化）
-    params: {window: 96, channels: 32, epochs: 60, patience: 8}
-  # transformer 临时注释（CPU 大用户约 25min，批跑提速；恢复时取消注释即可，2026-08-14）
+  # - name: lstm               # LSTM 时序回归（L=96 滑窗，Seq2Point 逐点输出）
+  #   params: {window: 96, hidden_size: 64, epochs: 60, patience: 8}
+  # - name: cnn1d              # 1D-CNN 时序回归（卷积堆叠+全局池化）
+  #   params: {window: 96, channels: 32, epochs: 60, patience: 8}
   # - name: transformer        # Transformer 时序回归（Encoder+位置编码）
   #   params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 60, patience: 8}
 

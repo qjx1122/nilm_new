@@ -371,3 +371,14 @@
 - 关键决策：插值语义修正是统计正确性的前置依赖（无效天判定/缺失天统计均受污染）；教训入 STATUS
 - 未决问题：无新增
 - 相关文件/分支：nilm/preprocess/clean.py、tests/test_clean.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-17] 会话纪要（第 29 次）
+- 目标：拉取最新版本；models 只保留 history_profile/proportional/ridge（其余注释）；2842 用户验证测试
+- 完成项：
+  - 拉取远程最新 60a738f（用户更新 2842/2844 数据至 2026-08-03，训练窗数据 132→146 天）
+  - default.yaml models 注释 random_forest/xgboost/lstm/cnn1d（transformer 原已注释），保留 3 基线；恢复取消注释即可
+  - 152 项测试全过；2842 train+infer OK：best=ridge test r2 0.651/f1 0.750（新数据下较旧 0.616/0.769 r2 提升）；infer 离线 r2 0.871/f1 0.930
+  - 既有功能在新数据上保持生效：无效天剔除 train 7 天/infer 11 天（新数据 7-31/8-2 等新增缺失天正确识别）；6-13 仍在缺失清单（插值修复有效）；剔除天∩评估天=空；质量报告 bus 146/143/3、target 146/140/6/全关18
+- 关键决策：无新增（配置调整+验证轮）
+- 未决问题：待用户确认后可扩展到其余用户批量验证
+- 相关文件/分支：configs/default.yaml；分支 arena/019ffeb6-nilm-new
