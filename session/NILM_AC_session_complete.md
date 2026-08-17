@@ -360,3 +360,14 @@
 - 关键决策：复核方法论（独立路径重算+交叉断言）入 STATUS；gap_days 字段暂不加
 - 未决问题：无
 - 相关文件/分支：REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-17] 会话纪要（第 28 次）
+- 目标：排查 2842 用户 6-13 清洗后不再是全天缺失天的问题；修复并全用户重验
+- 完成项：
+  - 根因定位：interpolate(limit=N) 对长缺口部分填充前 N 点（pandas 语义陷阱），6-12 尾部 0 值延伸 2 个伪点进 6-13
+  - 修复：clean.py 新增 _interp_short_gaps（缺口游程整段决策：≤max_gap 全补/>max_gap 全不补；limit_area=inside 禁首尾外推）
+  - 新增 tests/test_clean.py 6 项回归测试；152 项全过
+  - 全 5 户 --force 重跑：8 项 OK（844 既有数据问题除外）；842 目标通道缺失天 1→6、全关 16→11 归位；6-13 进缺失+剔除清单、不在全关/日级评估
+- 关键决策：插值语义修正是统计正确性的前置依赖（无效天判定/缺失天统计均受污染）；教训入 STATUS
+- 未决问题：无新增
+- 相关文件/分支：nilm/preprocess/clean.py、tests/test_clean.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
