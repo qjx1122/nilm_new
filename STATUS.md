@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：逐用户×逐模型日级指标详析 + F1 不达标日形态学归因（发现 proportional×Scaler 工程缺陷）
 - ✅ 已完成：7 模型批量验证（transformer 临时注释）+ 日级指标达标分析（SAE<0.2 & F1>0.9，scripts/analyze_daily_metrics.py）
 - ✅ 已完成：配置说明文档 docs/CONFIG_GUIDE.md（default.yaml 逐项详解 + 8 模型训练效率因素）
 - ✅ 已完成：GPU 自动检测（device=auto：CUDA→MPS→CPU）+ 训练/推理前分路开机情况分析（branch_sessions.csv）
@@ -62,6 +63,7 @@
 - 无
 
 ## 下一步（TODO）
+0. 【高优先】修复 proportional 基线缺陷：pbus 被 z-score 标准化后 clip(0) 致预测恒≈0（TP 全期=0）——倾向方案：pbus 移出 scale_cols（slot 先例）；修复后全量重跑并复核历史 best_model 结论（844/789 的 proportional "胜出"是退化假象）
 1. ~~M2 多模型：GBDT/Seq2Point/LSTM~~ 已落地 8 模型对比；稀疏用户 789 仍无正 r2 模型（数据侧问题为主），844 test 切分过小——需数据扩充或切分配置调整
 2. DL 模型调参/加速：大用户 transformer CPU 训练约 25 min，可下调 epochs/d_model 或引入 GPU；DL 当前未超越树模型，数据量增大后复评
 3. 指南附件缺失项（日级指标字段清单/启动段契约）待补充
@@ -69,6 +71,8 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- 【缺陷发现 2026-08-17】proportional 基线自 Scaler 引入后失效：模型用特征列 pbus×share，但 pbus 在 scale_cols 中被标准化（中位≈0），clip(0) 后预测恒≈0——F1 不达标形态学分析（A 全漏报 47 行全来自 proportional）暴露；教训：基线模型按列名取原始物理量时必须校验该列是否被縮放
+- F1 不达标日六分类形态学（A 全漏报/B 全误报/C 错位/D TN=0 过度报开/E 漏报为主/F 误报为主）是高效归因工具：形态×模型交叉表 3 分钟定位三类根因（工程缺陷/阈值不匹配/停机样本缺失）
 - transformer 临时注释而非删除（default.yaml 注释保留参数，恢复取消注释即可）：CPU 大户 ~25min 拖慢批跑 4 倍；恢复时机=GPU 环境或调参后
 - 日级达标分析发现 SAE 口径缺陷：真值全关日 Σtrue=0，SAE=|Σpred|/(0+eps) 出现 1e13 天文数字——建议正式口径对全关日只考核 F1，或 SAE 分母加下限保护
 - SAE 超标主因是训练/推理期负荷水平漂移（Σpred/Σtarget：800 低估 43%、778 低估 17%、842 低估 14%）而非开关误判（F1 多数完美）——改善方向是扩充训练时间范围，非换模型

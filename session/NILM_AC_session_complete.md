@@ -291,3 +291,17 @@
 - 关键决策：SAE 口径修订建议（全关日只考核 F1）；改善方向定为扩充训练时间范围而非换模型
 - 未决问题：正式达标口径待需求方确认；transformer 恢复时机
 - 相关文件/分支：configs/default.yaml、scripts/analyze_daily_metrics.py、outputs/analysis/（不入库）、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-17] 会话纪要（第 22 次）
+- 目标：逐用户×逐模型日级指标详析；F1 不达标日重点归因
+- 完成项：
+  - 沙箱重置后重建环境+全量重跑（10/10 OK，与 08-14 结果逐行一致，可复现性验证通过）
+  - 日级全景：用户×模型 达标率/F1 达标率/SAE 达标率/F1 中位与最小值矩阵（train-test + infer）
+  - F1 不达标日混淆矩阵形态学六分类 + 数据交叉验证（branch_sessions/cleaned/inference_result/meta）
+  - 【重要发现】proportional 基线工程缺陷：pbus 被 Scaler 标准化后 clip(0) 预测恒≈0，5 户 test 全期 TP=0；844/789 的 proportional "best" 是退化假象
+  - 789 D 形态根因：真值双峰分布（P50 32W/P75 1312W）与 on_thr_w=60 不匹配 + cnn1d 无低功率分辨力（pred 恒 371~610W）
+  - 842 B 形态根因：停机日仅 11% 且停机日总线水平（237W）与开机日（296W）重叠；800 尾段误报同类（停机但总线有底载，训练仅 6 天无此模式）
+  - 778 F1 全期 100% 达标（标杆）
+- 关键决策：详析结论落 REPORT_TEST；proportional 修复列 TODO 高优先（倾向 pbus 移出 scale_cols），待修复后重跑再更新 best_model 结论
+- 未决问题：proportional 修复方案确认；789 阈值复核或 best 换 xgboost
+- 相关文件/分支：outputs/analysis/（不入库）、REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
