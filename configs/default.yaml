@@ -16,6 +16,8 @@ quality:                       # §6 质量门禁（阈值按 5 用户实测数�
   min_coverage: 0.15
   min_score: 10
   min_days: 3                  # 与 time_filters.json 中最短训练窗口（6 天）相容
+  max_daily_missing_rate: 0.9  # 日级无效天阈值：全天缺失或当日缺失率超此值的天，
+                               #   不参与模型训练与训练/推理阶段的评估指标计算
 
 preprocess:
   clip_negative: true

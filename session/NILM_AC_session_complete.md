@@ -337,3 +337,15 @@
 - 关键决策：三层口径定型（整表全景/目标子表门禁/目标分路 sessions）
 - 未决问题：无新增
 - 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-17] 会话纪要（第 26 次）
+- 目标：①无效天（全天缺失/缺失率超阈值）不参与训练与评估；②质量报告增实际天数；③全关天剔除全天缺失天；④审计全天缺失天的统计使用
+- 完成项：
+  - validator：invalid_data_days（功率列口径+max_daily_missing_rate 新配置，默认 0.9）；cleaned_stats 扩展 actual_days/missing_days/missing_dates；全关天只在实际天中判定；HTML 增实际天数/全天缺失天列与清单
+  - pipeline：train 侧 bus∪branch(target) 无效天整天剔除（时间过滤前）；infer 侧离线评估同口径剔除；两侧落盘 excluded_days.json
+  - 审计结论：branch_sessions/evaluate_daily/identifiability 均已天然安全；唯一漏洞为全关天 fillna(0) 把全缺失天计入，已修
+  - 146 项测试全过（新增 4 项）；真实数据验证：842 train 剔 7 天（含 6-20/6-22 此前发现的 2 点天）、日级指标不再含剔除天；844 暴露真实数据问题（49 个 0 点天）转 INSUFFICIENT_TIME_RANGE
+  - CONFIG_GUIDE.md 增 max_daily_missing_rate 条目
+- 关键决策：有效点按功率列判定（PF 兜底填充会误判，踩坑记录）；844 不放宽阈值迁就；全关≠无数据口径修订
+- 未决问题：844 数据侧补齐
+- 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、configs/default.yaml、docs/CONFIG_GUIDE.md、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new

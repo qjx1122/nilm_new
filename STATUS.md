@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：日级无效天剔除（全天缺失/缺失率超阈值不参与训练与评估）+ 质量报告实际天数统计 + 全关天剔除全天缺失天
 - ✅ 已完成：分路通道范围审计与修正——开机分析/质量门禁改为只针对配置目标分路（branch_target 子表报告）
 - ✅ 已完成：质量报告切分级统计（train/val/test 各自总天数/全关天）+ 推理阶段质量报告（有分路数据时，与训练同构）
 - ✅ 已完成：数据质量报告增加清洗后数据统计（总天数/全关天数量/全关天日期清单，按 on_thr_w 口径）
@@ -20,6 +21,10 @@
 - ✅ 已完成：5 用户真实数据批量执行验证测试（train+infer 全通）
 
 ## 已完成
+- [x] 日级无效天剔除（2026-08-17）：validator 新增 `invalid_data_days`（有效点按功率列判定；全天缺失或日缺失率> `quality.max_daily_missing_rate`〔新配置，默认 0.9〕即无效）；train 侧在时间过滤前对 bus_al 与 branch_al[target_cols] 取并集剔除整天（不参与训练与三阶段/日级评估）；infer 侧离线评估同口径剔除；两侧均落盘 excluded_days.json
+- [x] 质量报告实际天数：cleaned_stats 扩展为 total_days/**actual_days**（=总天数−全天缺失天）/missing_days/missing_dates/all_off_days/all_off_dates；全关天只在实际天中判定（全天缺失天不再计入全关天）；HTML 统计表增「实际天数/全天缺失天」列 + 全天缺失日期清单段
+- [x] 全天缺失天审计：branch_sessions（dropna 后分组，全 NaN 天不产生行✅）、evaluate_daily（上游 drop_invalid_rows/dropna 已剔 NaN 样本✅）、identifiability（内部 dropna✅）、质量四项指标（missing_rate/coverage 有意度量缺失，保留✅）——唯一漏洞是旧全关天统计把全 NaN 天当 0 功率计入（fillna(0)），已修
+- [x] 验证（2026-08-17）：146 项测试全过（新增 4 项：missing 天不计全关/invalid_data_days 阈值/HTML 实际天数渲染/端到端剔除）；真实数据 5 户——842 train 剔 7 天（含此前 F1 归因发现的 6-20/6-22"全天仅 2 点"可疑天）、infer 剔 7 天且日级指标不再含这些天；778/789/800 infer 各剔 3 天（7-24/25/26）；844 剔 76 天后 INSUFFICIENT_TIME_RANGE——数据侧真实问题暴露（p2 有 49 个 0 点天 + 27 天 bus/branch 不重叠），非误判
 - [x] 分路通道范围审计（2026-08-17）：核心建模链路（目标/训练/指标/推理评估）已严格限定 target_col；发现两处整表口径——branch_sessions 开机分析（全部 pN）与质量门禁 assert_quality（整表缺失率，非目标分路缺失可误杀任务）
 - [x] 修正（经用户确认）：①开机分析限定目标分路（analyze_branch_sessions 传 columns=target_cols，train/infer 两侧）；②新增 branch_target 目标子表质量报告（kind=branch_target，含 cleaned_stats）——门禁改按目标子表判定，整表 branch 报告保留作全景参考；split_stats 迁移至 branch_target（口径归位）；infer 侧同构（target_quality + split_stats.infer 挂目标子表）
 - [x] 验证（2026-08-17）：142 项测试全过（端到端断言更新：sessions 分路⊆target_cols、branch_target·train/test/infer HTML 渲染）；真实数据 789 户（4 分路配 p1+p2）——sessions 只含 p1/p2；整表全关 0 天 vs 目标子表全关 11 天，两口径差异直观证明区分价值
@@ -82,6 +87,9 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- invalid_data_days 有效点按功率列判定而非任意数值列：PF 兜底（回退文件均值）会把全缺失天的 pf 列填满，若按任意列判定则全缺失天被误判有效（首版实现踩坑，端到端测试暴露）——功率列口径与全关天判定一致
+- 844 户剔除 76 天后训练不足属数据真实问题（p2 仅 84 个完整天、49 个全 0 点天，且 bus 仅 90 天与 branch 136 天错位）：不放宽阈值迁就，记录为数据侧待补齐；如需临时跑通可在配置中调高 max_daily_missing_rate 或缩小训练时间窗
+- 全关天口径修订：旧实现 fillna(0) 把全 NaN 天当 0 功率计入全关天（虚增全关天数）；新口径全关只在实际天（有有效数据）中判定——「全关」与「无数据」是不同的业务事实
 - 分路范围三层口径定型：①branch 整表报告=全景参考（该户有没有全停日）；②branch_target 子表=门禁与切分统计口径（训练标签视角）；③branch_sessions=只分析目标分路（与训练目标一致）。门禁从整表改为目标子表：消除非目标分路缺失误杀任务的隐患（审计发现，用户确认修正）
 - 切分级统计用「目标功率序列」口径（splits y 值）而非整表 branch：切分是样本级概念，目标列才是训练标签；与整表 cleaned_stats（所有分路任一开机）口径不同属预期——前者回答"标签里有没有停机日"，后者回答"该户有没有全停日"
 - 推理质量报告只报告不设门禁：推理数据不满足训练门禁时仍应出结果（生产语义），质量问题由报告呈现而非阻断

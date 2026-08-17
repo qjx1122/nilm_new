@@ -277,6 +277,52 @@ def test_cleaned_csv_saved(tmp_path, base_cfg_file, time_filter_file):
     assert bus["timestamp"].is_unique
 
 
+def test_invalid_days_excluded_from_training_and_metrics(tmp_path, base_cfg,
+                                                         time_filter_file):
+    """总线全天缺失/缺失率超阈值的天：不参与训练，且不出现在日级评估指标中。"""
+    import numpy as np
+    import yaml
+
+    base_cfg["quality"]["max_daily_missing_rate"] = 0.9
+    cfg_file = tmp_path / "base_daily.yaml"
+    cfg_file.write_text(yaml.safe_dump(base_cfg, allow_unicode=True, sort_keys=False),
+                        encoding="utf-8")
+    data_root = tmp_path / "data"
+    d = write_user_dir(data_root, USER_KEY, days=21)
+    write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+
+    # 把训练总线 CSV 的第 8 天（2026-01-08）改为全 NaN（哨兵值→NaN 路径同效，直接置空）
+    bus_files = [p for p in d.iterdir() if p.name.startswith("e241_")]
+    df = pd.read_csv(bus_files[0])
+    ts = pd.to_datetime(df["event_time"])
+    df.loc[ts.dt.strftime("%Y-%m-%d") == "2026-01-08",
+           [c for c in df.columns if c != "event_time"]] = np.nan
+    df.to_csv(bus_files[0], index=False)
+
+    out_root = tmp_path / "outputs"
+    info = run_batch(time_filter_file, base_config_path=cfg_file,
+                     data_root=data_root, output_root=out_root,
+                     stages=("train", "infer"), user_keys=[USER_KEY])
+    table = pd.read_csv(info["status_csv"])
+    assert (table["status"] == Status.OK).all(), table
+
+    train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
+    excl = json.loads((train_dir / "excluded_days.json").read_text(encoding="utf-8"))
+    assert "2026-01-08" in excl["excluded_days"]
+    # 该天不出现在任何模型/阶段的日级指标里（未参与训练与评估）
+    daily = pd.read_csv(train_dir / "metrics_daily.csv")
+    assert "2026-01-08" not in set(daily["date"])
+    # 质量报告实际天数 = 总天数 − 全天缺失天
+    meta_q = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))["quality"]
+    cs = meta_q["bus"]["cleaned_stats"]
+    assert cs["actual_days"] == cs["total_days"] - cs["missing_days"]
+    # 全关天清单不含全天缺失天
+    assert set(cs["all_off_dates"]).isdisjoint(set(cs.get("missing_dates", [])))
+    # infer 侧 excluded_days.json 存在（本例推理段无坏天，清单可为空）
+    infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+    assert (infer_dir / "excluded_days.json").exists()
+
+
 def test_cleaned_csv_disabled_by_config(tmp_path, base_cfg, time_filter_file):
     """preprocess.save_cleaned_csv=false 时不产出 cleaned/ 目录。"""
     import yaml

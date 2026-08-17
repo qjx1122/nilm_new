@@ -48,8 +48,9 @@ def test_empty_and_no_power_columns():
     idx = pd.date_range("2026-01-01", periods=4, freq="15min")
     assert cleaned_daily_stats(pd.DataFrame(index=idx), 10.0)["total_days"] == 0
     df = pd.DataFrame({"ua": [220.0] * 4}, index=idx)
-    assert cleaned_daily_stats(df, 10.0) == {
-        "total_days": 0, "all_off_days": 0, "all_off_dates": []}
+    st = cleaned_daily_stats(df, 10.0)
+    assert st["total_days"] == 0 and st["actual_days"] == 0
+    assert st["all_off_days"] == 0 and st["all_off_dates"] == []
 
 
 def test_quality_report_embeds_cleaned_stats():
@@ -86,10 +87,12 @@ def test_series_daily_stats():
     assert st["total_days"] == 2
     assert st["all_off_days"] == 1
     assert st["all_off_dates"] == ["2026-01-02"]
-    # NaN 剔除后统计（整天 NaN 不计入总天数）
+    # 整天 NaN → 记全天缺失天，不计入实际天数、更不算全关天
     s2 = s.copy(); s2.iloc[96:] = np.nan
     st2 = series_daily_stats(s2, on_thr_w=50.0)
-    assert st2["total_days"] == 1 and st2["all_off_days"] == 0
+    assert st2["total_days"] == 2 and st2["actual_days"] == 1
+    assert st2["missing_days"] == 1 and st2["missing_dates"] == ["2026-01-02"]
+    assert st2["all_off_days"] == 0
 
 
 def test_quality_html_renders_split_stats(tmp_path):
@@ -105,3 +108,52 @@ def test_quality_html_renders_split_stats(tmp_path):
     assert "branch·train" in html and "branch·test" in html
     assert "branch·train 全关天日期清单（1 天）" in html
     assert "（无）" in html                       # test 无全关天
+
+
+def _frame_with_missing(days: int = 4, missing_days: list[int] | None = None,
+                        partial: dict[int, int] | None = None) -> pd.DataFrame:
+    """构造 15min 数据：missing_days 全天 NaN；partial={天序号: 有效点数}。"""
+    idx = pd.date_range("2026-01-01", periods=96 * days, freq="15min")
+    p1 = np.full(len(idx), 100.0)
+    for d in (missing_days or []):
+        p1[96 * d: 96 * (d + 1)] = np.nan
+    for d, keep in (partial or {}).items():
+        p1[96 * d + keep: 96 * (d + 1)] = np.nan
+    return pd.DataFrame({"p1": p1}, index=idx)
+
+
+def test_missing_days_not_counted_as_all_off():
+    """全天数据缺失的天：计入 missing_days，不计入实际天/全关天。"""
+    # 第 1 天全 NaN；第 2 天有数据但全 0（真全关）
+    df = _frame_with_missing(days=3, missing_days=[1])
+    df.iloc[96 * 2: 96 * 3, 0] = 0.0
+    st = cleaned_daily_stats(df, on_thr_w=50.0)
+    assert st["total_days"] == 3
+    assert st["actual_days"] == 2                      # 实际天数不含全缺失天
+    assert st["missing_days"] == 1
+    assert st["missing_dates"] == ["2026-01-02"]
+    assert st["all_off_days"] == 1                     # 只有真全关天
+    assert st["all_off_dates"] == ["2026-01-03"]
+
+
+def test_invalid_data_days_full_missing_and_threshold():
+    """invalid_data_days：全天缺失必入选；缺失率阈值生效。"""
+    from nilm.data_io.validator import invalid_data_days
+
+    # 第 0 天全缺失；第 1 天仅 5 点有效（缺失率 94.8%）；第 2/3 天完整
+    df = _frame_with_missing(days=4, missing_days=[0], partial={1: 5})
+    bad_any = invalid_data_days(df, 96, max_daily_missing_rate=1.0)
+    assert [d.strftime("%Y-%m-%d") for d in bad_any] == ["2026-01-01"]  # 仅全缺失
+    bad_thr = invalid_data_days(df, 96, max_daily_missing_rate=0.9)
+    assert [d.strftime("%Y-%m-%d") for d in bad_thr] == ["2026-01-01", "2026-01-02"]
+    assert invalid_data_days(pd.DataFrame(), 96) == []
+
+
+def test_quality_html_shows_actual_and_missing_days(tmp_path):
+    """HTML 渲染实际天数/全天缺失天列与缺失日期清单。"""
+    df = _frame_with_missing(days=3, missing_days=[1])
+    rep = quality_report(df, "bus", 96, on_thr_w=50.0)
+    html = write_quality_html(tmp_path / "q.html", [rep]).read_text(encoding="utf-8")
+    assert "实际天数" in html and "全天缺失天" in html
+    assert "bus 全天数据缺失日期清单（1 天）" in html
+    assert "2026-01-02" in html

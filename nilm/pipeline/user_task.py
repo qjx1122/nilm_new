@@ -22,7 +22,8 @@ from nilm.common.logging import get_logger
 from nilm.common.schema import bus_total
 from nilm.common.timefilter import filter_dataframe
 from nilm.data_io.csv_source import CsvBranchLoader, CsvBusLoader
-from nilm.data_io.validator import (QualityError, assert_quality, quality_report,
+from nilm.data_io.validator import (QualityError, assert_quality,
+                                    invalid_data_days, quality_report,
                                     series_daily_stats, write_quality_html,
                                     write_schema_report)
 from nilm.evaluation import (build_comparison_table, evaluate_all,
@@ -189,6 +190,24 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             bus_al = filter_dataframe(bus_al, tspec.get("include"), tspec.get("exclude"))
             branch_al = filter_dataframe(branch_al, tspec.get("include"), tspec.get("exclude"))
             target = target.loc[target.index.intersection(bus_al.index)]
+
+        # —— 日级无效天剔除：总线或分路全天缺失/缺失率超阈值的天不参与训练与评估
+        daily_thr = float(qcfg.get("max_daily_missing_rate", 1.0))
+        bad_days = sorted(set(invalid_data_days(bus_al, 96, daily_thr)) |
+                          set(invalid_data_days(branch_al[target_cols], 96, daily_thr)))
+        if bad_days:
+            bad_set = set(bad_days)
+            keep_bus = ~bus_al.index.normalize().isin(bad_set)
+            keep_br = ~branch_al.index.normalize().isin(bad_set)
+            bus_al, branch_al = bus_al[keep_bus], branch_al[keep_br]
+            target = target[~target.index.normalize().isin(bad_set)]
+            log.warning("[%s] 剔除无效天 %d 天（全天缺失或日缺失率>%.0f%%）: %s",
+                        user_key, len(bad_days), daily_thr * 100,
+                        [d.strftime("%Y-%m-%d") for d in bad_days])
+        _dump(out / "excluded_days.json", {
+            "max_daily_missing_rate": daily_thr,
+            "excluded_days": [d.strftime("%Y-%m-%d") for d in bad_days],
+        })
 
         if len(bus_al) < 96 * float(qcfg.get("min_days", 14)):
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE,
@@ -426,6 +445,20 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             t = build_target(branch_c, tcols).reindex(valid.index)
             target_vals = t
             have = t.dropna()
+            # 日级无效天剔除：总线或分路全天缺失/缺失率超阈值的天不参与评估指标
+            daily_thr = float(base_cfg.get("quality", {})
+                              .get("max_daily_missing_rate", 1.0))
+            bad_days = sorted(set(invalid_data_days(bus15, 96, daily_thr)) |
+                              set(invalid_data_days(branch_c[tcols], 96, daily_thr)))
+            if bad_days and len(have):
+                have = have[~have.index.normalize().isin(set(bad_days))]
+                log.warning("[%s] 推理评估剔除无效天 %d 天: %s", user_key,
+                            len(bad_days),
+                            [d.strftime("%Y-%m-%d") for d in bad_days])
+            _dump(out / "excluded_days.json", {
+                "max_daily_missing_rate": daily_thr,
+                "excluded_days": [d.strftime("%Y-%m-%d") for d in bad_days],
+            })
             if len(have) > 0:
                 metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
                 pred_on_have = pd.Series(pred, index=valid.index).loc[have.index]
