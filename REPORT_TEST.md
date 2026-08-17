@@ -237,3 +237,17 @@
   - **F1 值分层**：F1=0 的 94 行中 47 行 proportional 缺陷、24 行 844 连带、其余为真实停机日误报；0.7~0.8 带 22 行几乎全是 789 阈值问题——**修掉 proportional 缺陷后真实 F1 问题集中在：停机日辨识（842/800）与阈值适配（789）两类**
 - 是否进入 REPORT.md（稳定结论）：否（proportional 缺陷待修复后重跑验证）
 - 遗留问题：①【高优先】修复 proportional 基线（应使用未缩放 pbus：方案 A 模型内反标准化，方案 B pbus 移出 scale_cols，方案 C pipeline 传原始 pbus——倾向 B，slot 先例已存在）；②789 建议 on_thr_w 复核或 best 换 xgboost；③842/800 停机日辨识需要停机样本增强或"总线底载"特征；④SAE 全关日分母保护（沿用上轮建议）
+
+## [2026-08-17] 专题：数据质量报告统计数据正确性复核
+- 类型：验证专题
+- 目标与假设：对质量报告全部统计量做独立复核——用与实现不同的代码路径（逐天循环、正则功率列、手写四项指标公式）从 cleaned CSV 重放管线重算，与产物 JSON/HTML 逐项对比
+- 方法 / 数据 / 参数：
+  - 复核对象：789 户（干净数据基线）+ 842 户（含缺失天/剔除天复杂场景，train+infer 双侧）
+  - 覆盖统计量：n_rows / n_days_approx / missing_rate / outlier_rate / coverage_rate / quality_score / cleaned_stats 六字段（total/actual/missing/missing_dates/all_off/all_off_dates）× bus/branch/branch_target 三报告 × split_stats（train/val/test/infer）
+  - 交叉一致性：HTML 表格数值 vs meta.json；excluded_days vs missing_dates；split_stats.total_days vs metrics_daily 天数；剔除天∩评估天=空；全关∩缺失=空
+- 结果 / 结论：
+  - **全部通过，0 不一致**：789 户 36 项逐项相等；842 户 train 侧 cleaned_stats（bus 132/129/3、branch 132/131/1、全关 8/16 天清单逐日相等）、split_stats（58/19/21 天与 metrics_daily 完全一致）、HTML 6 行与 JSON 逐值相等；infer 侧（118 天/全关 7/split_stats.infer 25 天/missing_rate 0.455266/coverage 0.3026）全部相等
+  - 交叉一致性全部成立：训练窗内 bus 缺失天 ⊆ excluded_days（窗外 7-29 不需剔除，语义正确）；剔除天不出现在任何评估天；全关与缺失严格互斥
+  - **两个口径疑点核查后确认为设计而非缺陷**：①日历缺口天（跨度内整天无行，842 有 254 天）不计入 total_days/missing_days——total_days 口径=「有数据行的天」，缺口由 n_days_approx−total_days 与 coverage_rate 反映（跨度 386−132=254 自洽）；②excluded_days ⊉ 全部 missing_dates 是因为时间过滤窗外的缺失天无需剔除（例：7-29 在 train 窗 2025-07-10~2026-06-30 之外）
+- 是否进入 REPORT.md（稳定结论）：否（复核性验证）
+- 遗留问题：无——如需把「日历缺口天」也显式列出，可在 cleaned_stats 增加 gap_days 字段（当前由覆盖率反映，暂不加）

@@ -349,3 +349,14 @@
 - 关键决策：有效点按功率列判定（PF 兜底填充会误判，踩坑记录）；844 不放宽阈值迁就；全关≠无数据口径修订
 - 未决问题：844 数据侧补齐
 - 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、configs/default.yaml、docs/CONFIG_GUIDE.md、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-17] 会话纪要（第 27 次）
+- 目标：详细复核数据质量报告各统计数据的正确性
+- 完成项：
+  - 独立重算复核（不复用 validator 代码路径）：789 户 36 项 + 842 户 train/infer 双侧全部统计量（四项指标+cleaned_stats 六字段+split_stats）——0 不一致
+  - 交叉一致性验证：HTML=JSON 逐值相等；训练窗内缺失天⊆excluded_days；剔除天∩评估天=空；全关∩缺失=空；split_stats.total_days=metrics_daily 天数
+  - 两口径疑点核查：日历缺口天不计入 total_days（由跨度与覆盖率反映，386−132=254 自洽）；excluded_days 只含时间窗内无效天（窗外不参与训练无需剔除）——均为设计而非缺陷
+  - 146 项测试全过（回归确认）
+- 关键决策：复核方法论（独立路径重算+交叉断言）入 STATUS；gap_days 字段暂不加
+- 未决问题：无
+- 相关文件/分支：REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
