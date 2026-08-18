@@ -335,3 +335,17 @@
   - **改进**：state_strategy_metrics.csv 增加 strategy 列输出两行——raw_on_thr（与 by_split 完全同口径的对照行，测试断言逐值对账）+ decision+runs（生产链）；三份产物从此可直接互查
 - 是否进入 REPORT.md（稳定结论）：口径设计说明建议纳入
 - 遗留问题：无
+
+## [2026-08-18] 专题：proportional 在 2842 三阶段 F1 全 0 根因分析与修复
+- 类型：验证专题（缺陷修复，闭环 08-17 高优先 TODO）
+- 目标与假设：解剖 proportional train/val/test F1 恒 0 的机制并修复
+- 方法 / 数据 / 参数：train_predictions.csv 取证（预测分布）+ meta.scaler 状态 + 机制复算三证据链
+- 结果 / 结论：
+  - **根因（三证据闭环）**：①pred_proportional 全量 <3.6W（P95=1.39），≥10W 阈值占比 0 → TP 恒 0；②pbus 在 scale_cols 中被 z-score 标准化（μ=249W/σ=181 → 标准化后中位≈0）；③proportional 的 pred=share×z(pbus)（单目标 share=1），clip(0) 后只剩 0~3.5 的正 z 尾巴——**模型假设「pbus 列是物理功率」被 Scaler 破坏**，与数据质量无关
+  - 连锁澄清：precision 空真行（上轮已修）曾使该缺陷更隐蔽（全漏报却显示 precision=1.0）
+  - **修复（方案 B）**：pbus 加入 NON_SCALED_COLS（slot 先例，物理量纲直通）；ridge 等模型个别列不缩放数学无碍（实证 ridge test f1 0.7613→0.7602、r2 0.6051→0.6046，差异在切分随机性内）
+  - **修复后 proportional 复活**：test MAE 173.7（优于 history_profile 253.5）、R² 0.488、SAE 0.093、F1 0.596（recall 1.0/precision 0.425）——回归其「粗但不瞎」的基线定位；F1 仍不高属模型本性（占比分摊把夜间底载也放大为开机误报），非缺陷
+  - 163 项测试全过（新增回归守卫：pbus 不在 scale_cols + proportional 预测物理量级 + TP>0）
+  - 影响面：789/844 历史 best=proportional 的结论作废（退化假象），下轮全量重跑后重新选型
+- 是否进入 REPORT.md（稳定结论）：修复事实建议记入
+- 遗留问题：全量 5 户重跑刷新 best_model（待批跑窗口）；proportional 的 F1 上限受其模型本性限制，不再投入调优

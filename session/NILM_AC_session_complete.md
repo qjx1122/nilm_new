@@ -480,3 +480,14 @@
 - 关键决策：宽表设计（一行一个时间点、各模型并列）便于直接画预测-真值对比曲线；放 predictions/ 子目录与推理产物同域
 - 未决问题：无
 - 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 39 次）
+- 目标：proportional 在 2842 三阶段 F1 全 0 根因分析与修复
+- 完成项：
+  - 三证据链闭环：pred 全量 <3.6W（P95 1.39，≥10W 占比 0）→ pbus 被 z-score（μ249/σ181）→ pred=clip(z,0) 只剩正 z 尾巴——模型「pbus=物理功率」假设被 Scaler 破坏
+  - 修复：pbus 加入 NON_SCALED_COLS（方案 B，slot 先例）；163 项测试全过（新增回归守卫）
+  - 2842 重跑验证：proportional 复活（test MAE 173.7/R² 0.488/F1 0.596/recall 1.0）；ridge 等无回归（f1 0.7613→0.7602 属切分随机）
+  - 影响面：789/844 历史 best=proportional 作废，待全量重跑刷新
+- 关键决策：方案 B 选型依据入 STATUS；proportional F1 上限受模型本性限制（底载放大误报），不再投入调优
+- 未决问题：全量 5 户重跑刷新 best_model
+- 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new

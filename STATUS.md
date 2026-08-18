@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：proportional F1 全 0 根因修复（pbus 移出缩放列）——test MAE 173.7/F1 0.596 复活，其他模型无回归
 - ✅ 已完成：训练阶段预测结果落盘 predictions/train_predictions.csv（timestamp/split/真实值+各模型预测列）
 - ✅ 已完成：三份评估产物口径差异审计——主因设计口径不同（模型能力 vs 生产判决链）；修复 precision 空真不一致；增加 raw 对照行跨产物对账
 - ✅ 已完成：2842 优化方案 1+2 落地——decision_thr_w 配置字段+state_strategy_metrics.csv 两口径产出；推理 F1 0.908→0.981，开机日口径 0.982 达标
@@ -91,7 +92,7 @@
 - 无
 
 ## 下一步（TODO）
-0. 【高优先】修复 proportional 基线缺陷：pbus 被 z-score 标准化后 clip(0) 致预测恒≈0（TP 全期=0）——倾向方案：pbus 移出 scale_cols（slot 先例）；修复后全量重跑并复核历史 best_model 结论（844/789 的 proportional "胜出"是退化假象）
+0. ~~【高优先】修复 proportional 基线缺陷~~ ✅ 已修复（2026-08-18，pbus 入 NON_SCALED_COLS）；遗留：全量 5 户重跑刷新 best_model：pbus 被 z-score 标准化后 clip(0) 致预测恒≈0（TP 全期=0）——倾向方案：pbus 移出 scale_cols（slot 先例）；修复后全量重跑并复核历史 best_model 结论（844/789 的 proportional "胜出"是退化假象）
 1. ~~M2 多模型：GBDT/Seq2Point/LSTM~~ 已落地 8 模型对比；稀疏用户 789 仍无正 r2 模型（数据侧问题为主），844 test 切分过小——需数据扩充或切分配置调整
 2. DL 模型调参/加速：大用户 transformer CPU 训练约 25 min，可下调 epochs/d_model 或引入 GPU；DL 当前未超越树模型，数据量增大后复评
 3. 指南附件缺失项（日级指标字段清单/启动段契约）待补充
@@ -99,6 +100,7 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- proportional 修复选方案 B（pbus 入 NON_SCALED_COLS）而非模型内反标准化：①slot 先例已存在，机制一致；②模型层保持「按列名取物理量」的简单契约，不感知 Scaler；③对缩放敏感的模型（ridge）实证无回归（f1/r2 差异 <0.001）。教训固化：基线模型按列名取物理量的列必须逐一确认不在 scale_cols
 - 评估产物双口径设计定型（2026-08-18）：metrics_by_split/metrics_daily=模型能力口径（on_thr_w 判决、无后处理，选型用）；state_strategy_metrics=生产判决链口径（decision_thr_w+游程后处理，部署效果）——两者数字必然不同是设计而非缺陷；state_strategy 增加 raw_on_thr 对照行与 by_split 逐值对账（测试守卫）
 - 【缺陷修复】state_strategy 的 precision 空真约定曾与 evaluation.metrics 不一致（tp+fp=0 有 FN 时记 1.0 而非 0）——教训：同一指标在多处实现时，空真/除零约定必须复用同一实现或测试对账
 - decision_thr_w 与 on_thr_w 分离（2026-08-18）：决策阈值只影响预测→状态判决；真值判态/分类指标恒用 on_thr_w——保证「业务开机定义」与「模型判决点」解耦，调优判决点不改变考核口径

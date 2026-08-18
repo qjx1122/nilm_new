@@ -47,7 +47,11 @@ log = get_logger("pipeline.user_task")
 
 DONE_MARKER = "_DONE"
 NON_SCALED_COLS = {"slot", "hour", "minute", "day_of_week", "is_weekend",
-                   "month", "day_of_year"}
+                   "month", "day_of_year",
+                   # pbus 保持物理量纲（W）不缩放：基线模型（proportional 等）按列名
+                   # 取用其物理值——曾因被 z-score 标准化（中位≈0）+ clip(0) 导致
+                   # proportional 预测恒≈0、F1 全 0（2026-08-18 修复，2842 户实证）
+                   "pbus"}
 
 
 class UserTaskError(Exception):
