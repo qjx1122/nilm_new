@@ -100,6 +100,114 @@ def invalid_data_days(df: pd.DataFrame | pd.Series, points_per_day: int,
     return sorted(bad)
 
 
+def _day_score(df: pd.DataFrame, points_per_day: int,
+               allow_negative_power: bool = False) -> tuple[float, float]:
+    """单日质量得分与缺失率（与 quality_report 同一公式，按日窗口计算）。
+
+    缺失率口径 = 1 − 有效单元格/(points_per_day×列数)——把当日行数不足
+    （设备离线缺口）也计入缺失，比整段口径更严格、更贴近"这一天可用性"。
+    """
+    n_cols = max(1, df.shape[1])
+    total_cells = points_per_day * n_cols
+    valid_cells = int(df.notna().sum().sum())
+    missing_rate = 1.0 - min(1.0, valid_cells / total_cells)
+    outliers = 0
+    for col in df.columns:
+        s = df[col]
+        if not np.issubdtype(s.dtype, np.number):
+            continue
+        vals = s.dropna()
+        if col in BOUNDS:
+            lo, hi = BOUNDS[col]
+            outliers += int(((vals < lo) | (vals > hi)).sum())
+        if is_power_column(col) and not allow_negative_power:
+            outliers += int((vals < 0).sum())
+    outlier_rate = outliers / valid_cells if valid_cells else 0.0
+    score = float(np.clip(100.0 * (1 - missing_rate) * (1 - min(1.0, 5 * outlier_rate)),
+                          0, 100))
+    return round(score, 2), round(missing_rate, 4)
+
+
+def daily_quality_table(bus: pd.DataFrame, branch: pd.DataFrame,
+                        points_per_day: int, min_score: float,
+                        allow_negative_power: bool = False) -> pd.DataFrame:
+    """逐天数据质量表：总线得分 / 目标分路得分 / 阈值 / 当天是否合格。
+
+    - 日期集合 = 总线∪分路出现过数据行的天（并集，缺一侧记 0 分）；
+    - 合格判定：bus_score ≥ min_score 且 branch_score ≥ min_score；
+    - 返回列：date / bus_score / bus_missing_rate / branch_score /
+      branch_missing_rate / score_threshold / qualified(0|1)。
+    """
+    days = sorted(set(bus.index.normalize()) | set(branch.index.normalize()))
+    rows = []
+    for day in days:
+        b = bus[bus.index.normalize() == day]
+        r = branch[branch.index.normalize() == day]
+        # 纯日历缺口天（两侧均无任何有效数据，如重采样填出的全 NaN 网格）不进表：
+        # 已由覆盖率/实际天数反映，进表会把缺口天刷成大量 0 分行干扰阅读
+        if int(b.notna().sum().sum()) == 0 and int(r.notna().sum().sum()) == 0:
+            continue
+        bs, bm = _day_score(b, points_per_day, allow_negative_power) \
+            if len(b) else (0.0, 1.0)
+        rs, rm = _day_score(r, points_per_day, allow_negative_power) \
+            if len(r) else (0.0, 1.0)
+        ok = int(bs >= float(min_score) and rs >= float(min_score))
+        rows.append({"date": day.strftime("%Y-%m-%d"),
+                     "bus_score": bs, "bus_missing_rate": bm,
+                     "branch_score": rs, "branch_missing_rate": rm,
+                     "score_threshold": float(min_score), "qualified": ok})
+    return pd.DataFrame(rows, columns=["date", "bus_score", "bus_missing_rate",
+                                       "branch_score", "branch_missing_rate",
+                                       "score_threshold", "qualified"])
+
+
+def quality_advice(daily: pd.DataFrame, min_days: float = 3.0) -> list[str]:
+    """基于逐天质量表生成训练数据集划分与模型训练建议（规则式，供报告呈现）。"""
+    tips: list[str] = []
+    if daily.empty:
+        return ["无逐天质量数据，无法给出建议"]
+    n = len(daily)
+    ok = daily[daily["qualified"] == 1]
+    bad = daily[daily["qualified"] == 0]
+    ratio = len(ok) / n
+    tips.append(f"总线与分路同时达标 {len(ok)}/{n} 天（{ratio:.0%}）")
+
+    # —— 数据集划分建议
+    if len(ok) < min_days:
+        tips.append(f"合格天不足 {min_days:.0f} 天：不建议训练，优先补数据")
+    elif len(ok) < 14:
+        tips.append("合格天 <14 天：建议 time 顺序切分并锁定 splits 锚点，"
+                    "test 至少保留 2 个完整合格天；结论仅作参考基线")
+    else:
+        tips.append("合格天充足：建议 stratified_day 分层切分（按天打散），"
+                    "使 train/val/test 各含开机日与停机日")
+    if len(bad):
+        # 不合格天的连片性：连续段 ≥3 天提示设备离线期
+        d = pd.to_datetime(bad["date"])
+        gaps = (d.diff().dt.days.fillna(1) == 1)
+        max_run = (gaps.groupby((~gaps).cumsum()).cumsum().max() or 0) + 1
+        head = "、".join(bad["date"].head(8)) + ("…" if len(bad) > 8 else "")
+        tips.append(f"不合格天 {len(bad)} 天（{head}）：已由日级无效天机制剔除口径覆盖，"
+                    "建议在 time_filters 中显式 exclude 其中的连续离线段")
+        if max_run >= 3:
+            tips.append(f"存在连续 ≥{int(max_run)} 天的不合格段：疑似设备离线/换表，"
+                        "切分时避免跨该段（time 切分锚点不落在段内）")
+    # —— 模型训练建议
+    if ratio < 0.5:
+        tips.append("合格率 <50%：优先修数不调参；模型仅跑基线（ridge）验证通路")
+    elif ratio < 0.8:
+        tips.append("合格率 50%~80%：建议树模型（random_forest/xgboost，对缺口鲁棒）；"
+                    "深度序列模型窗口会跨缺口，暂不推荐")
+    else:
+        tips.append("合格率 ≥80%：可启用全模型对比（含深度序列模型）；"
+                    "关注 val/test 指标差距判断过拟合")
+    lo_branch = daily[daily["branch_score"] < daily["bus_score"] - 20]
+    if len(lo_branch) > n * 0.2:
+        tips.append("分路质量显著低于总线（>20 分差的天超 20%）：标签侧是短板，"
+                    "训练前重点核查分路采集；评估结论对标签缺口敏感")
+    return tips
+
+
 def quality_report(df: pd.DataFrame, kind: str, points_per_day: int,
                    allow_negative_power: bool = False,
                    on_thr_w: float | None = None) -> dict:
@@ -170,8 +278,11 @@ def write_schema_report(path: str | Path, bus_report: dict, branch_report: dict,
     return path
 
 
-def write_quality_html(path: str | Path, reports: list[dict]) -> Path:
-    """data_quality_report.html（§4 输出物：质量简表 + 清洗后数据统计）。"""
+def write_quality_html(path: str | Path, reports: list[dict],
+                       daily_quality: pd.DataFrame | None = None,
+                       advice: list[str] | None = None) -> Path:
+    """data_quality_report.html（§4 输出物）：质量简表 + 双达标统计 +
+    逐天质量表（总线/分路得分、阈值、当天是否合格）+ 清洗后统计 + 训练建议。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = "\n".join(
@@ -219,6 +330,29 @@ def write_quality_html(path: str | Path, reports: list[dict]) -> Path:
 </table>
 {chr(10).join(off_sections)}"""
 
+    # 逐天质量表 + 双达标统计 + 建议（daily_quality / advice 参数存在才输出）
+    daily_html = ""
+    if daily_quality is not None and len(daily_quality):
+        d = daily_quality
+        n_ok = int((d["qualified"] == 1).sum())
+        day_rows = "\n".join(
+            f"<tr{' style=background:#fdd' if r.qualified == 0 else ''}>"
+            f"<td>{r.date}</td><td>{r.bus_score}</td><td>{r.branch_score}</td>"
+            f"<td>{r.score_threshold}</td><td>{'合格' if r.qualified else '不合格'}</td></tr>"
+            for r in d.itertuples())
+        daily_html = f"""
+<h2>总线与分路数据同时达标统计</h2>
+<p>同时达标天数：<b>{n_ok}</b> / {len(d)} 天（得分阈值 {d['score_threshold'].iloc[0]}）</p>
+<h2>每天数据质量情况</h2>
+<table><tr><th>日期</th><th>总线质量得分</th><th>目标分路质量得分</th>
+<th>得分阈值</th><th>当天是否合格</th></tr>
+{day_rows}
+</table>"""
+    advice_html = ""
+    if advice:
+        advice_html = ("\n<h2>训练数据集划分与模型训练建议</h2>\n<ul>"
+                       + "".join(f"<li>{a}</li>" for a in advice) + "</ul>")
+
     html = f"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>数据质量报告</title>
 <style>table{{border-collapse:collapse}}td,th{{border:1px solid #999;padding:4px 8px}}</style>
@@ -227,7 +361,7 @@ def write_quality_html(path: str | Path, reports: list[dict]) -> Path:
 <table><tr><th>数据集</th><th>行数</th><th>天数</th><th>缺失率</th>
 <th>异常率</th><th>覆盖率</th><th>质量分</th></tr>
 {rows}
-</table>{cleaned_html}
+</table>{daily_html}{cleaned_html}{advice_html}
 </body></html>"""
     path.write_text(html, encoding="utf-8")
     log.info("质量报告: %s", path)

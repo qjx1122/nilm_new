@@ -94,6 +94,15 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
     html = (train_dir / "data_quality_report.html").read_text(encoding="utf-8")
     assert "清洗后数据统计" in html
     assert "branch·train" in html and "branch·test" in html
+    # 逐天质量表 + 双达标统计 + 建议（新增产物与 HTML 段）
+    assert "每天数据质量情况" in html and "同时达标天数" in html
+    assert "训练数据集划分与模型训练建议" in html
+    dq = pd.read_csv(train_dir / "daily_quality.csv")
+    assert {"date", "bus_score", "branch_score", "score_threshold",
+            "qualified"} <= set(dq.columns)
+    assert set(dq["qualified"].unique()) <= {0, 1}
+    assert meta_q["branch"]["both_qualified_days"] == int((dq["qualified"] == 1).sum())
+    assert (train_dir / "quality_advice.json").exists()
     # 无效通道（非目标）已丢弃：清洗产物与开机分析只含目标通道
     tcols = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))["target_cols"]
     sessions = pd.read_csv(train_dir / "branch_sessions.csv")

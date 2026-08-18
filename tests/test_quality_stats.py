@@ -157,3 +157,86 @@ def test_quality_html_shows_actual_and_missing_days(tmp_path):
     assert "实际天数" in html and "全天缺失天" in html
     assert "bus 全天数据缺失日期清单（1 天）" in html
     assert "2026-01-02" in html
+
+
+def test_daily_quality_table_and_both_qualified():
+    """逐天质量表：得分/阈值/合格列；双达标口径 = 两侧同日均 ≥ 阈值。"""
+    from nilm.data_io.validator import daily_quality_table
+
+    idx = pd.date_range("2026-01-01", periods=96 * 3, freq="15min")
+    bus = pd.DataFrame({"pa": np.full(len(idx), 100.0)}, index=idx)
+    br = pd.DataFrame({"p1": np.full(len(idx), 50.0)}, index=idx)
+    br.loc[br.index.normalize() == pd.Timestamp("2026-01-02"), "p1"] = np.nan  # 分路第2天全缺
+    d = daily_quality_table(bus, br, 96, min_score=50.0)
+    assert list(d.columns) == ["date", "bus_score", "bus_missing_rate",
+                               "branch_score", "branch_missing_rate",
+                               "score_threshold", "qualified"]
+    assert len(d) == 3
+    assert (d["score_threshold"] == 50.0).all()
+    assert d.loc[d.date == "2026-01-01", "qualified"].iloc[0] == 1
+    assert d.loc[d.date == "2026-01-02", "qualified"].iloc[0] == 0   # 分路0分→不合格
+    assert d.loc[d.date == "2026-01-02", "branch_score"].iloc[0] == 0.0
+    assert d.loc[d.date == "2026-01-02", "bus_score"].iloc[0] >= 50  # 总线仍高分
+    assert int((d["qualified"] == 1).sum()) == 2                     # 双达标 2 天
+
+
+def test_daily_quality_missing_side_days():
+    """总线∪分路的并集口径：只在一侧出现的天，另一侧记 0 分不合格。"""
+    from nilm.data_io.validator import daily_quality_table
+
+    idx_b = pd.date_range("2026-01-01", periods=96, freq="15min")
+    idx_r = pd.date_range("2026-01-02", periods=96, freq="15min")
+    bus = pd.DataFrame({"pa": np.full(96, 100.0)}, index=idx_b)
+    br = pd.DataFrame({"p1": np.full(96, 50.0)}, index=idx_r)
+    d = daily_quality_table(bus, br, 96, min_score=50.0)
+    assert len(d) == 2 and (d["qualified"] == 0).all()
+
+
+def test_quality_advice_rules():
+    """建议规则：合格天不足/较少/充足 与 合格率分层。"""
+    from nilm.data_io.validator import quality_advice
+
+    def mk(n_ok, n_bad):
+        rows = []
+        for i in range(n_ok):
+            rows.append({"date": f"2026-01-{i+1:02d}", "bus_score": 99.0,
+                         "bus_missing_rate": 0, "branch_score": 99.0,
+                         "branch_missing_rate": 0, "score_threshold": 50.0,
+                         "qualified": 1})
+        for i in range(n_bad):
+            rows.append({"date": f"2026-02-{i+1:02d}", "bus_score": 10.0,
+                         "bus_missing_rate": 0.9, "branch_score": 10.0,
+                         "branch_missing_rate": 0.9, "score_threshold": 50.0,
+                         "qualified": 0})
+        return pd.DataFrame(rows)
+
+    t1 = "\n".join(quality_advice(mk(1, 5), min_days=3))
+    assert "不建议训练" in t1
+    t2 = "\n".join(quality_advice(mk(6, 1), min_days=3))
+    assert "time 顺序切分" in t2
+    t3 = "\n".join(quality_advice(mk(30, 2), min_days=3))
+    assert "stratified_day" in t3 and "全模型对比" in t3
+    t4 = "\n".join(quality_advice(mk(10, 12), min_days=3))
+    assert "优先修数" in t4
+
+
+def test_quality_html_daily_table_and_advice(tmp_path):
+    """HTML 渲染逐天质量表、双达标统计与建议段。"""
+    from nilm.data_io.validator import daily_quality_table, quality_advice
+
+    idx = pd.date_range("2026-01-01", periods=96 * 2, freq="15min")
+    bus = pd.DataFrame({"pa": np.full(len(idx), 100.0)}, index=idx)
+    br = pd.DataFrame({"p1": np.full(len(idx), 50.0)}, index=idx)
+    d = daily_quality_table(bus, br, 96, 50.0)
+    adv = quality_advice(d, 1)
+    rep = quality_report(bus, "bus", 96, on_thr_w=10.0)
+    html = write_quality_html(tmp_path / "q.html", [rep],
+                              daily_quality=d, advice=adv).read_text(encoding="utf-8")
+    assert "总线与分路数据同时达标统计" in html
+    assert "每天数据质量情况" in html
+    assert "总线质量得分" in html and "目标分路质量得分" in html
+    assert "得分阈值" in html and "当天是否合格" in html
+    assert "训练数据集划分与模型训练建议" in html
+    # 不传 daily/advice 时不渲染（向后兼容）
+    html2 = write_quality_html(tmp_path / "q2.html", [rep]).read_text(encoding="utf-8")
+    assert "每天数据质量情况" not in html2

@@ -23,7 +23,8 @@ from nilm.common.schema import bus_total
 from nilm.common.timefilter import filter_dataframe
 from nilm.data_io.csv_source import CsvBranchLoader, CsvBusLoader
 from nilm.data_io.validator import (QualityError, assert_quality,
-                                    invalid_data_days, quality_report,
+                                    daily_quality_table, invalid_data_days,
+                                    quality_advice, quality_report,
                                     series_daily_stats, write_quality_html,
                                     write_schema_report)
 from nilm.evaluation import (build_comparison_table, evaluate_all,
@@ -180,7 +181,16 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         q_br = quality_report(branch_al, "branch", 96, allow_negative,
                               on_thr_w=float(user_cfg["on_thr_w"]))
         q_br["target_cols"] = target_cols
-        write_quality_html(out / "data_quality_report.html", [q_bus, q_br])
+        # 逐天质量表（总线/分路得分、阈值、当天合格）+ 双达标统计 + 训练建议
+        min_score = float(qcfg.get("min_score", 50))
+        daily_q = daily_quality_table(bus_al, branch_al, 96, min_score, allow_negative)
+        daily_q.to_csv(out / "daily_quality.csv", index=False, encoding="utf-8")
+        advice = quality_advice(daily_q, float(qcfg.get("min_days", 14)))
+        q_br["both_qualified_days"] = int((daily_q["qualified"] == 1).sum())
+        q_br["daily_total_days"] = int(len(daily_q))
+        _dump(out / "quality_advice.json", {"advice": advice})
+        write_quality_html(out / "data_quality_report.html", [q_bus, q_br],
+                           daily_quality=daily_q, advice=advice)
         assert_quality(q_bus, qcfg.get("max_missing_rate", 0.3),
                        qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
         assert_quality(q_br, qcfg.get("max_missing_rate", 0.3),
@@ -248,8 +258,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             k: series_daily_stats(pd.Series(splits[k][1][:, 0], index=splits[k][2]),
                                   float(user_cfg["on_thr_w"]))
             for k in ("train", "val", "test") if split_sizes.get(k, 0) > 0}
-        write_quality_html(out / "data_quality_report.html",
-                           [q_bus, q_br])  # 重写含切分统计
+        write_quality_html(out / "data_quality_report.html", [q_bus, q_br],
+                           daily_quality=daily_q, advice=advice)  # 重写含切分统计
 
         # Scaler 只由 Train 拟合（§11）；日历列不缩放
         scale_cols = [i for i, c in enumerate(names) if c not in NON_SCALED_COLS]
@@ -401,8 +411,20 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             q_br_i = quality_report(branch_c, "branch", 96, allow_negative,
                                     on_thr_w=float(user_cfg["on_thr_w"]))
             q_br_i["target_cols"] = tcols_i
+            # 逐天质量表 + 双达标统计 + 建议（推理侧建议主要看数据可用性）
+            min_score_i = float(base_cfg.get("quality", {}).get("min_score", 50))
+            daily_q_i = daily_quality_table(bus15, branch_c, 96, min_score_i,
+                                            allow_negative)
+            daily_q_i.to_csv(out / "daily_quality.csv", index=False, encoding="utf-8")
+            advice_i = quality_advice(daily_q_i,
+                                      float(base_cfg.get("quality", {})
+                                            .get("min_days", 14)))
+            q_br_i["both_qualified_days"] = int((daily_q_i["qualified"] == 1).sum())
+            q_br_i["daily_total_days"] = int(len(daily_q_i))
+            _dump(out / "quality_advice.json", {"advice": advice_i})
             infer_quality = {"bus": q_bus_i, "branch": q_br_i}
-            write_quality_html(out / "data_quality_report.html", [q_bus_i, q_br_i])
+            write_quality_html(out / "data_quality_report.html", [q_bus_i, q_br_i],
+                               daily_quality=daily_q_i, advice=advice_i)
 
         # §12.4 infer 时间过滤
         ispec = user_cfg.get("infer") or {}
@@ -473,7 +495,8 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     infer_quality["branch"]["split_stats"] = {
                         "infer": series_daily_stats(have, float(user_cfg["on_thr_w"]))}
                     write_quality_html(out / "data_quality_report.html",
-                                       [infer_quality["bus"], infer_quality["branch"]])
+                                       [infer_quality["bus"], infer_quality["branch"]],
+                                       daily_quality=daily_q_i, advice=advice_i)
                 # 日级离线指标 CSV（model × date 行 × 指标列）
                 daily = evaluate_daily(have.to_numpy()[:, None],
                                        pred_on_have.to_numpy()[:, None],

@@ -405,3 +405,14 @@
 - 关键决策：三层口径简化为单一有效通道口径；语义修正不改模型结果（验证确认）
 - 未决问题：优化方案落地优先级待确认
 - 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 32 次）
+- 目标：质量报告增加①总线分路双达标总天数②逐天质量表（总线得分/分路得分/阈值/当天合格）③训练数据集划分与模型训练建议
+- 完成项：
+  - validator：_day_score（单日得分，与整段公式一致但缺失率含行数不足）、daily_quality_table（并集口径逐天表，纯日历缺口天跳过）、quality_advice（规则式建议：合格天数分层→切分策略；合格率分层→模型选择；连续不合格段→exclude 提示；分路短板提示）
+  - write_quality_html 扩展：双达标统计段、逐天质量表（不合格行红底）、建议列表段（参数可选，向后兼容）
+  - pipeline train/infer 接入：daily_quality.csv + quality_advice.json 落盘；meta.quality.branch 增 both_qualified_days/daily_total_days
+  - 新增 4 项测试，156 项全过；2842 实测：train 146 天双达标 140（不合格 6 天=2 个 bus 低分天+4 个分路全缺天，与既有缺失天结论吻合）；建议输出正确（96% 合格率→stratified_day+全模型对比）；infer 390 天（bus 全程覆盖）双达标 140——分路 0 分天正确标记不可评估
+- 关键决策：日级得分缺失率口径含行数不足（比整段更严）；纯日历缺口天不进表（覆盖率已反映）；建议为规则式启发（非硬约束，供人工决策）
+- 未决问题：无新增
+- 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new
