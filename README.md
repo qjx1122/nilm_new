@@ -81,6 +81,10 @@ outputs/
     │   │                                     #   target_state(真实状态,on_thr_w 口径) +
     │   │                                     #   pred_<model>/pred_state_<model>（预测值与
     │   │                                     #   预测状态,生产判决链口径，时间有序）
+    │   │                                     # ⚠ 口径提示：metrics_daily/by_split 的 TP/FP/FN/TN
+    │   │                                     #   由「pred 值 ≥ on_thr_w」直接判（模型能力口径），
+    │   │                                     #   与 pred_state 列（decision_thr_w+游程后处理）
+    │   │                                     #   不同属预期；用值列同阈值判态即可精确对账
     │   ├── branch_sessions.csv               # 分路开机分析：逐分路逐天开机段（起止/时长/
     │   │                                     #   最小/平均/峰值功率/电量kWh/状态；整天关机
     │   │                                     #   输出整天一行 state=0）

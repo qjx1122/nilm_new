@@ -502,3 +502,13 @@
 - 关键决策：预测状态选生产判决链口径（非 raw 口径）——与推理产物/策略评估一致，三产物可互查；真实状态用 on_thr_w（业务口径）
 - 未决问题：无
 - 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 41 次）
+- 目标：分析 train_predictions.csv 与 metrics_daily.csv 的 TP/FP/FN/TN 数量不一致
+- 完成项：
+  - 三口径对比+逐因子分解：daily=值 ≥ on_thr_w(10) 直接判（模型能力口径）837/510/18/648；pred_state 列=decision_thr(50)+游程（生产判决链）831/200/24/958；FP 510→250（阈值）→200（游程）
+  - 对账验证：用 train_predictions 值列按 on_thr_w 重判 → 与 metrics_daily 三模型逐值相等 ✅（同源无缺陷）
+  - README 增加口径提示；结论入 REPORT_TEST
+- 关键决策：不改代码——差异是双口径设计（08-18 定型）的预期表现；对账方法文档化
+- 未决问题：无
+- 相关文件/分支：README.md、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new

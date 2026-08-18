@@ -349,3 +349,18 @@
   - 影响面：789/844 历史 best=proportional 的结论作废（退化假象），下轮全量重跑后重新选型
 - 是否进入 REPORT.md（稳定结论）：修复事实建议记入
 - 遗留问题：全量 5 户重跑刷新 best_model（待批跑窗口）；proportional 的 F1 上限受其模型本性限制，不再投入调优
+
+## [2026-08-18] 专题：train_predictions vs metrics_daily 混淆矩阵计数不一致分析
+- 类型：验证专题（口径审计续篇）
+- 目标与假设：解释 train_predictions.csv 的状态列与 metrics_daily.csv 的 TP/FP/FN/TN 数量差异；确认是否有缺陷
+- 方法 / 数据 / 参数：2842 最新产物三口径对比（daily 求和 / 值列@on_thr 判态 / 状态列）+ 逐因子分解（阈值→游程）
+- 结果 / 结论：
+  - **无缺陷，差异=双口径设计的直接体现**：
+    - metrics_daily（=metrics_by_split 同口径）：**pred 值 ≥ on_thr_w(10W) 直接判态、无后处理**（模型能力口径）——ridge test 求和 837/510/18/648
+    - train_predictions 的 pred_state 列：**decision_thr_w(50W)+min_on(8)/fill(3) 游程后处理**（生产判决链口径）——831/200/24/958
+  - **精确对账验证**：用 train_predictions 的 pred 值列按 on_thr_w=10 重新判态 → 837/510/18/648 与 metrics_daily **三模型逐值相等** ✅（两份产物同源同预测，只是判决链不同）
+  - 逐因子分解（ridge test FP）：510 →（阈值 10→50 消夜间小值）→ 250 →（min_on=8 消短段）→ 200；TP 837→831（阈值损失 6 个 10~50W 弱开机点）
+  - 三口径样本数均为 2013（无样本集差异）；proportional 的 daily TN=0 vs 状态列 TN=370 同因（其预测恒>10W，但 50W 阈值+游程能判出部分关态）
+  - 文档澄清：README train_predictions 条目增加口径提示（如何对账）
+- 是否进入 REPORT.md（稳定结论）：与上轮口径设计说明合并考虑
+- 遗留问题：无——如需状态列与 daily 完全一致，将用户 decision_thr_w/post_min_on 配置移除即可（缺省时两口径自动重合）
