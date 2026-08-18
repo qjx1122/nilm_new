@@ -436,3 +436,14 @@
 - 关键决策：新增「字段生效位置速查」表（字段→影响哪个产物），排查配置问题可反查；target_col 语义按最新业务口径（有效通道/无效通道）表述
 - 未决问题：无
 - 相关文件/分支：docs/CONFIG_GUIDE.md、README.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 35 次）
+- 目标：min_score→70；2842 排除训练/推理不达标天；重验+F1 详析与优化方案
+- 完成项：
+  - default.yaml min_score=70；离线预演定位不达标天（训练窗 12+推理窗 3）；time_filters.json 2842 train/infer exclude 落地
+  - 160 项测试全过；重跑 OK：切分 6098/2092/2013、双达标 131 天；推理 F1=0 天全部消失（评估噪声清除）
+  - F1≤0.95 归因：test A 型全关天 4 天（FP 51%）/B 型 6 天/C 型 10 天；推理 19 天全为 B/C 型
+  - 优化量化：决策阈值 50+min_on8 → F1 0.881；开机日口径（排除全关天）→ **0.982 达标**
+- 关键决策：min_score=70 的选型依据入 STATUS；F1>0.95 需口径协商的结论实证固化
+- 未决问题：post 参数写入配置正式生效待确认；全关天口径协商
+- 相关文件/分支：configs/{default.yaml,time_filters.json}、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new

@@ -14,7 +14,7 @@ data:
 quality:                       # §6 质量门禁（阈值按 5 用户实测数据校准，见 STATUS.md 决策记录）
   max_missing_rate: 0.9
   min_coverage: 0.15
-  min_score: 10
+  min_score: 70                # 数据质量得分阈值（2026-08-18 由 10 上调：门禁与逐天质量表/双达标口径共用）
   min_days: 3                  # 与 time_filters.json 中最短训练窗口（6 天）相容
   max_daily_missing_rate: 0.9  # 日级无效天阈值：全天缺失或当日缺失率超此值的天，
                                #   不参与模型训练与训练/推理阶段的评估指标计算
