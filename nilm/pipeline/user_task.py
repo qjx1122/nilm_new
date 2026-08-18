@@ -145,13 +145,20 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         bus_c, branch_c = cleaner.transform(bus_raw), cleaner.transform(branch_raw)
         save_cleaned = bool(pp.get("save_cleaned_csv", True))
         _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
-        _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
 
-        # —— §3.3/§12.3 目标列契约（提前解析：开机分析/质量门禁按目标分路口径）
+        # —— §3.3/§12.3 目标列契约（提前解析）：配置的目标通道为唯一有效分路，
+        #    其余通道不在当前总线回路中（无效通道数据），清洗后立即丢弃——
+        #    后续所有环节（清洗产物/开机分析/质量报告/门禁/无效天/评估）只见有效通道
         target_cols = resolve_target_cols(user_cfg.get("target_col"), branch_c)
+        invalid_ch = [c for c in branch_c.columns if c not in target_cols]
+        if invalid_ch:
+            log.info("[%s] 丢弃无效分路通道 %s（不在当前总线回路，仅保留目标通道 %s）",
+                     user_key, invalid_ch, target_cols)
+            branch_c = branch_c[target_cols]
+        _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
         target = build_target(branch_c, target_cols)
 
-        # —— 训练前分路开机情况分析（只针对配置的目标分路，逐天开机段/时长/功率/电量）
+        # —— 训练前分路开机情况分析（有效通道=目标通道，逐天开机段/时长/功率/电量）
         sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]),
                                            columns=target_cols)
         sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
@@ -169,19 +176,14 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         q_bus = quality_report(bus_al, "bus", 96, allow_negative,
                                on_thr_w=float(user_cfg["on_thr_w"]))
+        # branch 报告=有效通道（目标通道）口径：无效通道已在清洗后丢弃
         q_br = quality_report(branch_al, "branch", 96, allow_negative,
                               on_thr_w=float(user_cfg["on_thr_w"]))
-        # 门禁按配置的目标分路子表计算（整表口径会被非目标分路缺失误杀任务）
-        q_br_target = quality_report(branch_al[target_cols], "branch_target", 96,
-                                     allow_negative,
-                                     on_thr_w=float(user_cfg["on_thr_w"]))
         q_br["target_cols"] = target_cols
-        q_br["target_quality"] = q_br_target
-        write_quality_html(out / "data_quality_report.html",
-                           [q_bus, q_br, q_br_target])
+        write_quality_html(out / "data_quality_report.html", [q_bus, q_br])
         assert_quality(q_bus, qcfg.get("max_missing_rate", 0.3),
                        qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
-        assert_quality(q_br_target, qcfg.get("max_missing_rate", 0.3),
+        assert_quality(q_br, qcfg.get("max_missing_rate", 0.3),
                        qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
 
         # —— §12.4 train 时间过滤
@@ -194,7 +196,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         # —— 日级无效天剔除：总线或分路全天缺失/缺失率超阈值的天不参与训练与评估
         daily_thr = float(qcfg.get("max_daily_missing_rate", 1.0))
         bad_days = sorted(set(invalid_data_days(bus_al, 96, daily_thr)) |
-                          set(invalid_data_days(branch_al[target_cols], 96, daily_thr)))
+                          set(invalid_data_days(branch_al, 96, daily_thr)))
         if bad_days:
             bad_set = set(bad_days)
             keep_bus = ~bus_al.index.normalize().isin(bad_set)
@@ -242,12 +244,12 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, f"切分后样本不足: {split_sizes}")
 
         # —— 质量报告补充切分级清洗后统计（train/val/test 各自的总天数/全关天，目标功率口径）
-        q_br_target["split_stats"] = {
+        q_br["split_stats"] = {
             k: series_daily_stats(pd.Series(splits[k][1][:, 0], index=splits[k][2]),
                                   float(user_cfg["on_thr_w"]))
             for k in ("train", "val", "test") if split_sizes.get(k, 0) > 0}
         write_quality_html(out / "data_quality_report.html",
-                           [q_bus, q_br, q_br_target])  # 重写含切分统计
+                           [q_bus, q_br])  # 重写含切分统计
 
         # Scaler 只由 Train 拟合（§11）；日历列不缩放
         scale_cols = [i for i, c in enumerate(names) if c not in NON_SCALED_COLS]
@@ -382,25 +384,25 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if scan.branch_files:
             branch_raw, _ = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
             branch_c = Cleaner(clip_negative=not allow_negative).transform(branch_raw)
-            _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
-            # 目标列契约（与训练同口径）：开机分析/质量统计只针对配置的目标分路
+            # 目标通道为唯一有效分路，其余通道（不在当前总线回路）清洗后立即丢弃
             tcols_i = resolve_target_cols(user_cfg.get("target_col"), branch_c)
+            invalid_ch = [c for c in branch_c.columns if c not in tcols_i]
+            if invalid_ch:
+                log.info("[%s] 丢弃无效分路通道 %s（不在当前总线回路，仅保留目标通道 %s）",
+                         user_key, invalid_ch, tcols_i)
+                branch_c = branch_c[tcols_i]
+            _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
             sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]),
                                                columns=tcols_i)
             sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
-            # 数据质量报告（与训练阶段同构：bus+branch+目标子表；只报告不设门禁）
+            # 数据质量报告（与训练阶段同构：bus+branch 有效通道口径；只报告不设门禁）
             q_bus_i = quality_report(bus15, "bus", 96, allow_negative,
                                      on_thr_w=float(user_cfg["on_thr_w"]))
             q_br_i = quality_report(branch_c, "branch", 96, allow_negative,
                                     on_thr_w=float(user_cfg["on_thr_w"]))
-            q_br_t_i = quality_report(branch_c[tcols_i], "branch_target", 96,
-                                      allow_negative,
-                                      on_thr_w=float(user_cfg["on_thr_w"]))
             q_br_i["target_cols"] = tcols_i
-            q_br_i["target_quality"] = q_br_t_i
             infer_quality = {"bus": q_bus_i, "branch": q_br_i}
-            write_quality_html(out / "data_quality_report.html",
-                               [q_bus_i, q_br_i, q_br_t_i])
+            write_quality_html(out / "data_quality_report.html", [q_bus_i, q_br_i])
 
         # §12.4 infer 时间过滤
         ispec = user_cfg.get("infer") or {}
@@ -449,7 +451,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             daily_thr = float(base_cfg.get("quality", {})
                               .get("max_daily_missing_rate", 1.0))
             bad_days = sorted(set(invalid_data_days(bus15, 96, daily_thr)) |
-                              set(invalid_data_days(branch_c[tcols], 96, daily_thr)))
+                              set(invalid_data_days(branch_c, 96, daily_thr)))
             if bad_days and len(have):
                 have = have[~have.index.normalize().isin(set(bad_days))]
                 log.warning("[%s] 推理评估剔除无效天 %d 天: %s", user_key,
@@ -466,14 +468,12 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     have.to_numpy()[:, None], pred_on_have.to_numpy()[:, None],
                     metric_names, on_thr_w=float(user_cfg["on_thr_w"]))
                 _dump(out / "offline_metrics.json", offline_metrics)
-                # 质量报告补充推理评估段切分级统计（目标功率口径，挂目标子表报告）
+                # 质量报告补充推理评估段切分级统计（目标功率口径）
                 if infer_quality is not None:
-                    q_br_t = infer_quality["branch"]["target_quality"]
-                    q_br_t["split_stats"] = {
+                    infer_quality["branch"]["split_stats"] = {
                         "infer": series_daily_stats(have, float(user_cfg["on_thr_w"]))}
                     write_quality_html(out / "data_quality_report.html",
-                                       [infer_quality["bus"], infer_quality["branch"],
-                                        q_br_t])
+                                       [infer_quality["bus"], infer_quality["branch"]])
                 # 日级离线指标 CSV（model × date 行 × 指标列）
                 daily = evaluate_daily(have.to_numpy()[:, None],
                                        pred_on_have.to_numpy()[:, None],

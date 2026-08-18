@@ -84,22 +84,22 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
         cs = meta_q[kind]["cleaned_stats"]
         assert cs["total_days"] > 0
         assert cs["all_off_days"] == len(cs["all_off_dates"])
-    # 目标分路子表质量（门禁口径）+ 训练切分级统计（目标功率口径）
-    q_t = meta_q["branch"]["target_quality"]
-    assert q_t["kind"] == "branch_target"
+    # branch 报告=有效通道（目标通道）口径 + 训练切分级统计（目标功率口径）
     assert meta_q["branch"]["target_cols"]                 # 记录了配置目标分路
-    ss = q_t["split_stats"]
+    ss = meta_q["branch"]["split_stats"]
     assert set(ss) == {"train", "val", "test"}
     for k in ("train", "val", "test"):
         assert ss[k]["total_days"] > 0
         assert ss[k]["all_off_days"] == len(ss[k]["all_off_dates"])
     html = (train_dir / "data_quality_report.html").read_text(encoding="utf-8")
     assert "清洗后数据统计" in html
-    assert "branch_target·train" in html and "branch_target·test" in html
-    # 开机分析只含目标分路
-    sessions = pd.read_csv(train_dir / "branch_sessions.csv")
+    assert "branch·train" in html and "branch·test" in html
+    # 无效通道（非目标）已丢弃：清洗产物与开机分析只含目标通道
     tcols = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))["target_cols"]
+    sessions = pd.read_csv(train_dir / "branch_sessions.csv")
     assert set(sessions["branch"].unique()) <= set(tcols)
+    cleaned_br = pd.read_csv(train_dir / "cleaned" / "branch_cleaned.csv")
+    assert set(c for c in cleaned_br.columns if c != "timestamp") == set(tcols)
 
     # 推理侧质量报告（有分路数据时产出，与训练同构 + infer 切分统计）
     infer_dir2 = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
@@ -107,11 +107,13 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
     meta_i = json.loads((infer_dir2 / "meta.json").read_text(encoding="utf-8"))
     qi = meta_i["quality"]
     assert qi["bus"]["cleaned_stats"]["total_days"] > 0
-    assert qi["branch"]["target_quality"]["split_stats"]["infer"]["total_days"] > 0
+    assert qi["branch"]["split_stats"]["infer"]["total_days"] > 0
     html_i = (infer_dir2 / "data_quality_report.html").read_text(encoding="utf-8")
-    assert "清洗后数据统计" in html_i and "branch_target·infer" in html_i
+    assert "清洗后数据统计" in html_i and "branch·infer" in html_i
     sessions_i = pd.read_csv(infer_dir2 / "branch_sessions.csv")
     assert set(sessions_i["branch"].unique()) <= set(tcols)
+    cleaned_br_i = pd.read_csv(infer_dir2 / "cleaned" / "branch_cleaned.csv")
+    assert set(c for c in cleaned_br_i.columns if c != "timestamp") == set(tcols)
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
     assert meta["best_model"] in meta["models"]
 
