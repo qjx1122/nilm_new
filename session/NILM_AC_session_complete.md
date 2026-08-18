@@ -427,3 +427,12 @@
 - 关键决策：双达标单一口径取代 bus/branch 分列统计；未使用类别显性化；覆盖性建议把人工分析结论规则化
 - 未决问题：无新增
 - 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 34 次）
+- 目标：更新配置文件详细说明（yaml + json 全数据项）
+- 完成项：
+  - docs/CONFIG_GUIDE.md v1.0→v2.0：重构为两部分——第一部分 default.yaml（同步近期变更：max_daily_missing_rate、min_score 兼作逐天质量表阈值与双达标口径、save_cleaned_csv、模型当前启用状态注记、质量报告新产物链）；第二部分用户 JSON 全字段（顶级结构/_default/_user_id_map 键规则与优先级、CONFIG_RULES 全部标量字段含取值范围与全流程语义、train/infer/splits 时间过滤闭区间与切分锚定语义、字段生效位置速查表）
+  - README 链接文案更新
+- 关键决策：新增「字段生效位置速查」表（字段→影响哪个产物），排查配置问题可反查；target_col 语义按最新业务口径（有效通道/无效通道）表述
+- 未决问题：无
+- 相关文件/分支：docs/CONFIG_GUIDE.md、README.md；分支 arena/019ffeb6-nilm-new

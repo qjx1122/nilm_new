@@ -1,12 +1,17 @@
-# configs/default.yaml 配置说明（含模型与训练效率指南）
+# 配置文件详细说明（default.yaml + 用户 JSON，含模型与训练效率指南）
 
-> 版本：v1.0（2026-08-14）
+> 版本：v2.0（2026-08-18）
 > 适用代码：`nilm/` 流水线（对齐《工商业负荷辨识算法开发指南 V2.1》）
-> 优先级：`--time-filter-config` 用户 JSON（§12）> 本文件默认值 > 代码硬编码默认。
+> 优先级：`--time-filter-config` 用户 JSON（§12）> default.yaml 默认值 > 代码硬编码默认。
 > 本文档描述各配置项在**当前代码实现**中的真实语义（非仅注释复述）；
 > 配置结构变化时须同步更新本文档（BOOTSTRAP 收尾仪式条件触发项）。
+>
+> 全文分两部分：**第一部分 configs/default.yaml**（§1–§10，流水线级配置）；
+> **第二部分 用户 JSON**（§11–§14，`--time-filter-config` 指定，用户级配置）。
 
 ---
+
+# 第一部分：configs/default.yaml（流水线级）
 
 ## 1. 全局
 
@@ -34,7 +39,12 @@
 | `min_coverage` | 0.15 | 时间覆盖率下限（实际点数 / 按 15min 应有点数） |
 | `min_score` | 10 | 综合质量分下限（缺失/异常/覆盖合成） |
 | `min_days` | 3 | 时间过滤后最少有效天数（`len(bus) < 96×min_days` 判 `INSUFFICIENT_TIME_RANGE`） |
-| `max_daily_missing_rate` | 0.9 | **日级无效天阈值**：总线或分路（目标列）全天数据缺失、或当日缺失率超过该值的天，整天剔除——不参与模型训练，也不参与训练/推理阶段的评估指标计算；剔除清单落盘 `excluded_days.json`。有效点按功率列判定（与全关天口径一致） |
+| `max_daily_missing_rate` | 0.9 | **日级无效天阈值**：总线或分路（有效通道）全天数据缺失、或当日缺失率超过该值的天，整天剔除——不参与模型训练，也不参与训练/推理阶段的评估指标计算；剔除清单落盘 `excluded_days.json`。有效点按功率列判定（与全关天口径一致） |
+
+`quality.min_score` 同时是**逐天质量表**（`daily_quality.csv` / 质量报告 HTML）的
+「得分阈值」列：单日总线得分与目标分路得分均 ≥ 该值才算「当天合格」（双达标）；
+双达标天进一步产出明细表（`qualified_days_detail.csv`：是否全关日/全关阈值/所属数据集）
+与训练建议（`quality_advice.json`）。
 
 > 当前阈值按 5 户真实数据校准过的「放宽版」；数据质量改善后建议收紧（如 0.3 / 0.5 / 50）。
 
@@ -99,6 +109,10 @@ ua: {ch: 1, column: load_iden_data9, multiplier: 0.001, unit: V}
 
 所有模型经 `MODEL_REGISTRY` 注册、配置驱动实例化，统一 `(n,f)→(n,k)` 矩阵接口。
 
+> **当前启用状态（2026-08-18）**：仅启用 3 个基线（history_profile/proportional/ridge），
+> random_forest/xgboost/lstm/cnn1d/transformer 在 `models:` 中临时注释（参数保留，
+> 取消注释即恢复）。恢复树/深度模型需已安装 `requirements-ml.txt` 依赖。
+
 ### A. 基线组（sanity 下界；毫秒级；零 ML 依赖）
 
 | 模型 | 原理 | 参数 | 效率因素 | 定位 |
@@ -158,6 +172,81 @@ ua: {ch: 1, column: load_iden_data9, multiplier: 0.001, unit: V}
 
 ---
 
+# 第二部分：用户 JSON 配置（--time-filter-config）
+
+指南 §12 规定入口：`python scripts/run_batch_users.py --time-filter-config <path.json>`。
+仓库示例：`configs/time_filters.json`（生产在用）、`configs/time_filter.example.json`（全字段示例）。
+
+## 11. 顶级结构与键规则（§12.1）
+
+```json
+{
+  "<device>_<user>": { ...单用户配置... },
+  "_default":        { ...全局默认... },
+  "_user_id_map":    { "<user_id>": "<device>_<user>" }
+}
+```
+
+| 顶级键 | 意义 |
+| --- | --- |
+| `<device>_<user>` | 用户配置键，必须严格匹配 user_key 格式（如 `800080252842_4206894986488`）|
+| `_default` | 全局默认层：所有用户共享，被具体 user_key 配置覆盖 |
+| `_user_id_map` | 单独 user_id 键的**显式映射层**（`{user_id: user_key}`）。§12.1 禁止隐式猜测——不在映射中的非法键直接报错 |
+| 其他 `_` 前缀键 | 保留键（如 `_note_`/`_comment_`），不作为用户数据加载 |
+
+**优先级**：具体 user_key 配置 > `_default` > 代码硬编码默认（`contracts.CONFIG_RULES`）。
+合并来源记录在运行时配置的 `_provenance` 字段（可在日志/调试中溯源每个值来自哪层）。
+
+## 12. 用户级标量字段（校验规则见 `CONFIG_RULES` + `user_config.py`）
+
+| 字段 | 默认 | 取值/范围 | 意义 |
+| --- | --- | --- | --- |
+| `target_col` | `None`→回退链 | 字符串，如 `"p1"`、`"p1+p2"` | **目标分路通道（有效通道）**。复合目标按行相加（任一分量 NaN 则复合为 NaN）。缺省回退链：p1 → 首个 pN（WARNING 告警）。**非目标通道视为无效数据，清洗后即丢弃**（不在当前总线回路） |
+| `on_thr_w` | 10.0 | 0.001~5000 (W) | **开机功率阈值**，全流程统一口径：状态判据（pred_state/target_state）、F1 等分类指标二值化、开机段分析（branch_sessions）、全关天判定、可辨识性分析、pred_prob 的 sigmoid 中心 |
+| `split_ratios` | [0.6,0.2,0.2] | 3 个非负数、和=1 | train/val/test 切分比例 |
+| `split_strategy` | `stratified_day` | `stratified_day` / `stratified` / `time` / `global_stratified` | 切分策略：stratified_day=按天分层打散（推荐，各集覆盖开机/停机日）；time=按时间顺序切；stratified=点级分层；global_stratified=全局分层 |
+| `post_min_on` | 1 | ≥0 整数 | 状态后处理：开机段最短持续点数，短于此的开段视为噪声置关（15min/点；如 8=2 小时）。**对压误报（FP）收益显著**，见 2842 分析（0.75→0.87） |
+| `post_fill_short_off` | 3 | ≥0 整数 | 状态后处理：两开机段之间 ≤N 点的短关断填充为开 |
+| `weather_latitude` / `weather_longitude` | 30.59 / 114.31 | 经纬度范围 | 天气特征取数坐标（预留字段，校验已实现；天气特征模块未接入前不参与训练） |
+| `use_weather_features` / `use_temp_based_season` | true | 布尔 | 天气/温度季节特征开关（预留字段，同上） |
+
+## 13. 时间过滤与切分锚定（§12.4，闭区间语义）
+
+`train` / `infer` / `splits` 三个结构字段，元素均为 `[start, end]` **闭区间**字符串
+（支持日期 `"2026-06-30"` 或精确到秒 `"2026-04-02 17:45"`；日期右端点含全天）。
+
+| 字段 | 意义 |
+| --- | --- |
+| `train.include` / `train.exclude` | 训练数据时间窗：先取 include 并集（**空/缺省=全部**），再剔除 exclude。质量门禁之后、切分之前执行 |
+| `infer.include` / `infer.exclude` | 推理数据时间窗，语义同上 |
+| `splits.train/val/test` 各自 `include`/`exclude` | **切分锚定**：include=硬锚定（这些天强制归入该集）；exclude=从该集精确排除。在 `split_strategy` 初始切分之后应用，最后自动做空集修复（repair）。用于复现实验/指定验收日 |
+
+示例（`configs/time_filters.json` 实况节选）：
+
+```json
+"800080270778_4200903422131": {
+  "target_col": "p2",
+  "on_thr_w": 50.0,
+  "splits": { "train": { "include": [["2026-06-24", "2026-06-25"]] } },
+  "train":  { "include": [["2026-05-21", "2026-06-08"], ["2026-07-01", "2026-07-08"]] },
+  "infer":  { "include": [["2026-07-01", "2026-07-31"]],
+              "exclude": [["2026-06-20", "2026-06-20"]] }
+}
+```
+
+## 14. 字段生效位置速查（哪个字段影响哪个产物）
+
+| 字段 | 影响的流程/产物 |
+| --- | --- |
+| `target_col` | 目标构建、无效通道丢弃、branch_sessions.csv、质量报告 branch 段、无效天判定、全部评估指标 |
+| `on_thr_w` | pred_state/target_state、f1/accuracy/precision/recall/tp/fp/fn/tn、branch_sessions、全关天统计（cleaned_stats/qualified_days_detail）、pred_prob |
+| `split_ratios`/`split_strategy`/`splits` | 切分掩码 → metrics_by_split.csv、metrics_daily.csv（split 列）、qualified_days_detail.csv 的所属数据集列 |
+| `post_min_on`/`post_fill_short_off` | inference_result.csv 的 pred_state（训练评估的分类指标**不经过**后处理，用原始阈值判态） |
+| `train`/`infer` 时间过滤 | 参与训练/推理的数据范围 → 质量报告「未使用」天数、excluded_days 语义边界 |
+
+---
+
 ## 修订记录
 
+- **v2.0（2026-08-18）**：新增第二部分「用户 JSON 配置」全字段说明（顶级结构/标量字段/时间过滤与切分锚定/字段生效位置速查）；yaml 部分同步近期变更——quality.max_daily_missing_rate（日级无效天）、min_score 兼作逐天质量表阈值与双达标口径、preprocess.save_cleaned_csv、模型清单当前启用状态（仅 3 基线，其余注释）、质量报告新产物（daily_quality/qualified_days_detail/quality_advice）
 - **v1.0（2026-08-14）**：初版——覆盖 default.yaml 全部配置项、8 模型说明与训练效率因素、5 户实测结论
