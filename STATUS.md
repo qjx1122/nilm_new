@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：压 FP 调参后 2842 复验——ridge 判决链口径日级达标 15/21（中位 0.980）；raw 口径 B/C 类已被判决链治理，剩余=4 全关天+2 FN 天
 - ✅ 已完成：FP 过多模型侧治理——ridge 加权岭（off_weight=5，FP -23%）+ history_profile 中位画像（FP -83%）；顺带修复 unseen 槽位误回退缺陷
 - ✅ 已完成：train_predictions vs metrics_daily 混淆计数差异审计——同源同预测、判决链不同（值列同阈值重判可逐值对账，无缺陷）
 - ✅ 已完成：train_predictions.csv 增加 target_state（真实状态）与 pred_state_<model>（预测状态，生产判决链口径）

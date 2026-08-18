@@ -524,3 +524,14 @@
 - 关键决策：proportional 不调参（sanity 定位）；off_weight/agg 均为可配参数按用户校准
 - 未决问题：全关天误报（模型层无解，需停机特征）；其他用户参数校准
 - 相关文件/分支：nilm/models/baselines.py、configs/default.yaml、tests/test_ml_models.py；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 43 次）
+- 目标：调参落地后 2842 重新验证；日级 F1 不达标天详析与优化方案
+- 完成项：
+  - 重跑 OK（165 项测试全过）；test 日级达标：hp 0→12 天、ridge raw 6 天/判决链口径 15/21 天（中位 0.980）
+  - ridge raw 不达标 15 天分解：4 全关天（FP 242）+ 11 个 B/C 天（FP 132=边界 58+凌晨 1-6 时小值 74）
+  - 判决链口径复核：B/C 类几乎清零（F1 0.91~1.00）；剩余=4 全关天+2 个 FN 天（6-10/6-08 段内低功率间歇被 50W 阈值误杀）
+  - 结论：raw 口径 B/C"不达标"非生产问题；优化方向收敛为全关天特征/口径与 FN-FP 权衡（decision_thr 微调）
+- 关键决策：不再追加代码改动（三层治理已覆盖可治理项）；推理日级生产口径统计扩展待需求确认
+- 未决问题：全关天（不变）；decision_thr 50 的 FN 代价是否回调由需求方定
+- 相关文件/分支：REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
