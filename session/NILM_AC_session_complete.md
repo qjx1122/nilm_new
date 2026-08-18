@@ -512,3 +512,15 @@
 - 关键决策：不改代码——差异是双口径设计（08-18 定型）的预期表现；对账方法文档化
 - 未决问题：无
 - 相关文件/分支：README.md、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 42 次）
+- 目标：解决三模型每日指标 FP 过多问题（模型侧）
+- 完成项：
+  - 离线定量实验：alpha 无效；关态加权 w_off=5 最优（FP 481→342）；中位画像 FP 363→184
+  - 落地：ridge off_weight/off_thr_w（加权岭）+ history_profile agg=median 参数化，default.yaml 启用
+  - 修复 unseen 槽位 profile==0 代理缺陷（显式 _seen）；新增 2 项测试，165 项全过
+  - 2842 重跑：hp F1 0.619→0.859（FP -83%）、ridge 0.760→0.799（FP -23%，SAE 0.128→0.028）；生产判决链 0.877/0.976 维持
+  - FP 治理三层框架（模型层/判决层/口径层）定型入 STATUS
+- 关键决策：proportional 不调参（sanity 定位）；off_weight/agg 均为可配参数按用户校准
+- 未决问题：全关天误报（模型层无解，需停机特征）；其他用户参数校准
+- 相关文件/分支：nilm/models/baselines.py、configs/default.yaml、tests/test_ml_models.py；分支 arena/019ffeb6-nilm-new

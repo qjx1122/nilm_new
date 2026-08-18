@@ -124,3 +124,48 @@ def test_seq_model_default_device_auto():
     for name in DL_MODELS:
         m = MODEL_REGISTRY.create(name, **{**EXTRA[name]})
         assert m.params["device"] == "auto"
+
+
+def test_ridge_off_weight_reduces_false_positives():
+    """加权岭：关态样本加权后，关态时段的预测残余显著降低（压 FP 机制）。"""
+    rng = np.random.default_rng(0)
+    n = 800
+    # 构造：一半时间开机（y=100+噪声，x1 高），一半关机（y=0，x1 仍有底载噪声）
+    on = np.arange(n) % 2 == 0
+    x1 = np.where(on, 5.0, 1.0) + rng.normal(0, 0.8, n)   # 底载重叠，制造误报倾向
+    X = np.column_stack([x1, rng.normal(0, 1, n)])
+    y = np.where(on, 100.0, 0.0)[:, None]
+    base = MODEL_REGISTRY.create("ridge", alpha=1.0)
+    base.fit(X, y)
+    weighted = MODEL_REGISTRY.create("ridge", alpha=1.0, off_weight=5.0,
+                                     off_thr_w=10.0)
+    weighted.fit(X, y)
+    off_res_base = float(np.clip(base.predict(X)[~on, 0], 0, None).mean())
+    off_res_w = float(np.clip(weighted.predict(X)[~on, 0], 0, None).mean())
+    assert off_res_w < off_res_base, "关态加权应降低关态时段预测残余"
+    # off_weight=1 与原版行为一致
+    plain = MODEL_REGISTRY.create("ridge", alpha=1.0, off_weight=1.0)
+    plain.fit(X, y)
+    assert np.allclose(plain.predict(X), base.predict(X), atol=1e-8)
+
+
+def test_history_profile_median_agg():
+    """中位画像：槽位内多数为 0、少数极大时，median 输出 0（mean 会被拉高）。"""
+    n_days, slots = 5, 96
+    slot = np.tile(np.arange(slots), n_days)
+    X = slot[:, None].astype(float)
+    y = np.zeros((len(slot), 1))
+    y[slot == 40] = 0.0
+    # 槽位 40：5 天中 1 天开机 500W，4 天 0 → median=0, mean=100
+    day_idx = np.repeat(np.arange(n_days), slots)
+    y[(slot == 40) & (day_idx == 0)] = 500.0
+    m_mean = MODEL_REGISTRY.create("history_profile")
+    m_mean.fit(X, y, feature_names=["slot"])
+    m_med = MODEL_REGISTRY.create("history_profile", agg="median")
+    m_med.fit(X, y, feature_names=["slot"])
+    x40 = np.array([[40.0]])
+    assert m_mean.predict(x40)[0, 0] == 100.0
+    assert m_med.predict(x40)[0, 0] == 0.0
+    import pytest
+    with pytest.raises(ValueError):
+        MODEL_REGISTRY.create("history_profile", agg="p25")

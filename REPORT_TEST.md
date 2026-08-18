@@ -364,3 +364,19 @@
   - 文档澄清：README train_predictions 条目增加口径提示（如何对账）
 - 是否进入 REPORT.md（稳定结论）：与上轮口径设计说明合并考虑
 - 遗留问题：无——如需状态列与 daily 完全一致，将用户 decision_thr_w/post_min_on 配置移除即可（缺省时两口径自动重合）
+
+## [2026-08-18] 专题：三模型每日指标 FP 过多的模型侧治理（加权岭/中位画像）
+- 类型：实验专题（调参落地）
+- 目标与假设：在既有后处理手段（decision_thr+min_on，压推理链 FP）之外，从模型本身减少原始预测的 FP（metrics_daily 口径）
+- 方法 / 数据 / 参数：
+  - 离线扫描（2842 test，on_thr=10 口径）：ridge alpha 5~50 无效（FP 481→495~511，正则不改变系统性高估）；**关态样本加权 w_off=2/3/5/10 → FP 418/376/342/321、F1 单调升至 0.824**；history_profile 中位画像 FP 363→184（P25 过狠 FN+311 弃用）
+  - 落地：ridge 新增 off_weight/off_thr_w 参数（加权岭闭式解 X'ΩX，默认 1.0=原行为）；history_profile 新增 agg=mean/median 参数；default.yaml 启用（ridge off_weight=5，hp agg=median）
+  - 顺带修复既有缺陷：history_profile 的 unseen 槽位判定用 profile==0 代理——合法 0 值画像（median 下大量出现）被误回退 fallback；改为显式 _seen 数组（兼容旧 pickle）
+  - 新增 2 项测试（加权压关态残余/off_weight=1 等价原版；median 语义/非法 agg 报错），165 项全过
+- 结果 / 结论（2842 test，metrics_daily 口径）：
+  - history_profile：FP 1054→184（-83%），F1 0.619→0.859（代价 FN 0→73）
+  - ridge：FP 510→395（-23%），F1 0.760→0.799，SAE 0.128→0.028 显著改善；生产判决链 all_days 0.877/on_days 0.976 维持
+  - proportional：不调（其 FP 来自模型本性——占比分摊无法区分底载，且作为 sanity 基线应保持朴素）
+  - **FP 治理全景（三层）**：①模型层（本轮：加权岭/中位画像，压原始预测 FP）→②判决层（decision_thr_w+post_min_on，压生产链 FP，前轮已落地）→③口径层（on_days_only，处理全关天可辨识性下界）；三层叠加后 ridge 生产链 F1 0.88（全量）/0.98（开机日）
+- 是否进入 REPORT.md（稳定结论）：建议与前两轮 FP 治理结论合并成章
+- 遗留问题：全关天整段误报仍是模型层无解项（需停机可观测特征）；787/844 等其他用户的参数需按各自数据校准（off_weight/agg 均为用户级可配）

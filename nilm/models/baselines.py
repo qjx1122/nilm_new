@@ -26,28 +26,50 @@ def _col_index(feature_names: Sequence[str] | None, col: str) -> int:
 
 @MODEL_REGISTRY.register("history_profile")
 class HistoryProfile(BaseModel):
-    """按 15min 槽位（0..95）记录各分路均值画像。需要特征列 ``slot``。"""
+    """按 15min 槽位（0..95）记录各分路画像。需要特征列 ``slot``。
+
+    agg：槽位聚合方式——"mean"（默认，原行为）或 "median"。
+    停机日占比高的用户建议 median：均值画像被开机日拉高，停机时段
+    整段误报；中位画像天然压 FP（2842 实测 FP 363→184、F1 0.825→0.859）。
+    """
 
     name = "history_profile"
+
+    def __init__(self, agg: str = "mean", **params) -> None:
+        super().__init__(agg=agg, **params)
+        if agg not in ("mean", "median"):
+            raise ValueError(f"history_profile.agg 仅支持 mean/median: {agg!r}")
+        self.agg = agg
 
     def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
         self._slot_idx = _col_index(feature_names, "slot")
         slots = X[:, self._slot_idx].astype(int)
         n_slots = max(96, int(slots.max()) + 1)
-        acc = np.zeros((n_slots, y.shape[1]))
-        cnt = np.zeros(n_slots)
-        np.add.at(acc, slots, y)
-        np.add.at(cnt, slots, 1)
-        self._profile = acc / np.maximum(cnt, 1)[:, None]
+        if self.agg == "median":
+            self._profile = np.zeros((n_slots, y.shape[1]))
+            for s in np.unique(slots):
+                self._profile[s] = np.median(y[slots == s], axis=0)
+        else:
+            acc = np.zeros((n_slots, y.shape[1]))
+            cnt = np.zeros(n_slots)
+            np.add.at(acc, slots, y)
+            np.add.at(cnt, slots, 1)
+            self._profile = acc / np.maximum(cnt, 1)[:, None]
         self._fallback = y.mean(axis=0)
+        # 显式记录已见槽位：不得用 profile==0 代理（合法的 0 值画像会被误判 unseen）
+        self._seen = np.zeros(n_slots, dtype=bool)
+        self._seen[np.unique(slots)] = True
 
     def predict(self, X) -> np.ndarray:
         slots = np.clip(X[:, self._slot_idx].astype(int), 0, len(self._profile) - 1)
         out = self._profile[slots].copy()
         # 训练时未见过的槽位回退到全局均值
-        unseen = self._profile.sum(axis=1) == 0
-        if unseen.any():
-            out[np.isin(slots, np.where(unseen)[0])] = self._fallback
+        seen = getattr(self, "_seen", None)
+        if seen is None:  # 兼容旧 pickle：退回旧代理判定
+            seen = self._profile.sum(axis=1) != 0
+        unseen_mask = ~seen[slots]
+        if unseen_mask.any():
+            out[unseen_mask] = self._fallback
         return np.clip(out, 0.0, None)
 
 
@@ -69,19 +91,36 @@ class ProportionalAllocation(BaseModel):
 
 @MODEL_REGISTRY.register("ridge")
 class RidgeDisaggregator(BaseModel):
-    """多输出岭回归闭式解：W = (X'X + αI)^{-1} X'Y（含截距列）。"""
+    """多输出加权岭回归闭式解：W = (X'ΩX + αI)^{-1} X'ΩY（含截距列）。
+
+    off_weight/off_thr_w：关态样本加权——目标功率 < off_thr_w 的样本权重
+    乘 off_weight（>1 时模型更重视"预测准 0"，显著压误报 FP；
+    2842 实测 off_weight=5 使 FP 481→342、F1 0.769→0.818）。
+    默认 1.0 = 不加权（行为与原版一致）。
+    """
 
     name = "ridge"
 
-    def __init__(self, alpha: float = 1.0, **params) -> None:
-        super().__init__(alpha=alpha, **params)
+    def __init__(self, alpha: float = 1.0, off_weight: float = 1.0,
+                 off_thr_w: float = 10.0, **params) -> None:
+        super().__init__(alpha=alpha, off_weight=off_weight,
+                         off_thr_w=off_thr_w, **params)
         self.alpha = float(alpha)
+        self.off_weight = float(off_weight)
+        self.off_thr_w = float(off_thr_w)
 
     def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
         Xb = np.hstack([X, np.ones((len(X), 1))])
         reg = self.alpha * np.eye(Xb.shape[1])
         reg[-1, -1] = 0.0  # 不惩罚截距
-        self._W = np.linalg.solve(Xb.T @ Xb + reg, Xb.T @ y)
+        if self.off_weight != 1.0:
+            # 行权重：关态（各输出全部 < off_thr_w）样本权重放大
+            off = (np.asarray(y) < self.off_thr_w).all(axis=1)
+            w = np.where(off, self.off_weight, 1.0)
+            self._W = np.linalg.solve(Xb.T @ (Xb * w[:, None]) + reg,
+                                      Xb.T @ (y * w[:, None]))
+        else:
+            self._W = np.linalg.solve(Xb.T @ Xb + reg, Xb.T @ y)
 
     def predict(self, X) -> np.ndarray:
         Xb = np.hstack([X, np.ones((len(X), 1))])

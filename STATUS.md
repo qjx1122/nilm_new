@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：FP 过多模型侧治理——ridge 加权岭（off_weight=5，FP -23%）+ history_profile 中位画像（FP -83%）；顺带修复 unseen 槽位误回退缺陷
 - ✅ 已完成：train_predictions vs metrics_daily 混淆计数差异审计——同源同预测、判决链不同（值列同阈值重判可逐值对账，无缺陷）
 - ✅ 已完成：train_predictions.csv 增加 target_state（真实状态）与 pred_state_<model>（预测状态，生产判决链口径）
 - ✅ 已完成：proportional F1 全 0 根因修复（pbus 移出缩放列）——test MAE 173.7/F1 0.596 复活，其他模型无回归
@@ -102,6 +103,8 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- FP 治理三层框架定型（2026-08-18）：模型层（加权岭 off_weight/中位画像 agg=median，压原始 FP）→判决层（decision_thr_w+post_min_on，压生产链 FP）→口径层（on_days_only，处理可辨识性下界）——alpha 正则被实验否定（不改变系统性高估方向）；proportional 保持朴素不调（sanity 基线定位）
+- 【缺陷修复】history_profile unseen 槽位判定曾用 profile==0 代理：中位画像下合法 0 值被误回退 fallback（非零）——显式 _seen 数组修复；教训：布尔状态不得用数值 0 代理
 - proportional 修复选方案 B（pbus 入 NON_SCALED_COLS）而非模型内反标准化：①slot 先例已存在，机制一致；②模型层保持「按列名取物理量」的简单契约，不感知 Scaler；③对缩放敏感的模型（ridge）实证无回归（f1/r2 差异 <0.001）。教训固化：基线模型按列名取物理量的列必须逐一确认不在 scale_cols
 - 评估产物双口径设计定型（2026-08-18）：metrics_by_split/metrics_daily=模型能力口径（on_thr_w 判决、无后处理，选型用）；state_strategy_metrics=生产判决链口径（decision_thr_w+游程后处理，部署效果）——两者数字必然不同是设计而非缺陷；state_strategy 增加 raw_on_thr 对照行与 by_split 逐值对账（测试守卫）
 - 【缺陷修复】state_strategy 的 precision 空真约定曾与 evaluation.metrics 不一致（tp+fp=0 有 FN 时记 1.0 而非 0）——教训：同一指标在多处实现时，空真/除零约定必须复用同一实现或测试对账

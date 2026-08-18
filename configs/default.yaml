@@ -61,10 +61,13 @@ bus_field_map:
 
 models:                        # 多模型对比：注册表 + 配置驱动
   # 当前只保留 3 个基线/线性模型（2026-08-17 用户要求，其余临时注释；恢复取消注释即可）
+  # 压 FP 调参（2026-08-18，2842 实测）：history_profile 中位画像（FP 363→184）；
+  # ridge 关态样本加权 off_weight=5（FP 481→342）——两者均为默认关闭的可选参数
   - name: history_profile
+    params: {agg: median}
   - name: proportional
   - name: ridge
-    params: {alpha: 1.0}
+    params: {alpha: 1.0, off_weight: 5.0, off_thr_w: 10.0}
   # - name: random_forest      # 随机森林回归（sklearn，原生 multioutput）
   #   params: {n_estimators: 200, min_samples_leaf: 2}
   # - name: xgboost            # XGBoost 回归（每分路一回归器；有 val 时早停）
