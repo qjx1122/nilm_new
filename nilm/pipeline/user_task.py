@@ -286,6 +286,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         results: dict[str, dict] = {}          # {model: test 指标}（选型口径不变）
         results_by_split: dict[str, dict] = {}  # {model: {split: 指标}} 三阶段全量
         daily_rows: list[pd.DataFrame] = []     # 每模型×每阶段×每天 指标
+        test_preds: dict[str, np.ndarray] = {}  # {model: test 段预测}（状态策略评估用）
         best = None
         for spec in base_cfg.get("models", []):
             name, params = spec["name"], spec.get("params", {})
@@ -312,6 +313,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 daily_rows.append(daily)
                 log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
                          {m: round(v["macro"], 4) for m, v in metrics.items()})
+                if split == "test":
+                    test_preds[name] = y_hat[:, 0]
             results[name] = results_by_split[name]["test"]  # 选型口径：test（不变）
 
         # 三阶段汇总 CSV：model × split 行 × 指标列
@@ -324,6 +327,34 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         # 日级指标 CSV：model × split × date 行 × 指标列
         pd.concat(daily_rows, ignore_index=True).to_csv(
             out / "metrics_daily.csv", index=False, encoding="utf-8")
+
+        # —— 状态策略评估（test）：决策阈值 + 游程后处理下的 F1（全量 / 仅开机日两口径）
+        dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
+        strat_rows = []
+        y_test = splits["test"][1][:, 0]
+        idx_test = splits["test"][2]
+        t_on_test = y_test >= on_thr
+        day_on = pd.Series(t_on_test, index=idx_test).groupby(
+            idx_test.normalize()).transform("max").to_numpy()
+        for mname, p in test_preds.items():
+            st = postprocess_state(p, dec_thr, int(user_cfg["post_min_on"]),
+                                   int(user_cfg["post_fill_short_off"]))
+            for scope, m in (("all_days", np.ones(len(st), bool)),
+                             ("on_days_only", day_on)):
+                tp = int((st[m] & t_on_test[m]).sum())
+                fp = int((st[m] & ~t_on_test[m]).sum())
+                fn = int((~st[m] & t_on_test[m]).sum())
+                prec = tp / (tp + fp) if tp + fp else 1.0
+                rec = tp / (tp + fn) if tp + fn else 1.0
+                f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+                strat_rows.append({"model": mname, "scope": scope,
+                                   "decision_thr_w": dec_thr,
+                                   "post_min_on": int(user_cfg["post_min_on"]),
+                                   "post_fill_short_off": int(user_cfg["post_fill_short_off"]),
+                                   "f1": round(f1, 4), "precision": round(prec, 4),
+                                   "recall": round(rec, 4), "tp": tp, "fp": fp, "fn": fn})
+        pd.DataFrame(strat_rows).to_csv(out / "state_strategy_metrics.csv",
+                                        index=False, encoding="utf-8")
 
         table = build_comparison_table(results)
         table.to_csv(out / "comparison.csv", encoding="utf-8")
@@ -521,10 +552,12 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 daily.to_csv(out / "metrics_daily.csv", index=False, encoding="utf-8")
 
         on_thr = float(user_cfg["on_thr_w"])
-        pred_state = postprocess_state(pred, on_thr,
+        # 决策阈值（§12.3 扩展）：仅作用于预测→状态判决；缺省沿用 on_thr_w
+        dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
+        pred_state = postprocess_state(pred, dec_thr,
                                        int(user_cfg["post_min_on"]),
                                        int(user_cfg["post_fill_short_off"]))
-        pred_prob = state_probability(pred, on_thr)
+        pred_prob = state_probability(pred, dec_thr)
         # 状态真值：分路真值按同一 on_thr_w 二值化；无真值处为空（NaN）
         target_np = target_vals.to_numpy(dtype=np.float64)
         target_state = np.where(np.isnan(target_np), np.nan,

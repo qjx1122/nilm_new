@@ -1,6 +1,8 @@
 {
   "800080252842_4206894986488": {
     "target_col": "p1",
+    "post_min_on": 8,
+    "decision_thr_w": 50.0,
     "train": {
       "include": [["2025-07-10", "2026-06-30"]],
       "exclude": [

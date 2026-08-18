@@ -447,3 +447,15 @@
 - 关键决策：min_score=70 的选型依据入 STATUS；F1>0.95 需口径协商的结论实证固化
 - 未决问题：post 参数写入配置正式生效待确认；全关天口径协商
 - 相关文件/分支：configs/{default.yaml,time_filters.json}、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 36 次）
+- 目标：2842 优化方案 1+2 验证测试；F1 不达标再分析与优化方案
+- 完成项：
+  - 新增 decision_thr_w 用户配置字段（仅作用于 pred_state/pred_prob/状态策略判决，真值口径不变）
+  - 训练新增 state_strategy_metrics.csv（每模型 × all_days/on_days_only 两口径 F1/P/R/TP/FP/FN）
+  - 2842 配置 post_min_on=8 + decision_thr_w=50；161 项测试全过
+  - 验证：训练 test 全量口径 0.881/开机日口径 0.9823 达标；推理 pred_state F1 0.981（vs 0.908），日级 22/24 天 >0.95
+  - 剩余不达标归因：4 全关天 FP 257（可辨识性下界）；推理 7-27 疑似真值漏记、7-14 晚间边界 4 点
+- 关键决策：decision/on 阈值分离；双口径产物化
+- 未决问题：7-27 数据侧核查；口径协商（0.88 vs 0.98 两数并出）
+- 相关文件/分支：nilm/common/contracts.py、nilm/pipeline/user_task.py、configs/time_filters.json、tests/test_batch.py；分支 arena/019ffeb6-nilm-new

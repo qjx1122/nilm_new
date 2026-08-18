@@ -140,6 +140,9 @@ CONFIG_RULES: dict[str, dict] = {
     "split_strategy":        {"default": "stratified_day", "choices": SPLIT_STRATEGIES},
     "post_min_on":           {"default": 1, "min": 0},
     "post_fill_short_off":   {"default": 3, "min": 0},
+    # 决策阈值（W）：仅作用于预测功率→开机状态的判决（pred_state/状态策略评估）；
+    # 缺省 None = 沿用 on_thr_w。真值判态（target_state/分类指标）恒用 on_thr_w。
+    "decision_thr_w":        {"default": None, "min": 0.001, "max": 5000.0},
     "weather_latitude":      {"default": 30.59, "min": -90.0, "max": 90.0},
     "weather_longitude":     {"default": 114.31, "min": -180.0, "max": 180.0},
     "use_weather_features":  {"default": True},
