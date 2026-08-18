@@ -416,3 +416,14 @@
 - 关键决策：日级得分缺失率口径含行数不足（比整段更严）；纯日历缺口天不进表（覆盖率已反映）；建议为规则式启发（非硬约束，供人工决策）
 - 未决问题：无新增
 - 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 33 次）
+- 目标：清洗后统计改为双达标口径（总/全关/训练/验证/测试天数）+ 每天明细（全关日/阈值/所属数据集）+ 划分与训练建议
+- 完成项：
+  - validator：qualified_days_detail（双达标天明细：all_off/on_thr_w/dataset——训练集/验证集/测试集/推理集/未使用）、qualified_days_summary（汇总）、split_coverage_advice（全关天覆盖检查/未使用占比提示）
+  - write_quality_html：清洗后统计段改双达标口径渲染（统计表+每天明细表，全关日蓝底），无明细时回退旧渲染
+  - pipeline：train 侧切分后构建明细（split_index=各集时间索引）；infer 侧评估段=推理集；qualified_days_detail.csv + quality_advice.json 落盘；meta.quality.branch.qualified_days_stats
+  - 新增 4 项测试，160 项全过；2842 实测：双达标 140 天=全关 18+训练 68/验证 23/测试 21/未使用 28；建议自动输出「训练集含全关天 7 天占 10%→建议加权」；infer 侧推理集 25 天正确标注
+- 关键决策：双达标单一口径取代 bus/branch 分列统计；未使用类别显性化；覆盖性建议把人工分析结论规则化
+- 未决问题：无新增
+- 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/{test_quality_stats,test_batch}.py；分支 arena/019ffeb6-nilm-new

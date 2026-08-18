@@ -24,8 +24,9 @@ from nilm.common.timefilter import filter_dataframe
 from nilm.data_io.csv_source import CsvBranchLoader, CsvBusLoader
 from nilm.data_io.validator import (QualityError, assert_quality,
                                     daily_quality_table, invalid_data_days,
+                                    qualified_days_detail, qualified_days_summary,
                                     quality_advice, quality_report,
-                                    series_daily_stats, write_quality_html,
+                                    split_coverage_advice, write_quality_html,
                                     write_schema_report)
 from nilm.evaluation import (build_comparison_table, evaluate_all,
                              evaluate_daily, summarize)
@@ -253,13 +254,18 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if split_sizes["test"] == 0 or split_sizes["train"] < window:
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, f"切分后样本不足: {split_sizes}")
 
-        # —— 质量报告补充切分级清洗后统计（train/val/test 各自的总天数/全关天，目标功率口径）
-        q_br["split_stats"] = {
-            k: series_daily_stats(pd.Series(splits[k][1][:, 0], index=splits[k][2]),
-                                  float(user_cfg["on_thr_w"]))
-            for k in ("train", "val", "test") if split_sizes.get(k, 0) > 0}
+        # —— 双达标天清洗后统计：总/全关/训练/验证/测试天数 + 每天明细（全关/阈值/所属集）
+        q_detail = qualified_days_detail(
+            daily_q, target, float(user_cfg["on_thr_w"]),
+            split_index={k: splits[k][2] for k in ("train", "val", "test")
+                         if split_sizes.get(k, 0) > 0})
+        q_detail.to_csv(out / "qualified_days_detail.csv", index=False, encoding="utf-8")
+        q_br["qualified_days_stats"] = qualified_days_summary(q_detail)
+        advice = advice + split_coverage_advice(q_detail)
+        _dump(out / "quality_advice.json", {"advice": advice})
         write_quality_html(out / "data_quality_report.html", [q_bus, q_br],
-                           daily_quality=daily_q, advice=advice)  # 重写含切分统计
+                           daily_quality=daily_q, advice=advice,
+                           qualified_detail=q_detail)  # 重写含双达标统计
 
         # Scaler 只由 Train 拟合（§11）；日历列不缩放
         scale_cols = [i for i, c in enumerate(names) if c not in NON_SCALED_COLS]
@@ -490,13 +496,22 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     have.to_numpy()[:, None], pred_on_have.to_numpy()[:, None],
                     metric_names, on_thr_w=float(user_cfg["on_thr_w"]))
                 _dump(out / "offline_metrics.json", offline_metrics)
-                # 质量报告补充推理评估段切分级统计（目标功率口径）
+                # 质量报告补充双达标天明细（推理评估段=推理集）
                 if infer_quality is not None:
-                    infer_quality["branch"]["split_stats"] = {
-                        "infer": series_daily_stats(have, float(user_cfg["on_thr_w"]))}
+                    infer_days = set(have.index.normalize().strftime("%Y-%m-%d"))
+                    q_detail_i = qualified_days_detail(
+                        daily_q_i, t, float(user_cfg["on_thr_w"]),
+                        infer_days=infer_days)
+                    q_detail_i.to_csv(out / "qualified_days_detail.csv",
+                                      index=False, encoding="utf-8")
+                    infer_quality["branch"]["qualified_days_stats"] = \
+                        qualified_days_summary(q_detail_i)
+                    advice_i = advice_i + split_coverage_advice(q_detail_i)
+                    _dump(out / "quality_advice.json", {"advice": advice_i})
                     write_quality_html(out / "data_quality_report.html",
                                        [infer_quality["bus"], infer_quality["branch"]],
-                                       daily_quality=daily_q_i, advice=advice_i)
+                                       daily_quality=daily_q_i, advice=advice_i,
+                                       qualified_detail=q_detail_i)
                 # 日级离线指标 CSV（model × date 行 × 指标列）
                 daily = evaluate_daily(have.to_numpy()[:, None],
                                        pred_on_have.to_numpy()[:, None],

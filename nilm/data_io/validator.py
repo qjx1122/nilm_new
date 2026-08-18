@@ -161,8 +161,67 @@ def daily_quality_table(bus: pd.DataFrame, branch: pd.DataFrame,
                                        "score_threshold", "qualified"])
 
 
+def qualified_days_detail(daily_quality: pd.DataFrame, target: pd.Series,
+                          on_thr_w: float,
+                          split_index: dict[str, "pd.DatetimeIndex"] | None = None,
+                          infer_days: set | None = None) -> pd.DataFrame:
+    """双达标天明细表：每天是否全关日、全关阈值、所属数据集。
+
+    - 只针对总线与分路**同时达标**（qualified=1）的天；
+    - all_off：该日目标功率日峰值 < on_thr_w（有有效数据的前提下）；
+    - dataset：该日样本所属数据集——训练集/验证集/测试集（按切分索引归属，
+      一天样本可能跨多个切分时并列显示）/ 推理集（infer_days）/ 未使用
+      （质量合格但样本构建阶段被剔除，如特征 NaN / 窗口不足 / 时间过滤）。
+    返回列：date / all_off / on_thr_w / dataset。
+    """
+    ok = daily_quality[daily_quality["qualified"] == 1]
+    if ok.empty:
+        return pd.DataFrame(columns=["date", "all_off", "on_thr_w", "dataset"])
+    # 全关判定：目标功率日峰值
+    t = pd.Series(target).dropna()
+    day_max = t.groupby(t.index.normalize()).max() if len(t) else pd.Series(dtype=float)
+    day_max.index = day_max.index.strftime("%Y-%m-%d")
+    # 切分归属：date -> [数据集名]
+    name_map = {"train": "训练集", "val": "验证集", "test": "测试集"}
+    day_sets: dict[str, list[str]] = {}
+    for split, idx in (split_index or {}).items():
+        for d in set(pd.DatetimeIndex(idx).strftime("%Y-%m-%d")):
+            day_sets.setdefault(d, []).append(name_map.get(split, split))
+    for d in (infer_days or set()):
+        day_sets.setdefault(str(d), []).append("推理集")
+
+    rows = []
+    for date in ok["date"]:
+        mx = day_max.get(date)
+        all_off = int(mx is not None and not pd.isna(mx) and mx < float(on_thr_w))
+        ds = "/".join(sorted(set(day_sets.get(date, [])))) or "未使用"
+        rows.append({"date": date, "all_off": all_off,
+                     "on_thr_w": float(on_thr_w), "dataset": ds})
+    return pd.DataFrame(rows, columns=["date", "all_off", "on_thr_w", "dataset"])
+
+
+def qualified_days_summary(detail: pd.DataFrame) -> dict:
+    """双达标天汇总：总天数/全关天数量/训练集/验证集/测试集天数（含推理集）。"""
+    if detail is None or detail.empty:
+        return {"total_days": 0, "all_off_days": 0, "train_days": 0,
+                "val_days": 0, "test_days": 0, "infer_days": 0, "unused_days": 0}
+    ds = detail["dataset"].astype(str)
+    return {
+        "total_days": int(len(detail)),
+        "all_off_days": int((detail["all_off"] == 1).sum()),
+        "train_days": int(ds.str.contains("训练集").sum()),
+        "val_days": int(ds.str.contains("验证集").sum()),
+        "test_days": int(ds.str.contains("测试集").sum()),
+        "infer_days": int(ds.str.contains("推理集").sum()),
+        "unused_days": int((ds == "未使用").sum()),
+    }
+
+
 def quality_advice(daily: pd.DataFrame, min_days: float = 3.0) -> list[str]:
-    """基于逐天质量表生成训练数据集划分与模型训练建议（规则式，供报告呈现）。"""
+    """基于逐天质量表生成训练数据集划分与模型训练建议（规则式，供报告呈现）。
+
+    daily 若含 all_off / dataset 列（双达标天明细），追加切分覆盖性建议。
+    """
     tips: list[str] = []
     if daily.empty:
         return ["无逐天质量数据，无法给出建议"]
@@ -205,6 +264,42 @@ def quality_advice(daily: pd.DataFrame, min_days: float = 3.0) -> list[str]:
     if len(lo_branch) > n * 0.2:
         tips.append("分路质量显著低于总线（>20 分差的天超 20%）：标签侧是短板，"
                     "训练前重点核查分路采集；评估结论对标签缺口敏感")
+    return tips
+
+
+def split_coverage_advice(detail: pd.DataFrame) -> list[str]:
+    """基于双达标天明细（all_off/dataset）的切分覆盖性建议。"""
+    tips: list[str] = []
+    if detail is None or detail.empty:
+        return tips
+    s = qualified_days_summary(detail)
+    tips.append(f"双达标天 {s['total_days']} 天中：全关天 {s['all_off_days']} 天、"
+                f"训练集 {s['train_days']} / 验证集 {s['val_days']} / "
+                f"测试集 {s['test_days']} 天"
+                + (f"、推理集 {s['infer_days']} 天" if s['infer_days'] else "")
+                + (f"、未使用 {s['unused_days']} 天" if s['unused_days'] else ""))
+    # 全关天在各集的覆盖：训练集缺全关天 → 模型学不到停机模式（2842 教训）
+    off = detail[detail["all_off"] == 1]
+    if len(off):
+        off_train = int(off["dataset"].str.contains("训练集").sum())
+        off_test = int(off["dataset"].str.contains("测试集").sum())
+        if s["train_days"] and off_train == 0:
+            tips.append("训练集不含任何全关天：模型无法学习停机模式，"
+                        "预计全关天将整段误报——建议调整切分锚点或对全关天过采样")
+        elif s["train_days"]:
+            tips.append(f"训练集含全关天 {off_train} 天"
+                        f"（占训练天 {off_train / max(s['train_days'],1):.0%}）；"
+                        "若 <15% 建议全关天样本加权（3~5 倍）强化停机模式学习")
+        if s["test_days"] and off_test == 0:
+            tips.append("测试集不含全关天：F1/SAE 结论未覆盖停机场景，"
+                        "指标可能偏乐观")
+    else:
+        tips.append("双达标天中无全关天：无法评估停机辨识能力；"
+                    "如业务存在停机场景，建议扩数据窗覆盖")
+    if s["unused_days"] > s["total_days"] * 0.2:
+        tips.append(f"未使用天占比 {s['unused_days']}/{s['total_days']}：质量合格但"
+                    "未进入任何数据集（时间过滤排除或特征构建剔除），"
+                    "如需更多样本可放宽 time_filters 的 include 范围")
     return tips
 
 
@@ -280,9 +375,11 @@ def write_schema_report(path: str | Path, bus_report: dict, branch_report: dict,
 
 def write_quality_html(path: str | Path, reports: list[dict],
                        daily_quality: pd.DataFrame | None = None,
-                       advice: list[str] | None = None) -> Path:
+                       advice: list[str] | None = None,
+                       qualified_detail: pd.DataFrame | None = None) -> Path:
     """data_quality_report.html（§4 输出物）：质量简表 + 双达标统计 +
-    逐天质量表（总线/分路得分、阈值、当天是否合格）+ 清洗后统计 + 训练建议。"""
+    逐天质量表 + 双达标天清洗后统计（总/全关/训练/验证/测试天数）+
+    双达标天每天明细（全关日/阈值/所属数据集）+ 训练建议。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = "\n".join(
@@ -310,20 +407,40 @@ def write_quality_html(path: str | Path, reports: list[dict],
                      f"<p>{listing}</p>")
         return "\n".join(parts)
 
-    cleaned_rows, off_sections = [], []
-    for r in reports:
-        cs = r.get("cleaned_stats")
-        if not cs:
-            continue
-        cleaned_rows.append(_stat_row(r["kind"], cs))
-        off_sections.append(_list_section(r["kind"], cs))
-        # 切分级统计（train/val/test 或 infer，split_stats 键存在才渲染）
-        for split, ss in (r.get("split_stats") or {}).items():
-            cleaned_rows.append(_stat_row(f"{r['kind']}·{split}", ss))
-            off_sections.append(_list_section(f"{r['kind']}·{split}", ss))
+    # —— 清洗后数据统计（双达标口径优先）：总/全关/训练/验证/测试天数 + 每天明细
     cleaned_html = ""
-    if cleaned_rows:
+    if qualified_detail is not None and len(qualified_detail):
+        s = qualified_days_summary(qualified_detail)
+        detail_rows = "\n".join(
+            f"<tr{' style=background:#eef' if r.all_off else ''}>"
+            f"<td>{r.date}</td><td>{'是' if r.all_off else '否'}</td>"
+            f"<td>{r.on_thr_w}</td><td>{r.dataset}</td></tr>"
+            for r in qualified_detail.itertuples())
         cleaned_html = f"""
+<h2>清洗后数据统计（总线与分路同时达标的天）</h2>
+<table><tr><th>总天数</th><th>全关天数量</th><th>训练集天数</th>
+<th>验证集天数</th><th>测试集天数</th><th>推理集天数</th><th>未使用天数</th></tr>
+<tr><td>{s['total_days']}</td><td>{s['all_off_days']}</td><td>{s['train_days']}</td>
+<td>{s['val_days']}</td><td>{s['test_days']}</td><td>{s['infer_days']}</td>
+<td>{s['unused_days']}</td></tr>
+</table>
+<h2>双达标天每天数据详细情况</h2>
+<table><tr><th>日期</th><th>是否为全关日</th><th>全关日阈值(W)</th><th>所属数据集</th></tr>
+{detail_rows}
+</table>"""
+    else:  # 兼容旧口径：无双达标明细时按 cleaned_stats 渲染
+        cleaned_rows, off_sections = [], []
+        for r in reports:
+            cs = r.get("cleaned_stats")
+            if not cs:
+                continue
+            cleaned_rows.append(_stat_row(r["kind"], cs))
+            off_sections.append(_list_section(r["kind"], cs))
+            for split, ss in (r.get("split_stats") or {}).items():
+                cleaned_rows.append(_stat_row(f"{r['kind']}·{split}", ss))
+                off_sections.append(_list_section(f"{r['kind']}·{split}", ss))
+        if cleaned_rows:
+            cleaned_html = f"""
 <h2>清洗后数据统计</h2>
 <table><tr><th>数据集</th><th>总天数</th><th>实际天数</th><th>全天缺失天</th><th>全关天数量</th></tr>
 {chr(10).join(cleaned_rows)}

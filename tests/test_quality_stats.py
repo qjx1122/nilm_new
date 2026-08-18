@@ -240,3 +240,85 @@ def test_quality_html_daily_table_and_advice(tmp_path):
     # 不传 daily/advice 时不渲染（向后兼容）
     html2 = write_quality_html(tmp_path / "q2.html", [rep]).read_text(encoding="utf-8")
     assert "每天数据质量情况" not in html2
+
+
+def test_qualified_days_detail_and_summary():
+    """双达标天明细：全关判定/所属数据集归属/汇总一致性。"""
+    from nilm.data_io.validator import (qualified_days_detail,
+                                        qualified_days_summary)
+
+    dq = pd.DataFrame([
+        {"date": "2026-01-01", "qualified": 1},   # 开机日 → 训练集
+        {"date": "2026-01-02", "qualified": 1},   # 全关日 → 验证集
+        {"date": "2026-01-03", "qualified": 1},   # 开机日 → 测试集
+        {"date": "2026-01-04", "qualified": 0},   # 不达标 → 不进明细
+        {"date": "2026-01-05", "qualified": 1},   # 合格但未使用
+    ])
+    idx = pd.date_range("2026-01-01", periods=96 * 5, freq="15min")
+    vals = np.concatenate([np.full(96, 100.0), np.full(96, 3.0),
+                           np.full(96, 100.0), np.full(96, 100.0),
+                           np.full(96, 100.0)])
+    target = pd.Series(vals, index=idx)
+    si = {"train": idx[:96], "val": idx[96:192], "test": idx[192:288]}
+    d = qualified_days_detail(dq, target, on_thr_w=10.0, split_index=si)
+    assert list(d.columns) == ["date", "all_off", "on_thr_w", "dataset"]
+    assert list(d["date"]) == ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-05"]
+    assert list(d["all_off"]) == [0, 1, 0, 0]
+    assert (d["on_thr_w"] == 10.0).all()
+    assert list(d["dataset"]) == ["训练集", "验证集", "测试集", "未使用"]
+    s = qualified_days_summary(d)
+    assert s == {"total_days": 4, "all_off_days": 1, "train_days": 1,
+                 "val_days": 1, "test_days": 1, "infer_days": 0, "unused_days": 1}
+
+
+def test_qualified_days_detail_infer_days():
+    from nilm.data_io.validator import qualified_days_detail
+
+    dq = pd.DataFrame([{"date": "2026-01-01", "qualified": 1}])
+    idx = pd.date_range("2026-01-01", periods=96, freq="15min")
+    target = pd.Series(np.full(96, 100.0), index=idx)
+    d = qualified_days_detail(dq, target, 10.0, infer_days={"2026-01-01"})
+    assert d.iloc[0]["dataset"] == "推理集"
+
+
+def test_split_coverage_advice_rules():
+    """切分覆盖建议：训练集无全关天/含全关天两分支。"""
+    from nilm.data_io.validator import split_coverage_advice
+
+    d1 = pd.DataFrame([
+        {"date": "2026-01-01", "all_off": 0, "on_thr_w": 10.0, "dataset": "训练集"},
+        {"date": "2026-01-02", "all_off": 1, "on_thr_w": 10.0, "dataset": "测试集"},
+    ])
+    t1 = "\n".join(split_coverage_advice(d1))
+    assert "训练集不含任何全关天" in t1
+    d2 = pd.DataFrame([
+        {"date": "2026-01-01", "all_off": 1, "on_thr_w": 10.0, "dataset": "训练集"},
+        {"date": "2026-01-02", "all_off": 0, "on_thr_w": 10.0, "dataset": "训练集"},
+        {"date": "2026-01-03", "all_off": 0, "on_thr_w": 10.0, "dataset": "测试集"},
+    ])
+    t2 = "\n".join(split_coverage_advice(d2))
+    assert "训练集含全关天 1 天" in t2
+    assert "测试集不含全关天" in t2
+
+
+def test_quality_html_qualified_detail_section(tmp_path):
+    """HTML 渲染双达标口径统计表与每天明细表。"""
+    from nilm.data_io.validator import qualified_days_detail
+
+    dq = pd.DataFrame([{"date": "2026-01-01", "qualified": 1},
+                       {"date": "2026-01-02", "qualified": 1}])
+    idx = pd.date_range("2026-01-01", periods=192, freq="15min")
+    target = pd.Series(np.concatenate([np.full(96, 100.0), np.zeros(96)]), index=idx)
+    detail = qualified_days_detail(dq, target, 10.0,
+                                   split_index={"train": idx[:96]})
+    rep = quality_report(pd.DataFrame({"pa": target}), "bus", 96, on_thr_w=10.0)
+    html = write_quality_html(tmp_path / "q.html", [rep],
+                              qualified_detail=detail).read_text(encoding="utf-8")
+    assert "清洗后数据统计（总线与分路同时达标的天）" in html
+    assert "训练集天数" in html and "验证集天数" in html and "测试集天数" in html
+    assert "双达标天每天数据详细情况" in html
+    assert "是否为全关日" in html and "全关日阈值(W)" in html and "所属数据集" in html
+    # 未传 qualified_detail 时回退旧 cleaned_stats 渲染（向后兼容）
+    html2 = write_quality_html(tmp_path / "q2.html", [rep]).read_text(encoding="utf-8")
+    assert "双达标天每天数据详细情况" not in html2
+    assert "清洗后数据统计" in html2

@@ -84,16 +84,21 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
         cs = meta_q[kind]["cleaned_stats"]
         assert cs["total_days"] > 0
         assert cs["all_off_days"] == len(cs["all_off_dates"])
-    # branch 报告=有效通道（目标通道）口径 + 训练切分级统计（目标功率口径）
+    # branch 报告=有效通道（目标通道）口径 + 双达标天统计（总/全关/训练/验证/测试）
     assert meta_q["branch"]["target_cols"]                 # 记录了配置目标分路
-    ss = meta_q["branch"]["split_stats"]
-    assert set(ss) == {"train", "val", "test"}
-    for k in ("train", "val", "test"):
-        assert ss[k]["total_days"] > 0
-        assert ss[k]["all_off_days"] == len(ss[k]["all_off_dates"])
+    qs = meta_q["branch"]["qualified_days_stats"]
+    assert qs["total_days"] > 0
+    assert qs["train_days"] > 0 and qs["val_days"] > 0 and qs["test_days"] > 0
     html = (train_dir / "data_quality_report.html").read_text(encoding="utf-8")
-    assert "清洗后数据统计" in html
-    assert "branch·train" in html and "branch·test" in html
+    assert "清洗后数据统计（总线与分路同时达标的天）" in html
+    assert "双达标天每天数据详细情况" in html
+    assert "是否为全关日" in html and "全关日阈值" in html and "所属数据集" in html
+    # 明细 CSV：列结构 + 汇总一致性
+    qd = pd.read_csv(train_dir / "qualified_days_detail.csv")
+    assert list(qd.columns) == ["date", "all_off", "on_thr_w", "dataset"]
+    assert len(qd) == qs["total_days"]
+    assert int((qd["all_off"] == 1).sum()) == qs["all_off_days"]
+    assert qd["dataset"].str.contains("训练集").sum() == qs["train_days"]
     # 逐天质量表 + 双达标统计 + 建议（新增产物与 HTML 段）
     assert "每天数据质量情况" in html and "同时达标天数" in html
     assert "训练数据集划分与模型训练建议" in html
@@ -116,9 +121,12 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
     meta_i = json.loads((infer_dir2 / "meta.json").read_text(encoding="utf-8"))
     qi = meta_i["quality"]
     assert qi["bus"]["cleaned_stats"]["total_days"] > 0
-    assert qi["branch"]["split_stats"]["infer"]["total_days"] > 0
+    assert qi["branch"]["qualified_days_stats"]["infer_days"] > 0
     html_i = (infer_dir2 / "data_quality_report.html").read_text(encoding="utf-8")
-    assert "清洗后数据统计" in html_i and "branch·infer" in html_i
+    assert "清洗后数据统计（总线与分路同时达标的天）" in html_i
+    assert "推理集" in html_i
+    qd_i = pd.read_csv(infer_dir2 / "qualified_days_detail.csv")
+    assert (qd_i["dataset"].str.contains("推理集")).any()
     sessions_i = pd.read_csv(infer_dir2 / "branch_sessions.csv")
     assert set(sessions_i["branch"].unique()) <= set(tcols)
     cleaned_br_i = pd.read_csv(infer_dir2 / "cleaned" / "branch_cleaned.csv")
