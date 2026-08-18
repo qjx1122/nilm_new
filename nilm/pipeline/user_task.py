@@ -286,6 +286,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         # —— 多模型训练与三阶段（train/val/test）评估（模块解耦：只经注册表接口）
         metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
         on_thr = float(user_cfg["on_thr_w"])
+        dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
         pbus_col = names.index("pbus")
         results: dict[str, dict] = {}          # {model: test 指标}（选型口径不变）
         results_by_split: dict[str, dict] = {}  # {model: {split: 指标}} 三阶段全量
@@ -294,7 +295,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         pred_frames: dict[str, pd.DataFrame] = {  # 训练预测结果落盘（真实值+各模型预测）
             s: pd.DataFrame({"timestamp": splits[s][2]
                              .strftime("%Y-%m-%d %H:%M:%S"),
-                             "split": s, "target": splits[s][1][:, 0]})
+                             "split": s, "target": splits[s][1][:, 0],
+                             # 真实状态：真值按 on_thr_w 二值化（与推理 target_state 同口径）
+                             "target_state": (splits[s][1][:, 0] >= on_thr).astype(int)})
             for s in ("train", "val", "test") if split_sizes.get(s, 0) > 0}
         best = None
         for spec in base_cfg.get("models", []):
@@ -323,6 +326,11 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
                          {m: round(v["macro"], 4) for m, v in metrics.items()})
                 pred_frames[split][f"pred_{name}"] = y_hat[:, 0]
+                # 预测状态：生产判决链口径（decision_thr_w + 游程后处理），
+                # 与推理 pred_state / state_strategy 的 decision+runs 行一致
+                pred_frames[split][f"pred_state_{name}"] = postprocess_state(
+                    y_hat[:, 0], dec_thr, int(user_cfg["post_min_on"]),
+                    int(user_cfg["post_fill_short_off"])).astype(int)
                 if split == "test":
                     test_preds[name] = y_hat[:, 0]
             results[name] = results_by_split[name]["test"]  # 选型口径：test（不变）
@@ -349,7 +357,6 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                  user_key, pred_csv, len(pred_out), len(test_preds))
 
         # —— 状态策略评估（test）：决策阈值 + 游程后处理下的 F1（全量 / 仅开机日两口径）
-        dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
         strat_rows = []
         y_test = splits["test"][1][:, 0]
         idx_test = splits["test"][2]

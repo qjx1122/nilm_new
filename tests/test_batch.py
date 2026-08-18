@@ -448,20 +448,24 @@ def test_train_predictions_artifact(tmp_path, base_cfg_file, time_filter_file):
     assert pf.exists()
     df = pd.read_csv(pf)
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
-    # 列契约：timestamp/split/target + pred_<model>
-    assert {"timestamp", "split", "target"} <= set(df.columns)
+    # 列契约：timestamp/split/target/target_state + pred_<model>/pred_state_<model>
+    assert {"timestamp", "split", "target", "target_state"} <= set(df.columns)
     for m in meta["models"]:
         assert f"pred_{m}" in df.columns, m
+        assert f"pred_state_{m}" in df.columns, m
     # 行数 = 三切分样本数之和；split 取值合法
     assert len(df) == sum(meta["split_sizes"].values())
     assert set(df["split"].unique()) <= {"train", "val", "test"}
     for s, n in meta["split_sizes"].items():
         assert int((df["split"] == s).sum()) == n, s
-    # 真实值与预测值均无空、预测非负（clip 约束）
+    # 真实值与预测值均无空、预测非负（clip 约束）；状态为 0/1
     assert df["target"].notna().all()
+    thr = meta["on_thr_w"]
+    assert (df["target_state"] == (df["target"] >= thr).astype(int)).all()
     for m in meta["models"]:
         assert df[f"pred_{m}"].notna().all()
         assert (df[f"pred_{m}"] >= 0).all()
+        assert set(df[f"pred_state_{m}"].unique()) <= {0, 1}
     # 时间有序
     assert pd.to_datetime(df["timestamp"]).is_monotonic_increasing
 

@@ -491,3 +491,14 @@
 - 关键决策：方案 B 选型依据入 STATUS；proportional F1 上限受模型本性限制（底载放大误报），不再投入调优
 - 未决问题：全量 5 户重跑刷新 best_model
 - 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 40 次）
+- 目标：训练预测结果增加预测状态与真实状态
+- 完成项：
+  - train_predictions.csv 扩列：target_state（真值按 on_thr_w 二值化，与推理同口径）+ pred_state_<model>（生产判决链口径：decision_thr_w+post_min_on/fill 游程后处理，与推理 pred_state / state_strategy decision+runs 行一致）
+  - dec_thr 计算前移复用（消重复定义）；测试断言扩展（target_state 一致性/pred_state∈{0,1}），163 项全过
+  - 2842 实测：10 列产物；由 pred_state_ridge/target_state 重算 test F1=0.8812 TP/FP/FN=831/200/24 与 state_strategy decision+runs 行精确对账 ✅；关机时段样例直观展示 ridge 判 0/proportional 误判 1 的差异
+  - README 输出产物说明更新
+- 关键决策：预测状态选生产判决链口径（非 raw 口径）——与推理产物/策略评估一致，三产物可互查；真实状态用 on_thr_w（业务口径）
+- 未决问题：无
+- 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new

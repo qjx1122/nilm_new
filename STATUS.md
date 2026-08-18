@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：train_predictions.csv 增加 target_state（真实状态）与 pred_state_<model>（预测状态，生产判决链口径）
 - ✅ 已完成：proportional F1 全 0 根因修复（pbus 移出缩放列）——test MAE 173.7/F1 0.596 复活，其他模型无回归
 - ✅ 已完成：训练阶段预测结果落盘 predictions/train_predictions.csv（timestamp/split/真实值+各模型预测列）
 - ✅ 已完成：三份评估产物口径差异审计——主因设计口径不同（模型能力 vs 生产判决链）；修复 precision 空真不一致；增加 raw 对照行跨产物对账
