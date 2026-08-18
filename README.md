@@ -77,6 +77,8 @@ outputs/
     │   │                                     #   preprocess.save_cleaned_csv: false 可关闭）
     │   ├── metrics_by_split.csv              # 每模型 train/val/test 三阶段指标汇总
     │   ├── metrics_daily.csv                 # 每模型×每阶段×每天 日级指标
+    │   ├── predictions/train_predictions.csv # 训练预测结果：timestamp/split/target(真实值)
+    │   │                                     #   + pred_<model> 各模型预测列（时间有序）
     │   ├── branch_sessions.csv               # 分路开机分析：逐分路逐天开机段（起止/时长/
     │   │                                     #   最小/平均/峰值功率/电量kWh/状态；整天关机
     │   │                                     #   输出整天一行 state=0）

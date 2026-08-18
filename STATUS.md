@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：训练阶段预测结果落盘 predictions/train_predictions.csv（timestamp/split/真实值+各模型预测列）
 - ✅ 已完成：三份评估产物口径差异审计——主因设计口径不同（模型能力 vs 生产判决链）；修复 precision 空真不一致；增加 raw 对照行跨产物对账
 - ✅ 已完成：2842 优化方案 1+2 落地——decision_thr_w 配置字段+state_strategy_metrics.csv 两口径产出；推理 F1 0.908→0.981，开机日口径 0.982 达标
 - ✅ 已完成：min_score 70 + 2842 排除不达标天重验——推理 F1=0 天消失；开机日口径+后处理 F1 可达 0.982（>0.95）

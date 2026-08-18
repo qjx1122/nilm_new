@@ -287,6 +287,11 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         results_by_split: dict[str, dict] = {}  # {model: {split: 指标}} 三阶段全量
         daily_rows: list[pd.DataFrame] = []     # 每模型×每阶段×每天 指标
         test_preds: dict[str, np.ndarray] = {}  # {model: test 段预测}（状态策略评估用）
+        pred_frames: dict[str, pd.DataFrame] = {  # 训练预测结果落盘（真实值+各模型预测）
+            s: pd.DataFrame({"timestamp": splits[s][2]
+                             .strftime("%Y-%m-%d %H:%M:%S"),
+                             "split": s, "target": splits[s][1][:, 0]})
+            for s in ("train", "val", "test") if split_sizes.get(s, 0) > 0}
         best = None
         for spec in base_cfg.get("models", []):
             name, params = spec["name"], spec.get("params", {})
@@ -313,6 +318,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 daily_rows.append(daily)
                 log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
                          {m: round(v["macro"], 4) for m, v in metrics.items()})
+                pred_frames[split][f"pred_{name}"] = y_hat[:, 0]
                 if split == "test":
                     test_preds[name] = y_hat[:, 0]
             results[name] = results_by_split[name]["test"]  # 选型口径：test（不变）
@@ -327,6 +333,16 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         # 日级指标 CSV：model × split × date 行 × 指标列
         pd.concat(daily_rows, ignore_index=True).to_csv(
             out / "metrics_daily.csv", index=False, encoding="utf-8")
+
+        # 训练阶段预测结果 CSV：timestamp/split/target(真实值) + 各模型预测列
+        # （§2.3 同域产物：predictions/train_predictions.csv，按时间排序便于画图比对）
+        pred_out = pd.concat(pred_frames.values(), ignore_index=True)
+        pred_out = pred_out.sort_values("timestamp").reset_index(drop=True)
+        pred_csv = out / "predictions" / "train_predictions.csv"
+        pred_csv.parent.mkdir(parents=True, exist_ok=True)
+        pred_out.round(3).to_csv(pred_csv, index=False, encoding="utf-8")
+        log.info("[%s] 训练预测结果已保存: %s（%d 行 × %d 模型）",
+                 user_key, pred_csv, len(pred_out), len(test_preds))
 
         # —— 状态策略评估（test）：决策阈值 + 游程后处理下的 F1（全量 / 仅开机日两口径）
         dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)

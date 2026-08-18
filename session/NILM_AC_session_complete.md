@@ -470,3 +470,13 @@
 - 关键决策：双口径设计定型并文档化；空真约定教训入 STATUS
 - 未决问题：无
 - 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 38 次）
+- 目标：训练阶段输出预测结果（预测值+真实值）
+- 完成项：
+  - user_task 训练循环收集三切分各模型预测，落盘 predictions/train_predictions.csv——列：timestamp/split/target(真实值)+pred_<model>（宽表、时间有序、round(3)）
+  - README 输出产物章节更新；新增 1 项端到端测试（列契约/行数=切分之和/非负/时间有序），162 项全过
+  - 2842 实测验证：10203 行（6098/2092/2013）×3 模型列；由该 CSV 重算 ridge test TP/FP/FN=837/507/18 与 metrics_by_split 逐值对账 ✅
+- 关键决策：宽表设计（一行一个时间点、各模型并列）便于直接画预测-真值对比曲线；放 predictions/ 子目录与推理产物同域
+- 未决问题：无
+- 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new
