@@ -382,8 +382,15 @@ def test_infer_without_train_gives_model_not_found(tmp_path, base_cfg_file, time
     assert r["status"] == Status.MODEL_NOT_FOUND     # §13：不得借用他人模型
 
 
-def test_state_strategy_metrics_and_decision_thr(tmp_path, base_cfg_file, tmp_path_factory):
-    """decision_thr_w + 状态策略评估产物：两口径（all_days/on_days_only）齐备。"""
+def test_state_strategy_metrics_and_decision_thr(tmp_path, base_cfg, tmp_path_factory):
+    """decision_thr_w + 状态策略评估产物：两策略×两口径齐备，raw 行与 by_split 对账。"""
+    import yaml
+
+    base_cfg["metrics"] = ["mae", "r2", "f1", "precision", "recall",
+                           "tp", "fp", "fn", "tn"]
+    cfg_file = tmp_path / "base_cls.yaml"
+    cfg_file.write_text(yaml.safe_dump(base_cfg, allow_unicode=True,
+                                       sort_keys=False), encoding="utf-8")
     cfg = {
         USER_KEY: {"target_col": "p1", "split_ratios": [0.7, 0.15, 0.15],
                    "split_strategy": "time", "on_thr_w": 10.0,
@@ -397,7 +404,7 @@ def test_state_strategy_metrics_and_decision_thr(tmp_path, base_cfg_file, tmp_pa
     write_user_dir(data_root, USER_KEY, days=21)
     write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
     out_root = tmp_path / "outputs"
-    info = run_batch(tf, base_config_path=base_cfg_file, data_root=data_root,
+    info = run_batch(tf, base_config_path=cfg_file, data_root=data_root,
                      output_root=out_root, stages=("train", "infer"),
                      user_keys=[USER_KEY])
     table = pd.read_csv(info["status_csv"])
@@ -405,13 +412,24 @@ def test_state_strategy_metrics_and_decision_thr(tmp_path, base_cfg_file, tmp_pa
 
     train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
     sm = pd.read_csv(train_dir / "state_strategy_metrics.csv")
-    assert {"model", "scope", "decision_thr_w", "post_min_on", "f1",
+    assert {"model", "strategy", "scope", "decision_thr_w", "post_min_on", "f1",
             "precision", "recall", "tp", "fp", "fn"} <= set(sm.columns)
     assert set(sm["scope"].unique()) == {"all_days", "on_days_only"}
-    assert (sm["decision_thr_w"] == 20.0).all()
-    assert (sm["post_min_on"] == 4).all()
+    assert set(sm["strategy"].unique()) == {"raw_on_thr", "decision+runs"}
+    dr = sm[sm.strategy == "decision+runs"]
+    assert (dr["decision_thr_w"] == 20.0).all()
+    assert (dr["post_min_on"] == 4).all()
+    # raw_on_thr 对照行 = metrics_by_split test 同口径（跨产物对账）
+    bs = pd.read_csv(train_dir / "metrics_by_split.csv")
+    for m in sm["model"].unique():
+        raw = sm[(sm.model == m) & (sm.strategy == "raw_on_thr") &
+                 (sm.scope == "all_days")].iloc[0]
+        ref = bs[(bs.model == m) & (bs.split == "test")].iloc[0]
+        assert raw["tp"] == ref["tp"] and raw["fp"] == ref["fp"] \
+            and raw["fn"] == ref["fn"], m
+        assert abs(raw["f1"] - ref["f1"]) < 1e-3, m
     # 开机日口径的 F1 ≥ 全量口径（去掉全关天只会减 FP）
     for m in sm["model"].unique():
-        f_all = sm[(sm.model == m) & (sm.scope == "all_days")]["f1"].iloc[0]
-        f_on = sm[(sm.model == m) & (sm.scope == "on_days_only")]["f1"].iloc[0]
+        f_all = dr[(dr.model == m) & (dr.scope == "all_days")]["f1"].iloc[0]
+        f_on = dr[(dr.model == m) & (dr.scope == "on_days_only")]["f1"].iloc[0]
         assert f_on >= f_all - 1e-9

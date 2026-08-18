@@ -336,23 +336,29 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         t_on_test = y_test >= on_thr
         day_on = pd.Series(t_on_test, index=idx_test).groupby(
             idx_test.normalize()).transform("max").to_numpy()
+        # 三条策略：raw = 与 metrics_by_split 同口径的对照行（on_thr_w 判决、无游程），
+        # 便于跨产物对账；decision+runs = 生产判决链（decision_thr_w + min_on/fill）
+        strategies = [("raw_on_thr", on_thr, 0, 0),
+                      ("decision+runs", dec_thr, int(user_cfg["post_min_on"]),
+                       int(user_cfg["post_fill_short_off"]))]
         for mname, p in test_preds.items():
-            st = postprocess_state(p, dec_thr, int(user_cfg["post_min_on"]),
-                                   int(user_cfg["post_fill_short_off"]))
-            for scope, m in (("all_days", np.ones(len(st), bool)),
-                             ("on_days_only", day_on)):
-                tp = int((st[m] & t_on_test[m]).sum())
-                fp = int((st[m] & ~t_on_test[m]).sum())
-                fn = int((~st[m] & t_on_test[m]).sum())
-                prec = tp / (tp + fp) if tp + fp else 1.0
-                rec = tp / (tp + fn) if tp + fn else 1.0
-                f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
-                strat_rows.append({"model": mname, "scope": scope,
-                                   "decision_thr_w": dec_thr,
-                                   "post_min_on": int(user_cfg["post_min_on"]),
-                                   "post_fill_short_off": int(user_cfg["post_fill_short_off"]),
-                                   "f1": round(f1, 4), "precision": round(prec, 4),
-                                   "recall": round(rec, 4), "tp": tp, "fp": fp, "fn": fn})
+            for strat, thr_, mo_, fo_ in strategies:
+                st = postprocess_state(p, thr_, mo_, fo_)
+                for scope, m in (("all_days", np.ones(len(st), bool)),
+                                 ("on_days_only", day_on)):
+                    tp = int((st[m] & t_on_test[m]).sum())
+                    fp = int((st[m] & ~t_on_test[m]).sum())
+                    fn = int((~st[m] & t_on_test[m]).sum())
+                    # 空真约定与 evaluation.metrics 一致：无开态预测有漏报记 0
+                    prec = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if fn == 0 else 0.0)
+                    rec = tp / (tp + fn) if tp + fn else 1.0
+                    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+                    strat_rows.append({"model": mname, "strategy": strat,
+                                       "scope": scope, "decision_thr_w": thr_,
+                                       "post_min_on": mo_, "post_fill_short_off": fo_,
+                                       "f1": round(f1, 4), "precision": round(prec, 4),
+                                       "recall": round(rec, 4),
+                                       "tp": tp, "fp": fp, "fn": fn})
         pd.DataFrame(strat_rows).to_csv(out / "state_strategy_metrics.csv",
                                         index=False, encoding="utf-8")
 

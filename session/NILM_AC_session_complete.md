@@ -459,3 +459,14 @@
 - 关键决策：decision/on 阈值分离；双口径产物化
 - 未决问题：7-27 数据侧核查；口径协商（0.88 vs 0.98 两数并出）
 - 相关文件/分支：nilm/common/contracts.py、nilm/pipeline/user_task.py、configs/time_filters.json、tests/test_batch.py；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-18] 会话纪要（第 37 次）
+- 目标：分析 metrics_by_split/metrics_daily 与 state_strategy_metrics 指标不一致原因
+- 完成项：
+  - 重放分解定位差异三因素：判决阈值（10 vs 50）、游程后处理（无 vs min_on8）、口径（all vs on_days）——设计使然非缺陷；metrics_daily 与 by_split 同口径（tp/fp/fn 求和相等）
+  - 修复真实缺陷：state_strategy precision 空真约定不一致（有 FN 误记 1.0→0）
+  - state_strategy_metrics.csv 增加 strategy 列（raw_on_thr 对照行 + decision+runs 生产链）；新增跨产物对账测试断言
+  - 161 项测试全过；2842 重跑对账三模型 raw 行与 by_split 逐值相等 ✅
+- 关键决策：双口径设计定型并文档化；空真约定教训入 STATUS
+- 未决问题：无
+- 相关文件/分支：nilm/pipeline/user_task.py、tests/test_batch.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new

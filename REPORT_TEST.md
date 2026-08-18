@@ -323,3 +323,15 @@
   - 全量口径剩余 FP 结构：4 个全关天贡献 FP 257（6-01/12/23/29）——占绝对多数，可辨识性下界结论不变
 - 是否进入 REPORT.md（稳定结论）：建议下轮进入（优化方案实证有效且已配置化）
 - 遗留问题：①7-27 午后 FP 段疑似分路真值漏记（连续 6 点 95~302W 预测但真值 0），建议数据侧核查；②全关天口径正式协商（all_days 0.88 vs on_days 0.98 两个数字并出，由需求方选择考核口径）
+
+## [2026-08-18] 专题：三份评估产物指标不一致分析（by_split/daily vs state_strategy）
+- 类型：验证专题（口径审计）
+- 目标与假设：解释 metrics_by_split.csv / metrics_daily.csv 与 state_strategy_metrics.csv 的 F1 等指标为何不同；排查是否存在真实缺陷
+- 方法 / 数据 / 参数：2842 最新产物三方对比 + 同一份 ridge test 预测重放两条评估链逐步分解（阈值/游程/口径三因素隔离）
+- 结果 / 结论：
+  - **差异主因是设计口径不同（预期行为）**：①metrics_by_split/metrics_daily = 「模型能力口径」——原始预测 ≥ on_thr_w(10W) 直接判态、无后处理（跨模型/跨用户可比，选型口径）；②state_strategy = 「生产判决链口径」——decision_thr_w(50W)+min_on(8)+fill(3) 后处理后的状态（部署效果）。同一预测重放：10W 无后处理 →(0.764,FP 500)；50W→(0.858,FP 250)；+min_on8→(0.881,FP 199)，逐步分解完全复现两份产物差异
+  - **metrics_daily 与 by_split 是同口径**（日级 tp/fp/fn 求和=整段 837/507/18）；日级 F1 简单平均 0.70 低于整段 0.76 属正常（小样本天 F1=0 拉低平均，不可直接比较）
+  - **发现并修复一个真实缺陷**：state_strategy 的 precision 空真约定与 evaluation.metrics 不一致——tp+fp=0 且有 FN 时误记 1.0（proportional 全漏报却显示 precision=1.0），已改为记 0
+  - **改进**：state_strategy_metrics.csv 增加 strategy 列输出两行——raw_on_thr（与 by_split 完全同口径的对照行，测试断言逐值对账）+ decision+runs（生产链）；三份产物从此可直接互查
+- 是否进入 REPORT.md（稳定结论）：口径设计说明建议纳入
+- 遗留问题：无
