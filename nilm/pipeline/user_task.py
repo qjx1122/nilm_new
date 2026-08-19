@@ -297,7 +297,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                              .strftime("%Y-%m-%d %H:%M:%S"),
                              "split": s, "target": splits[s][1][:, 0],
                              # 真实状态：真值按 on_thr_w 二值化（与推理 target_state 同口径）
-                             "target_state": (splits[s][1][:, 0] >= on_thr).astype(int)})
+                             "target_state": (splits[s][1][:, 0] >= on_thr).astype(int),
+                             # 状态判定阈值（口径自描述）：真值判态 / 预测判态
+                             "on_thr_w": on_thr, "decision_thr_w": dec_thr})
             for s in ("train", "val", "test") if split_sizes.get(s, 0) > 0}
         best = None
         for spec in base_cfg.get("models", []):
@@ -322,6 +324,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                                        metric_names, on_thr_w=on_thr)
                 daily.insert(0, "split", split)
                 daily.insert(0, "model", name)
+                # 状态判定阈值自描述：分类指标（f1/tp/fp/fn/tn）真值与预测均按
+                # on_thr_w 判态（模型能力口径，非 pred_state 的判决链口径）
+                daily["state_thr_w"] = on_thr
                 daily_rows.append(daily)
                 log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
                          {m: round(v["macro"], 4) for m, v in metrics.items()})
@@ -335,8 +340,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     test_preds[name] = y_hat[:, 0]
             results[name] = results_by_split[name]["test"]  # 选型口径：test（不变）
 
-        # 三阶段汇总 CSV：model × split 行 × 指标列
-        split_rows = [{"model": mname, "split": s,
+        # 三阶段汇总 CSV：model × split 行 × 指标列（state_thr_w=分类指标判定阈值）
+        split_rows = [{"model": mname, "split": s, "state_thr_w": on_thr,
                        **{m: v["macro"] for m, v in mm.items()}}
                       for mname, by in results_by_split.items()
                       for s, mm in by.items()]
@@ -582,6 +587,8 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                                        have.index, metric_names,
                                        on_thr_w=float(user_cfg["on_thr_w"]))
                 daily.insert(0, "model", model_name)
+                # 状态判定阈值自描述（同训练日级：on_thr_w 口径，非判决链口径）
+                daily["state_thr_w"] = float(user_cfg["on_thr_w"])
                 daily.to_csv(out / "metrics_daily.csv", index=False, encoding="utf-8")
 
         on_thr = float(user_cfg["on_thr_w"])
@@ -604,8 +611,10 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "target_state": pd.array(
                 [int(v) if not np.isnan(v) else None for v in target_state],
                 dtype="Int64"),
+            "on_thr_w": on_thr,          # 真值判态阈值（分类指标同口径）
             "pred": pred,
             "pred_state": pred_state.astype(int),
+            "decision_thr_w": dec_thr,   # 预测判态阈值（判决链口径）
             "pred_prob": np.round(pred_prob, 6),
         })
         df_result[INFER_RESULT_COLUMNS].to_csv(result_csv, index=False)

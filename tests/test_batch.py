@@ -58,9 +58,12 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
     assert result_csv.exists()
     res = pd.read_csv(result_csv)
     assert list(res.columns) == ["timestamp", "user_id", "target", "target_state",
-                                 "pred", "pred_state", "pred_prob"]
+                                 "on_thr_w", "pred", "pred_state",
+                                 "decision_thr_w", "pred_prob"]
     assert (res["user_id"].astype(str) == USER_KEY.split("_")[1]).all()
     assert len(res) > 0
+    # 阈值列自描述：on_thr_w=真值判态；decision_thr_w 缺省=on_thr_w
+    assert res["on_thr_w"].nunique() == 1 and res["decision_thr_w"].nunique() == 1
     # 概率取值域 + 与 on_thr_w 决策边界一致（p>=0.5 ⟺ pred>=thr）
     assert res["pred_prob"].between(0.0, 1.0).all()
     # 状态真值：有 target 处为 0/1，与二值化口径一致
@@ -449,7 +452,32 @@ def test_train_predictions_artifact(tmp_path, base_cfg_file, time_filter_file):
     df = pd.read_csv(pf)
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
     # 列契约：timestamp/split/target/target_state + pred_<model>/pred_state_<model>
-    assert {"timestamp", "split", "target", "target_state"} <= set(df.columns)
+    assert {"timestamp", "split", "target", "target_state",
+            "on_thr_w", "decision_thr_w"} <= set(df.columns)
+    # 阈值一致性：target_state 必须严格等于 target ≥ on_thr_w 列值（同行口径）
+    assert (df["target_state"] == (df["target"] >= df["on_thr_w"]).astype(int)).all()
+    # metrics_daily 的分类指标阈值（state_thr_w）与预测结果的 on_thr_w 一致
+    md = pd.read_csv(train_dir / "metrics_daily.csv")
+    assert "state_thr_w" in md.columns
+    assert set(md["state_thr_w"].unique()) == set(df["on_thr_w"].unique())
+    # 由预测结果按 state_thr_w 重算日级 TP/FP/FN/TN，与 metrics_daily 逐日对账
+    # （基础夹具 metrics 不含混淆计数时跳过；完整对账见 state_strategy 测试）
+    if "tp" in md.columns:
+        meta_chk = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+        m0 = meta_chk["models"][0]
+        thr = float(md["state_thr_w"].iloc[0])
+        df2 = df.copy()
+        df2["date"] = pd.to_datetime(df2["timestamp"]).dt.strftime("%Y-%m-%d")
+        for (day, sp), g in df2.groupby(["date", "split"]):
+            row = md[(md.model == m0) & (md.split == sp) & (md.date == day)]
+            if row.empty:
+                continue
+            p_on = g[f"pred_{m0}"] >= thr
+            t_on = g["target"] >= thr
+            assert int((p_on & t_on).sum()) == int(row["tp"].iloc[0]), (day, sp)
+            assert int((p_on & ~t_on).sum()) == int(row["fp"].iloc[0]), (day, sp)
+            assert int((~p_on & t_on).sum()) == int(row["fn"].iloc[0]), (day, sp)
+            assert int((~p_on & ~t_on).sum()) == int(row["tn"].iloc[0]), (day, sp)
     for m in meta["models"]:
         assert f"pred_{m}" in df.columns, m
         assert f"pred_state_{m}" in df.columns, m

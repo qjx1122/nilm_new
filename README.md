@@ -94,7 +94,8 @@ outputs/
         ├── branch_sessions.csv               # 分路开机分析（同 train，有分路文件时产出）
         ├── metrics_daily.csv                 # 推理离线评估日级指标（有分路真值时产出）
         └── predictions/inference_result.csv  # 输出契约：timestamp,user_id,target,target_state,
-                                              #   pred,pred_state,pred_prob（真值状态与开态概率）
+                                              #   on_thr_w(真值判态阈值),pred,pred_state,
+                                              #   decision_thr_w(预测判态阈值),pred_prob
 ```
 
 ## 代码结构（按功能模块解耦，依赖方向单向）

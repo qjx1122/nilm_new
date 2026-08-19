@@ -535,3 +535,15 @@
 - 关键决策：不再追加代码改动（三层治理已覆盖可治理项）；推理日级生产口径统计扩展待需求确认
 - 未决问题：全关天（不变）；decision_thr 50 的 FN 代价是否回调由需求方定
 - 相关文件/分支：REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-19] 会话纪要（第 44 次）
+- 目标：训练/推理预测结果增加状态判定阈值列；核对日级指标 TP/FP/FN/TN 判定阈值与预测结果阈值一致性
+- 完成项：
+  - inference_result.csv 契约扩列：on_thr_w（真值判态阈值）+decision_thr_w（预测判态阈值），INFER_RESULT_COLUMNS 9 列
+  - train_predictions.csv 同步加两阈值列；metrics_daily（train/infer）与 metrics_by_split 加 state_thr_w 自描述列
+  - 一致性核对（2842）：state_thr_w=10 ≡ on_thr_w=10 ✅（日级分类指标与预测结果真值判态同阈值）；decision_thr_w=50 与之不等属双口径设计（pred_state 判决链，已显式标注防误读）
+  - 逐日全量对账：训练 321 行（3 模型×3 切分×各天）+ 推理 24 天由预测结果按 state_thr_w 重算 TP/FP/FN/TN 与 metrics_daily 全部相等（0 不一致）；新增测试断言（target_state≡target≥on_thr_w 行级一致、state_thr_w 集合相等、日级对账）
+  - 165 项测试全过；README 契约说明更新
+- 关键决策：阈值口径「数据自带」设计（防跨产物误读）；不改变任何计算逻辑（纯自描述增强）
+- 未决问题：无
+- 相关文件/分支：nilm/common/contracts.py、nilm/pipeline/user_task.py、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new

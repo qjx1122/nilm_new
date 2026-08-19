@@ -162,6 +162,10 @@ INFERENCE_RESULT_REL = "predictions/inference_result.csv"   # 最终预测 CSV�
 # 注：日级指标 23 字段清单与启动段字段契约在指南附件中定义；附件未随 PDF 提供，
 #     当前按已知字段实现并记录为「接口待确认项」（指南 §0 同口径处理）。
 # target_state = 状态真值（target 按 on_thr_w 二值化；无分路真值时为空）；
-# pred_prob    = 开态概率（以 on_thr_w 为中心的 sigmoid 伪概率，见 postprocess.state）。
+# pred_prob    = 开态概率（以 decision_thr_w 为中心的 sigmoid 伪概率）。
+# 状态判定阈值列（口径自描述，防跨产物误读）：
+#   on_thr_w       = 真值判态阈值（target_state 与分类指标 F1/TP… 均用它）；
+#   decision_thr_w = 预测判态阈值（pred_state 的判决链：该阈值+游程后处理）。
 INFER_RESULT_COLUMNS = ["timestamp", "user_id", "target", "target_state",
-                        "pred", "pred_state", "pred_prob"]
+                        "on_thr_w", "pred", "pred_state", "decision_thr_w",
+                        "pred_prob"]

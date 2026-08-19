@@ -1,6 +1,7 @@
 # STATUS.md
 
 ## 当前目标
+- ✅ 已完成：预测结果增加状态判定阈值列（on_thr_w/decision_thr_w）+ 日级指标 state_thr_w 自描述；训练 321 行/推理 24 天逐日对账 0 不一致
 - ✅ 已完成：压 FP 调参后 2842 复验——ridge 判决链口径日级达标 15/21（中位 0.980）；raw 口径 B/C 类已被判决链治理，剩余=4 全关天+2 FN 天
 - ✅ 已完成：FP 过多模型侧治理——ridge 加权岭（off_weight=5，FP -23%）+ history_profile 中位画像（FP -83%）；顺带修复 unseen 槽位误回退缺陷
 - ✅ 已完成：train_predictions vs metrics_daily 混淆计数差异审计——同源同预测、判决链不同（值列同阈值重判可逐值对账，无缺陷）
@@ -104,6 +105,7 @@
 5. 部分文件缺 data9/45/81/37/44（三相电压与 B 相电流/PF）：置 0 保证流程可用，但电压特征实际无信息；可评估是否向采集侧补齐这些点位
 
 ## 决策记录 / 踩坑
+- 阈值自描述列设计（2026-08-19）：预测结果带 on_thr_w（真值判态）+decision_thr_w（预测判态）双列；日级/三阶段指标带 state_thr_w（分类指标判定阈值）——三份产物的阈值口径从「读文档才知道」变为「数据自带」；一致性关系：state_thr_w≡on_thr_w（分类指标真值与预测都按它判），与 decision_thr_w 不等属双口径设计（pred_state 判决链）
 - FP 治理三层框架定型（2026-08-18）：模型层（加权岭 off_weight/中位画像 agg=median，压原始 FP）→判决层（decision_thr_w+post_min_on，压生产链 FP）→口径层（on_days_only，处理可辨识性下界）——alpha 正则被实验否定（不改变系统性高估方向）；proportional 保持朴素不调（sanity 基线定位）
 - 【缺陷修复】history_profile unseen 槽位判定曾用 profile==0 代理：中位画像下合法 0 值被误回退 fallback（非零）——显式 _seen 数组修复；教训：布尔状态不得用数值 0 代理
 - proportional 修复选方案 B（pbus 入 NON_SCALED_COLS）而非模型内反标准化：①slot 先例已存在，机制一致；②模型层保持「按列名取物理量」的简单契约，不感知 Scaler；③对缩放敏感的模型（ridge）实证无回归（f1/r2 差异 <0.001）。教训固化：基线模型按列名取物理量的列必须逐一确认不在 scale_cols
