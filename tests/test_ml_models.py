@@ -169,3 +169,39 @@ def test_history_profile_median_agg():
     import pytest
     with pytest.raises(ValueError):
         MODEL_REGISTRY.create("history_profile", agg="p25")
+
+
+def test_history_profile_conditional_pbus_bins():
+    """条件画像 pbus_bins：同槽位低总线桶输出关机值、高总线桶输出开机值——
+    修补无条件画像的『条件缺失』缺陷（全关天整段误报根因）。"""
+    rng = np.random.default_rng(0)
+    n_days, slots = 10, 96
+    slot = np.tile(np.arange(slots), n_days)
+    day = np.repeat(np.arange(n_days), slots)
+    # 3 个全关天（target=0，pbus=背景 300）；7 个开机日白天 target=700，pbus=1000
+    off_day = day < 3
+    is_daytime = (slot >= 36) & (slot < 80)
+    target = np.where(~off_day & is_daytime, 700.0, 0.0)
+    pbus = np.where(~off_day & is_daytime, 1000.0, 300.0) + rng.normal(0, 10, len(slot))
+    X = np.column_stack([slot.astype(float), pbus])
+    y = target[:, None]
+    names = ["slot", "pbus"]
+
+    base = MODEL_REGISTRY.create("history_profile", agg="median")
+    base.fit(X, y, feature_names=names)
+    cond = MODEL_REGISTRY.create("history_profile", agg="median", pbus_bins=2)
+    cond.fit(X, y, feature_names=names)
+
+    # 白天槽位：无条件画像输出开机值（多数日开机）；条件画像按当天 pbus 区分
+    x_low = np.array([[50.0, 300.0]])    # 全关天形态（总线低）
+    x_high = np.array([[50.0, 1000.0]])  # 开机日形态
+    assert base.predict(x_low)[0, 0] > 500      # 无条件：误报开机值
+    assert cond.predict(x_low)[0, 0] < 10       # 条件画像：正确输出关机
+    assert cond.predict(x_high)[0, 0] > 500     # 高桶仍输出开机值
+    # pbus_bins=1 与原行为一致
+    plain = MODEL_REGISTRY.create("history_profile", agg="median", pbus_bins=1)
+    plain.fit(X, y, feature_names=names)
+    assert np.allclose(plain.predict(x_low), base.predict(x_low))
+    import pytest
+    with pytest.raises(ValueError):
+        MODEL_REGISTRY.create("history_profile", pbus_bins=0)

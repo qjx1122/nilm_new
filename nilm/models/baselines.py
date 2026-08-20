@@ -31,30 +31,54 @@ class HistoryProfile(BaseModel):
     agg：槽位聚合方式——"mean"（默认，原行为）或 "median"。
     停机日占比高的用户建议 median：均值画像被开机日拉高，停机时段
     整段误报；中位画像天然压 FP（2842 实测 FP 363→184、F1 0.825→0.859）。
+
+    pbus_bins：>1 时启用**条件画像**——每槽位内按 pbus 分位再分桶，
+    画像=profile[slot, pbus_bin]。修补画像模型的「条件缺失」本质缺陷
+    （无条件画像回答"这个时刻通常开吗"而非"今天开吗"，全关天必然整段
+    误报）：低 pbus 桶由停机样本主导 → 当天总线低时输出关机值。
+    需要特征列 ``pbus``；对总线可见性好的用户有效（778 实测 F1
+    0.9851→0.9881），可见性差的用户（如 2842，信号/背景日间漂移≈1.9）
+    受信息论边界限制收益有限。默认 1 = 关闭（原行为）。
     """
 
     name = "history_profile"
 
-    def __init__(self, agg: str = "mean", **params) -> None:
-        super().__init__(agg=agg, **params)
+    def __init__(self, agg: str = "mean", pbus_bins: int = 1, **params) -> None:
+        super().__init__(agg=agg, pbus_bins=pbus_bins, **params)
         if agg not in ("mean", "median"):
             raise ValueError(f"history_profile.agg 仅支持 mean/median: {agg!r}")
+        if int(pbus_bins) < 1:
+            raise ValueError(f"history_profile.pbus_bins 必须 ≥1: {pbus_bins!r}")
         self.agg = agg
+        self.pbus_bins = int(pbus_bins)
+
+    def _agg_fn(self, arr: np.ndarray) -> np.ndarray:
+        return np.median(arr, axis=0) if self.agg == "median" else arr.mean(axis=0)
 
     def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
         self._slot_idx = _col_index(feature_names, "slot")
         slots = X[:, self._slot_idx].astype(int)
         n_slots = max(96, int(slots.max()) + 1)
-        if self.agg == "median":
-            self._profile = np.zeros((n_slots, y.shape[1]))
+        self._profile = np.zeros((n_slots, y.shape[1]))
+        self._pbus_idx = None
+        self._cuts = None
+        self._cond_profile = None
+        for s in np.unique(slots):
+            self._profile[s] = self._agg_fn(y[slots == s])
+        if self.pbus_bins > 1:  # 条件画像：slot × pbus 分位桶
+            self._pbus_idx = _col_index(feature_names, "pbus")
+            pbus = X[:, self._pbus_idx].astype(float)
+            self._cuts = np.zeros((n_slots, self.pbus_bins - 1))
+            self._cond_profile = np.zeros((n_slots, self.pbus_bins, y.shape[1]))
+            qs = np.linspace(0, 1, self.pbus_bins + 1)[1:-1]
             for s in np.unique(slots):
-                self._profile[s] = np.median(y[slots == s], axis=0)
-        else:
-            acc = np.zeros((n_slots, y.shape[1]))
-            cnt = np.zeros(n_slots)
-            np.add.at(acc, slots, y)
-            np.add.at(cnt, slots, 1)
-            self._profile = acc / np.maximum(cnt, 1)[:, None]
+                m = slots == s
+                self._cuts[s] = np.quantile(pbus[m], qs)
+                bins = np.digitize(pbus[m], self._cuts[s])
+                for b in range(self.pbus_bins):
+                    bm = bins == b
+                    self._cond_profile[s, b] = (self._agg_fn(y[m][bm]) if bm.any()
+                                                else self._profile[s])
         self._fallback = y.mean(axis=0)
         # 显式记录已见槽位：不得用 profile==0 代理（合法的 0 值画像会被误判 unseen）
         self._seen = np.zeros(n_slots, dtype=bool)
@@ -62,7 +86,14 @@ class HistoryProfile(BaseModel):
 
     def predict(self, X) -> np.ndarray:
         slots = np.clip(X[:, self._slot_idx].astype(int), 0, len(self._profile) - 1)
-        out = self._profile[slots].copy()
+        if self._cond_profile is not None:  # 条件画像路径
+            pbus = X[:, self._pbus_idx].astype(float)
+            out = np.empty((len(X), self._profile.shape[1]))
+            for i, (s, pb) in enumerate(zip(slots, pbus)):
+                b = int(np.digitize(pb, self._cuts[s]))
+                out[i] = self._cond_profile[s, b]
+        else:
+            out = self._profile[slots].copy()
         # 训练时未见过的槽位回退到全局均值
         seen = getattr(self, "_seen", None)
         if seen is None:  # 兼容旧 pickle：退回旧代理判定
