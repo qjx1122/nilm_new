@@ -40,8 +40,12 @@ def test_insufficient_data():
     assert "INSUFFICIENT_TIME_RANGE" in rep["risk"]
 
 
-def test_bus_visibility_ratio_flags_invisible_target():
-    """总线可见性：目标开机沿在总线无同步跳变 → TARGET_NOT_VISIBLE_ON_BUS。"""
+def test_bus_edge_snr_scale_invariant():
+    """总线可见性（尺度不变）：CT/PT 变比不影响判定；沿淹没时才标记风险。
+
+    2842 纠正教训：总线经 CT/PT 变比（原始值=实际/倍率），Δtarget/Δpbus≈8
+    是变比而非"未计入总线"——检测必须在总线自身单位内比较（边沿信噪比）。
+    """
     import numpy as np
     import pandas as pd
 
@@ -49,21 +53,23 @@ def test_bus_visibility_ratio_flags_invisible_target():
 
     idx = pd.date_range("2026-01-01", periods=96 * 14, freq="15min")
     rng = np.random.default_rng(0)
-    # 目标：每天 9:00-18:00 开机 700W；总线：与目标无关的背景 300W±噪声
     hour = idx.hour
     target = pd.Series(np.where((hour >= 9) & (hour < 18), 700.0, 0.0), index=idx)
-    bus_bg = 300 + rng.normal(0, 10, len(idx))
-    bus = pd.DataFrame({"pa": bus_bg / 2, "pb": 0.0, "pc": bus_bg / 2}, index=idx)
+
+    # 情形1：设备计入总线但总线经 1/8 变比（CT×PT=8）+ 小背景噪声
+    bus_raw = (300.0 + target.to_numpy()) / 8.0 + rng.normal(0, 1.0, len(idx))
+    bus = pd.DataFrame({"pa": bus_raw / 2, "pb": 0.0, "pc": bus_raw / 2}, index=idx)
     rep = identifiability_report(bus, target, on_thr_w=10.0)
     assert rep["n_on_edges"] >= 10
-    assert rep["bus_visibility_ratio"] is not None
-    assert rep["bus_visibility_ratio"] < 0.5
-    assert "TARGET_NOT_VISIBLE_ON_BUS" in rep["risk"]
-    assert rep["identifiable"] is False
+    assert rep["bus_edge_snr"] > 1.0, "变比不应触发风险（尺度不变）"
+    assert "TARGET_EDGE_BURIED_IN_BUS" not in rep["risk"]
+    assert abs(rep["implied_bus_scale"] - 8.0) < 1.0  # 隐含变比≈8 供核对
 
-    # 对照：目标计入总线 → 比值≈1，不触发
-    bus2 = pd.DataFrame({"pa": (bus_bg + target.to_numpy()) / 2, "pb": 0.0,
-                         "pc": (bus_bg + target.to_numpy()) / 2}, index=idx)
+    # 情形2：开机沿被总线背景波动淹没（背景抖动 >> 沿幅度）
+    bus_noisy = 300.0 + target.to_numpy() / 100.0 + rng.normal(0, 50.0, len(idx))
+    bus2 = pd.DataFrame({"pa": bus_noisy / 2, "pb": 0.0, "pc": bus_noisy / 2},
+                        index=idx)
     rep2 = identifiability_report(bus2, target, on_thr_w=10.0)
-    assert rep2["bus_visibility_ratio"] > 0.9
-    assert "TARGET_NOT_VISIBLE_ON_BUS" not in rep2["risk"]
+    assert rep2["bus_edge_snr"] < 1.0
+    assert "TARGET_EDGE_BURIED_IN_BUS" in rep2["risk"]
+    assert rep2["identifiable"] is False

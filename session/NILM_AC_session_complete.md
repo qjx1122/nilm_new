@@ -558,3 +558,14 @@
 - 关键决策：结论建议进 REPORT.md；解决路径收敛为数据侧（B 相补计量/停机日历）；其余 4 户待体检
 - 未决问题：向采集侧确认 B 相点位与设备接相
 - 相关文件/分支：nilm/analysis/identifiability.py、tests/test_identifiability.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-20] 会话纪要（第 46 次）
+- 目标：纠正上轮全关天根因结论（用户指正：总线功率含 CT/PT 变比，与分路不可直接比较）
+- 完成项：
+  - 尺度不变口径重验：隐含变比 Δp1/Δpbus=7.97≈8（典型 CT 变比）；边沿 SNR=3.18（开机沿在总线上清晰可辨）——撤销"未计入总线/B 相挂接"错误结论
+  - 检测修正：TARGET_NOT_VISIBLE_ON_BUS→TARGET_EDGE_BURIED_IN_BUS（边沿信噪比，尺度不变）+implied_bus_scale 输出；测试重写双情形；166 项全过
+  - 2842 重验：snr 2.85/隐含变比 7.47，正确判 identifiable=True（上轮误报警撤销）
+  - 全关天定性回归"背景掩盖"（信号在但被背景波动盖住）；REPORT_TEST 上轮结论作废声明
+- 关键决策：跨源绝对幅值比较无效教训入 STATUS（重大）；获取 CT/PT 变比列为数据侧行动项（隐含值≈8 供核对）
+- 未决问题：CT/PT 变比获取；per-user 变比配置层设计（变比确认后）
+- 相关文件/分支：nilm/analysis/identifiability.py、tests/test_identifiability.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new

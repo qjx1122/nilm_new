@@ -98,22 +98,33 @@ def identifiability_report(bus: pd.DataFrame, target: pd.Series,
     corr = rep["pearson"]
     if corr == corr and abs(corr) < 0.3:
         risks.append("WEAK_BUS_CORRELATION")     # 与总线弱相关（可能大量未监测负荷）
-    # 总线可见性：目标开机沿在总线上的同步跳变占比（2842 教训：目标设备
-    # 挂在缺失计量的 B 相上时，开机 700W 总线只跳 90W——比值中位 ~0.12，
-    # 全关天在总线上无任何信号，停机辨识必然失效）
+    # 总线可见性（尺度不变口径）：CT/PT 变比未知时，目标与总线的绝对幅值
+    # 不可直接比较（2842 教训：Δp1/Δpbus≈8 实为 CT×PT 综合倍率，并非
+    # "未计入总线"）。改用边沿信噪比：目标开机沿处总线跳变幅度 vs 总线
+    # 自身背景跳变（同一单位内比较，不受变比影响）——
+    #   snr = |Δpbus@开机沿| 中位 / |Δpbus| 背景 P90；
+    #   snr < 1 = 开机沿被总线背景波动淹没（停机/开机在总线上不可辨）。
+    # 同时输出隐含变比 implied_bus_scale = Δtarget/Δpbus 中位（供 CT/PT 核对）。
     t = df["target"]
     edge = (t.shift(1) < on_thr_w) & (t > max(on_thr_w * 2, 50.0))
     n_edges = int(edge.sum())
     rep["n_on_edges"] = n_edges
     if n_edges >= 10:
-        d_bus = (df["pbus"] - df["pbus"].shift(1))[edge]
+        d_bus_all = df["pbus"].diff().abs()
+        d_bus = d_bus_all[edge]
         d_t = (t - t.shift(1))[edge]
-        ratio = float((d_bus / d_t.replace(0, np.nan)).median())
-        rep["bus_visibility_ratio"] = round(ratio, 4)
-        if ratio == ratio and ratio < 0.5:
-            risks.append("TARGET_NOT_VISIBLE_ON_BUS")  # 目标功率未计入总线（缺相/口径）
+        bg = d_bus_all[~edge].quantile(0.9)
+        snr = float(d_bus.median() / bg) if bg and bg > 0 else float("inf")
+        rep["bus_edge_snr"] = round(snr, 4)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            signed_d_bus = (df["pbus"] - df["pbus"].shift(1))[edge]
+            scale = float((d_t / signed_d_bus.replace(0, np.nan)).median())
+        rep["implied_bus_scale"] = round(scale, 4) if scale == scale else None
+        if snr == snr and snr < 1.0:
+            risks.append("TARGET_EDGE_BURIED_IN_BUS")  # 开机沿被总线背景淹没
     else:
-        rep["bus_visibility_ratio"] = None
+        rep["bus_edge_snr"] = None
+        rep["implied_bus_scale"] = None
     if risks:
         risks.append("IDENTIFIABILITY_LOW")
     rep["risk"] = risks
