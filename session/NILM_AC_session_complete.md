@@ -547,3 +547,14 @@
 - 关键决策：阈值口径「数据自带」设计（防跨产物误读）；不改变任何计算逻辑（纯自描述增强）
 - 未决问题：无
 - 相关文件/分支：nilm/common/contracts.py、nilm/pipeline/user_task.py、tests/test_batch.py、README.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-08-20] 会话纪要（第 45 次）
+- 目标：hp/ridge 全关天严重误报详析与优化验证
+- 完成项：
+  - 根因终判：开机沿分析（115 沿）p1 跳 723W/pbus 仅跳 92W（可见性 0.12）——目标设备功率未计入总线；B 相计量全缺+93% 点 p1>pbus（比值 1.59）证明疑挂 B 相
+  - 机制分解：hp 画像结构性失效（对当天输入零感知）；ridge 弱信号（92W）被背景波动淹没
+  - 三组缓解实验全部量化失败（门控/基线差/阶跃均不可分）——算法侧确认无解
+  - 落地：identifiability 新增 bus_visibility_ratio + TARGET_NOT_VISIBLE_ON_BUS 风险（2842 实测 0.1338 自动命中）；166 项测试全过
+- 关键决策：结论建议进 REPORT.md；解决路径收敛为数据侧（B 相补计量/停机日历）；其余 4 户待体检
+- 未决问题：向采集侧确认 B 相点位与设备接相
+- 相关文件/分支：nilm/analysis/identifiability.py、tests/test_identifiability.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new

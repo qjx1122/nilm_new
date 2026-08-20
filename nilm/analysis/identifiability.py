@@ -98,6 +98,22 @@ def identifiability_report(bus: pd.DataFrame, target: pd.Series,
     corr = rep["pearson"]
     if corr == corr and abs(corr) < 0.3:
         risks.append("WEAK_BUS_CORRELATION")     # 与总线弱相关（可能大量未监测负荷）
+    # 总线可见性：目标开机沿在总线上的同步跳变占比（2842 教训：目标设备
+    # 挂在缺失计量的 B 相上时，开机 700W 总线只跳 90W——比值中位 ~0.12，
+    # 全关天在总线上无任何信号，停机辨识必然失效）
+    t = df["target"]
+    edge = (t.shift(1) < on_thr_w) & (t > max(on_thr_w * 2, 50.0))
+    n_edges = int(edge.sum())
+    rep["n_on_edges"] = n_edges
+    if n_edges >= 10:
+        d_bus = (df["pbus"] - df["pbus"].shift(1))[edge]
+        d_t = (t - t.shift(1))[edge]
+        ratio = float((d_bus / d_t.replace(0, np.nan)).median())
+        rep["bus_visibility_ratio"] = round(ratio, 4)
+        if ratio == ratio and ratio < 0.5:
+            risks.append("TARGET_NOT_VISIBLE_ON_BUS")  # 目标功率未计入总线（缺相/口径）
+    else:
+        rep["bus_visibility_ratio"] = None
     if risks:
         risks.append("IDENTIFIABILITY_LOW")
     rep["risk"] = risks
