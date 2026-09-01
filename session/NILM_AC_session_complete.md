@@ -647,3 +647,14 @@
 - 关键决策：数据怀疑必须物理核验后下结论（方法论入 STATUS）；fill_short_off 不调（收益 2 点）
 - 未决问题：无新增
 - 相关文件/分支：REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-09-01] 会话纪要（第 54 次）
+- 目标：重跑 2842 train+infer 展示指标；7-27 推理详析与 inference_result.csv 数据检查
+- 完成项：
+  - 重跑 OK：train best=hp（F1 0.946/P 1.000）、ridge 0.954；推理（ridge 锁定）F1 0.983、日级 23/24 达标（中位 0.990）
+  - inference_result.csv 13 项契约检查全过（列结构/时间网格/数值域/阈值列/状态一致性/prob 边界）；15min 网格 100%
+  - 7-27 审查：缺 1 点=00:00 采集缺口（机制正确）；FP 两段+FN 1 点与第 53 次结论一致；物理核验复现自洽；raw 口径重算 F1 与 metrics_daily 逐值对账 ✅——数据无问题
+  - 167 项测试全过
+- 关键决策：13 项契约检查清单沉淀为例行体检模板（REPORT_TEST）
+- 未决问题：无新增
+- 相关文件/分支：REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
