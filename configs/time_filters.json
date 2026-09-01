@@ -1,6 +1,7 @@
 {
   "800080252842_4206894986488": {
     "target_col": "p1",
+    "on_thr_w": 50.0,
     "post_min_on": 8,
     "decision_thr_w": 50.0,
     "infer_model": "ridge",
