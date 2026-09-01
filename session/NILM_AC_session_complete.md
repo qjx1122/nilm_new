@@ -627,3 +627,13 @@
 - 关键决策：三因分解方法论与多档位切分原则入 STATUS；低档日幅值 SAE 待数据积累（3 样本太少）
 - 未决问题：档位判别特征；metrics_daily 加 target_std 辅助列（待议）
 - 相关文件/分支：configs/time_filters.json、REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-09-01] 会话纪要（第 52 次）
+- 目标：metrics_daily.csv 三切分指标意义详析 + 各切分坏天逐日归因
+- 完成项：
+  - 三切分意义框架：train 拟合诊断/val 泛化预警/test 能力结论；train F1 中位低于 test 的反常确认为成分差异（train 含 11 全关天+4月漂移段）
+  - 坏天全量归因（ridge 83 天）五类：全关天 17 天（train11+val6 连续停机段落 val）、4-5 月作息漂移 FP 爆发（日均开机 3.8h vs 夏季 12h，4-10 FP75 覆盖全天）、2025 段夜间小值 FP（日均 8.6 点，判决链已消）、低档日 6 天（test 3 天状态好但 SAE 0.7~1.3）、平坦日 R² 伪影 ~8 天
+  - 可执行项输出：季节分段/val 停机段锚定/metrics_daily 辅助列（均待确认，未动代码）
+- 关键决策：诊断框架与五类模式入 STATUS/REPORT_TEST；本轮纯分析不改代码
+- 未决问题：季节分段建模、target_std 辅助列
+- 相关文件/分支：REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
