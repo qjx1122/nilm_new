@@ -524,7 +524,9 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         X = scaler.transform(valid.to_numpy(np.float64))
 
         # 模型选择：配置指定 > 训练最优；只用本用户模型
-        model_name = base_cfg.get("infer_model") or meta.get("best_model") or meta["models"][0]
+        # 模型选择优先级：用户级 infer_model > 全局 infer_model > 训练综合最优
+        model_name = (user_cfg.get("infer_model") or base_cfg.get("infer_model")
+                      or meta.get("best_model") or meta["models"][0])
         if model_name not in meta["models"]:
             raise UserTaskError(Status.MODEL_NOT_FOUND, f"模型 {model_name} 不在该用户训练清单")
         model_path = train_dir / "models" / f"{model_name}.pkl"

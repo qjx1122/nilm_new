@@ -143,6 +143,10 @@ CONFIG_RULES: dict[str, dict] = {
     # 决策阈值（W）：仅作用于预测功率→开机状态的判决（pred_state/状态策略评估）；
     # 缺省 None = 沿用 on_thr_w。真值判态（target_state/分类指标）恒用 on_thr_w。
     "decision_thr_w":        {"default": None, "min": 0.001, "max": 5000.0},
+    # 推理模型（用户级）：显式指定该用户推理用的模型名；缺省 None = 走
+    # base_cfg.infer_model（全局）→ 训练综合最优 best_model 的既有链路。
+    # 用途：综合最优被退化指标（如 recall=1 的全漏报基线）带偏时人工锁定。
+    "infer_model":           {"default": None},
     "weather_latitude":      {"default": 30.59, "min": -90.0, "max": 90.0},
     "weather_longitude":     {"default": 114.31, "min": -180.0, "max": 180.0},
     "use_weather_features":  {"default": True},

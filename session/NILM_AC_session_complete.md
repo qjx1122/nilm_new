@@ -605,3 +605,15 @@
 - 关键决策：pbus_bins 默认关闭；2842 维持 median+判决链，全关天走外部信息路径（不变）
 - 未决问题：其余用户可见性体检后决定是否启用 pbus_bins
 - 相关文件/分支：nilm/models/baselines.py、tests/test_ml_models.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-09-01] 会话纪要（第 50 次）
+- 目标：2842 重跑复现 hp 全关天问题；深层原因分析；模型/数据集两层方案验证落地
+- 完成项：
+  - 重跑复现（train+infer OK）：hp FP 184/184 全来自全关天、预测与开机日逐点相同、P(开|slot) 0.78——条件缺失结构性缺陷确认
+  - 方案 A 条件画像切点扫描：q=0.05~0.50 无 Pareto 改进（FP/FN 严格互换）——2842 不启用（负结果）
+  - 方案 B 落地：splits 锚定 4 全关天入 train——hp test F1 0.859→0.9444（FP 184→0）、ridge 0.799→0.942；推理连带 F1 0.934→0.980
+  - 连带修复：新增用户级 infer_model 配置（best_model 被 proportional 退化特性带偏），2842 锁定 ridge
+  - 167 项测试全过
+- 关键决策：splits 锚定优于纯口径排除（样本利用+考核聚焦）；best_model 选型鲁棒性问题记录待改
+- 未决问题：hp 剩余 FN 90（开机段内低功率间歇，另一问题域）；选型 wins 计数改进
+- 相关文件/分支：configs/time_filters.json、nilm/common/contracts.py、nilm/pipeline/{user_config,user_task}.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new

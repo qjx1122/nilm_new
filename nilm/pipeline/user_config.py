@@ -94,9 +94,9 @@ def resolve_user_config(user_key: str, cfg: dict) -> dict:
         if field in merged and merged[field] is not None:
             if field == "split_ratios":
                 merged[field] = _validate_split_ratios(merged[field])
-            elif field in ("target_col",):
+            elif field in ("target_col", "infer_model"):
                 if not isinstance(merged[field], str):
-                    raise UserConfigError("target_col 必须为字符串")
+                    raise UserConfigError(f"{field} 必须为字符串")
             elif field in ("use_weather_features", "use_temp_based_season"):
                 if not isinstance(merged[field], bool):
                     raise UserConfigError(f"{field} 必须为布尔值")
