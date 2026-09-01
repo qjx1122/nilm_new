@@ -617,3 +617,13 @@
 - 关键决策：splits 锚定优于纯口径排除（样本利用+考核聚焦）；best_model 选型鲁棒性问题记录待改
 - 未决问题：hp 剩余 FN 90（开机段内低功率间歇，另一问题域）；选型 wins 计数改进
 - 相关文件/分支：configs/time_filters.json、nilm/common/contracts.py、nilm/pipeline/{user_config,user_task}.py、REPORT_TEST.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-09-01] 会话纪要（第 51 次）
+- 目标：解剖上轮锚定后"训练指标差"的原因并修复验证
+- 完成项：
+  - 三因分解：①真问题=设备双档位（200W/720W）且 6 个低档日全在 test（train 零覆盖），SAE 1.2~4.9；②统计伪影=平坦日（真值 std 13W）日级 R²=-57；③成分效应=全关天移出后 R² 分母缩小（同口径重算 0.565 vs 0.564 无退化）
+  - 修复：splits 补锚 3 个低档日入 train（6-04/08/09），test 留 3 个作外推检验
+  - 验证：hp test R² 0.410→0.598、SAE 0.211→0.029、MAE→129.4；ridge F1 0.954、日级达标 10/14；推理 F1 0.983 维持；167 项测试全过
+- 关键决策：三因分解方法论与多档位切分原则入 STATUS；低档日幅值 SAE 待数据积累（3 样本太少）
+- 未决问题：档位判别特征；metrics_daily 加 target_std 辅助列（待议）
+- 相关文件/分支：configs/time_filters.json、REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
