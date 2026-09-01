@@ -669,3 +669,14 @@
 - 关键决策：口径统一的价值确认（阈值差是此前口径分裂主源）；历史 10W 指标不可直接对比的提示入档
 - 未决问题：无新增
 - 相关文件/分支：configs/time_filters.json、REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-09-01] 会话纪要（第 56 次）
+- 任务：解释 2842 用户 7-27 推理结果中 14:30/14:45 两点 pred<50 但 pred_state=1 的原因
+- 完成内容：
+  - 定位：pred_state 非逐点阈值判态，而是 postprocess_state 三步判决链（≥50 判态 → enforce_min_on(8) 去短开 → fill_short_off(3) 填短关）输出
+  - 根因：14:30~14:45 是被 06:15~14:15（33 点开）与 15:00~21:45（28 点开）两长开态段夹住的 2 点关断，长度 ≤ post_fill_short_off=3，被整段回填为开——设计行为非缺陷
+  - 数值复现：对 inference_result.csv 的 pred 重放判决链，7-27 当日 95 点与全区间 2246 点均与落盘 pred_state 逐点全等；pred_prob 与逐点 sigmoid(pred) 全等（0.027/0.426，点级证据保持"偏关"）
+  - 关联误差结构：这两点落在已确认的午间真实停机段（14:30~15:45），ridge 点级预测本对（<50），fill 回填制造 2 个 FP（当日三口径 F1：raw 0.8333 / 无 fill 0.8411 / 完整判决链 0.8257）——"段内短停机 vs 量测噪声"不可区分的必然代价，属午间停机不可辨识问题在判决链上的投影，无新增行动项
+- 沉淀：REPORT_TEST.md 新增专题；STATUS.md 决策记录新增「pred 与 pred_state 不一致排查三步法」与回填点识别信号（pred_state==1 且 pred<decision_thr_w）
+- 未决问题：无新增
+- 相关文件/分支：REPORT_TEST.md、STATUS.md、nilm/postprocess/state.py（只读分析）；分支 arena/019ffeb6-nilm-new
