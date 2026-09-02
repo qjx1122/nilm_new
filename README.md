@@ -124,6 +124,8 @@ scripts/run_batch_users.py   CLI 入口
   2 树模型（random_forest/xgboost，`tree_models.py`）+
   3 深度时序（lstm/cnn1d/transformer，`seq_models.py`，L=96 滑窗 Seq2Point 逐点输出；
   device 默认 `auto` 自动检测——有 CUDA GPU 用 GPU、其次 Apple MPS、否则 CPU，
-  显式配置 `params: {device: cpu|cuda}` 可覆盖）；
+  显式配置 `params: {device: cpu|cuda}` 可覆盖；内置训练稳健性护栏：标签 z-score
+  标准化+反标准化、batch 自适应保证每 epoch ≥8 步、总步数<500 UNDER_TRAINED 告警、
+  test 预测带宽<on_thr_w 的坍缩模型自动标记 PRED_COLLAPSED 并在被指定推理时告警）；
   全部经 MODEL_REGISTRY 注册、configs/default.yaml `models:` 配置驱动
 - 待办：真实数据 M0 摸底；指南附件中「日级指标 23 字段 / 启动段字段」契约待确认（PDF 未含附件原文）

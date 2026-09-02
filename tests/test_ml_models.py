@@ -205,3 +205,83 @@ def test_history_profile_conditional_pbus_bins():
     import pytest
     with pytest.raises(ValueError):
         MODEL_REGISTRY.create("history_profile", pbus_bins=0)
+
+
+# ---------------------------------------------------------------- y 标准化（0800 均值坍缩修复）
+def _make_watt_scale_data(n: int = 480, seed: int = 42):
+    """瓦数量级标签的小样本任务：模拟 0800 场景（y 0~272W，样本数百）。"""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n)
+    slot = (t % 96) / 96.0
+    on = ((slot > 0.4) & (slot < 0.8)).astype(float)
+    X = np.column_stack([np.sin(2 * np.pi * slot), np.cos(2 * np.pi * slot),
+                         on + rng.normal(0, 0.05, n)])
+    y = (on * 150.0 + rng.normal(0, 5.0, n))[:, None]   # 开态 ~150W / 关态 ~0W
+    n_tr = int(n * 0.8)
+    return (X[:n_tr], y[:n_tr]), (X[n_tr:], y[n_tr:])
+
+
+@pytest.mark.parametrize("name", DL_MODELS)
+def test_dl_label_normalization_avoids_collapse(name):
+    """y 标准化修复：瓦数标签+少步数下预测不得坍缩在均值以下的窄带。
+
+    修复前（y 原瓦数进 MSE）：epochs 内网络只够把常数输出爬到远低于均值处，
+    预测带宽 <50W、全部点低于开机阈值（0800 现场）。修复后同参数应能覆盖
+    开/关两态（带宽 >50W 且最大值接近开态水平）。
+    """
+    (X_tr, y_tr), (X_te, y_te) = _make_watt_scale_data()
+    params = {**EXTRA[name], "epochs": 15, "batch_size": 256}
+    model = MODEL_REGISTRY.create(name, **params)
+    model.fit(X_tr, y_tr, feature_names=["x1", "x2", "x3"],
+              X_val=X_te, y_val=y_te)
+    pred = model.predict(X_te)[:, 0]
+    band = float(pred.max() - pred.min())
+    assert band > 50.0, f"{name} 预测带宽 {band:.1f}W——仍坍缩（y 标准化未生效？）"
+    assert float(pred.max()) > 75.0, f"{name} 预测最大值 {pred.max():.1f}W 远低于开态 150W"
+
+
+def test_dl_label_normalization_roundtrip_pickle(tmp_path):
+    """y 标准化统计量随 pickle 往返：load 后预测仍在瓦数域。"""
+    (X_tr, y_tr), (X_te, _) = _make_watt_scale_data()
+    model = MODEL_REGISTRY.create("lstm", **{**EXTRA["lstm"], "epochs": 15})
+    model.fit(X_tr, y_tr, feature_names=["x1", "x2", "x3"])
+    p1 = model.predict(X_te)
+    path = tmp_path / "m.pkl"
+    model.save(path)
+    from nilm.models.base import BaseModel
+    loaded = BaseModel.load(path)
+    p2 = loaded.predict(X_te)
+    assert np.allclose(p1, p2, atol=1e-4)
+    assert float(p1.max()) > 50.0   # 瓦数域而非标准化域
+
+
+def test_dl_constant_label_no_nan():
+    """常量标签（std=0）防除零：不产生 NaN。"""
+    (X_tr, _), (X_te, _) = _make_watt_scale_data()
+    y_const = np.full((len(X_tr), 1), 42.0)
+    model = MODEL_REGISTRY.create("lstm", **{**EXTRA["lstm"], "epochs": 3})
+    model.fit(X_tr, y_const, feature_names=["x1", "x2", "x3"])
+    pred = model.predict(X_te)
+    assert np.isfinite(pred).all()
+
+
+def test_dl_batch_size_adaptive(caplog):
+    """batch 自适应护栏：样本 384、配置 bs=256 → 实际 bs≤48（每 epoch ≥8 步）。"""
+    import logging
+    (X_tr, y_tr), _ = _make_watt_scale_data()
+    model = MODEL_REGISTRY.create("lstm", **{**EXTRA["lstm"],
+                                             "epochs": 2, "batch_size": 256})
+    with caplog.at_level(logging.INFO, logger="nilm.models.seq"):
+        model.fit(X_tr, y_tr, feature_names=["x1", "x2", "x3"])
+    assert any("batch_size 自适应" in r.message for r in caplog.records)
+
+
+def test_dl_under_trained_warning(caplog):
+    """总步数 <500 时告警 UNDER_TRAINED。"""
+    import logging
+    (X_tr, y_tr), _ = _make_watt_scale_data()
+    model = MODEL_REGISTRY.create("lstm", **{**EXTRA["lstm"],
+                                             "epochs": 2, "batch_size": 64})
+    with caplog.at_level(logging.WARNING, logger="nilm.models.seq"):
+        model.fit(X_tr, y_tr, feature_names=["x1", "x2", "x3"])
+    assert any("UNDER_TRAINED" in r.message for r in caplog.records)

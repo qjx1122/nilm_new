@@ -526,3 +526,81 @@ def test_proportional_predicts_physical_scale(tmp_path, base_cfg_file,
     t_on = df["target"] >= 10
     p_on = df["pred_proportional"] >= 10
     assert int((p_on & t_on).sum()) > 0, "proportional 应能产生 TP"
+
+
+class _ConstantStub:
+    """恒定输出 3.0W 的坍缩桩模型（带宽 0 < on_thr_w=10）；模块级保证可 pickle。"""
+    pass
+
+
+def _register_constant_stub():
+    from nilm.models import MODEL_REGISTRY
+    from nilm.models.base import BaseModel
+
+    name = "constant_stub"
+    if name in MODEL_REGISTRY.names():
+        return name
+
+    @MODEL_REGISTRY.register(name)
+    class ConstantStub(BaseModel):
+        name = "constant_stub"
+
+        def fit(self, X, y, feature_names=None, X_val=None, y_val=None):
+            self._k = y.shape[1]
+
+        def predict(self, X):
+            import numpy as np
+            return np.full((len(X), self._k), 3.0)
+
+    global _StubCls
+    _StubCls = ConstantStub          # 模块级引用，pickle 可寻址
+    ConstantStub.__qualname__ = "_StubCls"
+    ConstantStub.__module__ = __name__
+    return name
+
+
+def test_collapsed_model_detected_and_flagged(tmp_path, base_cfg, time_filter_file):
+    """坍缩模型检测（0800 transformer 教训）：test 预测带宽 < on_thr_w 的模型
+    进 meta.collapsed_models；被 infer_model 指定时推理不失败但日志告警。"""
+    import yaml
+
+    name = _register_constant_stub()
+
+    cfg = dict(base_cfg)
+    cfg["models"] = base_cfg["models"] + [{"name": name}]
+    cfg_file = tmp_path / "base_stub.yaml"
+    cfg_file.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False),
+                        encoding="utf-8")
+    data_root = tmp_path / "data"
+    write_user_dir(data_root, USER_KEY, days=21)
+    write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+
+    info = run_batch(time_filter_file, base_config_path=cfg_file,
+                     data_root=data_root, output_root=tmp_path / "outputs",
+                     stages=("train",))
+    table = pd.read_csv(info["status_csv"])
+    assert (table["status"] == Status.OK).all()
+    run_dir = Path(table.iloc[0]["output_dir"])
+    meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    assert name in meta["collapsed_models"]          # 桩模型被标记
+    assert "ridge" not in meta["collapsed_models"]   # 正常模型不误伤
+
+    # 指定坍缩模型推理：不失败（软告警），日志含 PRED_COLLAPSED
+    tf = json.loads(Path(time_filter_file).read_text(encoding="utf-8"))
+    tf[USER_KEY]["infer_model"] = name
+    tf_file = tmp_path / "tf_stub.json"
+    tf_file.write_text(json.dumps(tf), encoding="utf-8")
+    import logging as _lg
+    records = []
+    handler = _lg.Handler()
+    handler.emit = lambda r: records.append(r.getMessage())
+    _lg.getLogger("nilm.pipeline.user_task").addHandler(handler)
+    try:
+        info2 = run_batch(tf_file, base_config_path=cfg_file,
+                          data_root=data_root, output_root=tmp_path / "outputs",
+                          stages=("infer",))
+    finally:
+        _lg.getLogger("nilm.pipeline.user_task").removeHandler(handler)
+    t2 = pd.read_csv(info2["status_csv"])
+    assert (t2["status"] == Status.OK).all()
+    assert any("PRED_COLLAPSED" in m for m in records)

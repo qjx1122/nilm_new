@@ -292,6 +292,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         results_by_split: dict[str, dict] = {}  # {model: {split: 指标}} 三阶段全量
         daily_rows: list[pd.DataFrame] = []     # 每模型×每阶段×每天 指标
         test_preds: dict[str, np.ndarray] = {}  # {model: test 段预测}（状态策略评估用）
+        collapsed_models: list[dict] = []       # 预测坍缩模型（带宽<on_thr_w，勿用于推理）
         pred_frames: dict[str, pd.DataFrame] = {  # 训练预测结果落盘（真实值+各模型预测）
             s: pd.DataFrame({"timestamp": splits[s][2]
                              .strftime("%Y-%m-%d %H:%M:%S"),
@@ -338,6 +339,19 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     int(user_cfg["post_fill_short_off"])).astype(int)
                 if split == "test":
                     test_preds[name] = y_hat[:, 0]
+                    # —— 坍缩模型检测（0800 transformer 均值坍缩教训，2026-09-02）：
+                    # test 预测带宽 < on_thr_w 时该模型永远无法产生开态判定
+                    # （F1=0 且 FP=0 貌似保守，实为未收敛），标记防止被
+                    # infer_model 指定后静默上线全漏报。
+                    band = float(y_hat[:, 0].max() - y_hat[:, 0].min())
+                    if band < on_thr:
+                        collapsed_models.append(
+                            {"model": name, "pred_band_w": round(band, 2),
+                             "on_thr_w": on_thr})
+                        log.warning(
+                            "[%s] PRED_COLLAPSED：模型 %s test 预测带宽 %.1fW < "
+                            "on_thr_w %.0fW——预测坍缩（疑似欠训练），该模型无法识别"
+                            "任何开机点，勿用于推理", user_key, name, band, on_thr)
             results[name] = results_by_split[name]["test"]  # 选型口径：test（不变）
 
         # 三阶段汇总 CSV：model × split 行 × 指标列（state_thr_w=分类指标判定阈值）
@@ -408,6 +422,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "scaler": scaler.state(), "window": window, "window_mode": wmode,
             "split_sizes": split_sizes, "split_strategy": user_cfg["split_strategy"],
             "best_model": best, "models": [s["name"] for s in base_cfg.get("models", [])],
+            "collapsed_models": [c["model"] for c in collapsed_models],
             "on_thr_w": user_cfg["on_thr_w"],
             "quality": {"bus": q_bus, "branch": q_br},
             "identifiable": ident.get("identifiable"),
@@ -531,6 +546,10 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                       or meta.get("best_model") or meta["models"][0])
         if model_name not in meta["models"]:
             raise UserTaskError(Status.MODEL_NOT_FOUND, f"模型 {model_name} 不在该用户训练清单")
+        if model_name in (meta.get("collapsed_models") or []):
+            log.warning("[%s] 推理模型 %s 在训练阶段被标记 PRED_COLLAPSED（test 预测带宽"
+                        "<on_thr_w，疑似欠训练）——推理结果将无法识别任何开机点，"
+                        "建议改用其他模型或重新训练", user_key, model_name)
         model_path = train_dir / "models" / f"{model_name}.pkl"
         if not model_path.exists():
             raise UserTaskError(Status.MODEL_NOT_FOUND, f"模型文件缺失: {model_path}")

@@ -699,3 +699,25 @@ ridge 全关天误识别的完整因果链：**单总线幅值信息不足（外
 4. **诊断侧**：pred 分布带宽（max-min < on_thr_w）可作为「坍缩模型」自动检测信号，训练后立即标记，避免坍缩模型被 infer_model 指定后静默上线。
 - 是否进入 REPORT.md（稳定结论）：「DL 标签未标准化+小样本大 batch 的均值坍缩失效模式（对照矩阵四环归因）」建议进入
 - 遗留问题：方案 1（y 标准化进 _SeqTorchModel）待拍板——涉及 DL 模型行为变化，需 2842 等大样本户回归验证
+
+## [2026-09-02] 专题：DL 均值坍缩修复落地——标签标准化+batch 自适应+UNDER_TRAINED 告警+坍缩检测（四项护栏）
+
+### 背景
+上一专题定位 0800 transformer 推理开机天全漏的根因（y 未标准化+小样本大 batch→总步数 120 的均值坍缩），四条优化方案获批落地。
+
+### 实现
+1. **标签标准化（`_SeqTorchModel.fit/predict`，根治）**：y 在适配器内部 z-score 标准化（`_y_mean/_y_std`，std<1e-6 置 1 防常量标签除零）后训练，predict 反标准化还原瓦数；早停的 val loss 与训练同域；统计量随既有 `__getstate__` 自动 pickle（不在排除清单），旧模型无该属性时兼容直通。
+2. **batch 自适应护栏**：实际 batch = `min(配置值, max(16, n_train//8))`——保证每 epoch ≥8 步梯度更新；缩减时 INFO 日志。
+3. **UNDER_TRAINED 告警**：总梯度步数 `ceil(n/bs)×epochs < 500` 时 WARNING（0800 修复前场景=120 步会触发）。
+4. **坍缩检测（流水线级，user_task）**：训练后 test 预测带宽 `max-min < on_thr_w` 的模型记入 `meta.json.collapsed_models` + WARNING `PRED_COLLAPSED`；该模型被 infer_model 指定推理时再次告警（软告警不阻断——保留人工强制通道，与 MODEL_NOT_FOUND 硬失败区分）。
+
+### 验证
+- **0800 端到端复验（修复主场）**：batch 自适应 256→47 生效、早停恢复工作（epoch 35，修复前 60 轮永不触发）；transformer test F1 **0→0.9195**（R² 0.785，recall 1.0）；推理 pred 带宽 0~132W（修复前 8~15W），**25 个开机天 25 个识别**（修复前 0），推理判决链 F1 0.8325；collapsed_models=[]。
+- **2842 大样本回归验证（防伤及正常场景）**：transformer test F1 0.9289 / R² 0.6461（历史口径 ~0.52 量级，无回归且略优）；y 标准化后收敛更快（早停 epoch 21）。
+- **测试 +7（共 180 项全过）**：DL 三兄弟瓦数标签不坍缩（带宽>50W）、y 统计量 pickle 往返、常量标签无 NaN、batch 自适应日志、UNDER_TRAINED 告警、坍缩模型 meta 标记+正常模型不误伤、坍缩模型被指定推理时 PRED_COLLAPSED 告警且不阻断。
+- 踩坑：测试桩模型局部类不可 pickle（BaseModel.save 整对象 pickle）——桩类提升到模块级并挂 `__qualname__` 引用。
+
+### 结论
+四项护栏全部落地：框架缺陷（标签尺度）根治 + 两道训练期预警 + 一道产物级拦截。0800 类小样本户 DL 从"完全不可用且静默"变为"可用且有告警兜底"；配置侧原则不变——小样本户仍首选 hp/ridge（0800 hp F1 0.975 依旧最优），DL 解锁的是"不再静默失效"。
+- 是否进入 REPORT.md（稳定结论）：「DL 标签标准化为适配器内置行为+坍缩检测护栏」建议进入
+- 遗留问题：无

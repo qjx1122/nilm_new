@@ -140,6 +140,12 @@ ua: {ch: 1, column: load_iden_data9, multiplier: 0.001, unit: V}
 
 共用适配器：L=96 滑窗 Seq2Point 逐点输出（头部复制填充，输出行数=输入行数）、Adam+MSE、验证早停（`patience` 轮不提升回滚最优权重）、种子可复现、state_dict 级持久化（跨设备加载）。
 
+**训练稳健性护栏（2026-09-02，0800 均值坍缩修复）**：
+- **标签标准化**：y 在适配器内部 z-score 标准化后训练、predict 反标准化还原瓦数——修复"y 原瓦数进 MSE 时小样本×大 batch 下预测坍缩在均值以下窄带"的框架缺陷（0800 实测 transformer test F1 0→0.92）；
+- **batch 自适应**：实际 batch = `min(配置值, max(16, n_train//8))`，保证每 epoch ≥8 步梯度更新；
+- **UNDER_TRAINED 告警**：总梯度步数（ceil(n/bs)×epochs）< 500 时 WARNING；
+- **坍缩检测**（流水线级）：训练后 test 预测带宽 < `on_thr_w` 的模型记入 `meta.json.collapsed_models` 并告警 `PRED_COLLAPSED`；该模型被 `infer_model` 指定推理时再次告警（不阻断）。
+
 **共同效率因素**（重要性排序）：
 
 1. **`window`（第一旋钮）**：每样本 (window, f) 张量，计算量 ∝ window（transformer 为 window²）；96→48 提速约 2 倍（transformer 约 4 倍）

@@ -720,3 +720,16 @@
 - 关键决策：定性为框架级缺陷（标签尺度处理缺失）而非调参问题；"F1=0 且 FP=0"的欺骗性失效模式入档
 - 未决问题：方案① y 标准化实现待用户拍板（需 2842 大样本回归验证）
 - 相关文件/分支：REPORT_TEST.md（新专题）、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-09-02] 会话纪要（第 60 次）
+- 任务：按第 59 次分析的优化方案落地 DL 均值坍缩修复
+- 完成内容：
+  - 方案1 根治（seq_models.py）：_SeqTorchModel.fit 内 y z-score 标准化（_y_mean/_y_std，std<1e-6 置 1 防常量除零），val 早停损失同域；predict 反标准化还原瓦数，旧模型无属性兼容直通；统计量随既有 __getstate__ 自动 pickle
+  - 方案2 护栏（seq_models.py）：batch 自适应 min(bs, max(16, n//8)) 保证每 epoch ≥8 步（缩减时 INFO）；总步数 <500 告警 UNDER_TRAINED
+  - 方案4 检测（user_task.py）：训练后 test 预测带宽 <on_thr_w 的模型→meta.collapsed_models + WARNING PRED_COLLAPSED；被 infer_model 指定推理时软告警不阻断
+  - 方案3 配置原则：不改代码，文档沉淀（小样本户首选基线模型）
+  - 验证：0800 端到端——batch 256→47、早停恢复(epoch 35)、transformer test F1 0→0.9195、推理 25/25 开机天识别（修复前 0/25）、判决链 F1 0.8325；2842 大样本回归——F1 0.9289/R² 0.6461 无回归且收敛更快(早停 21)；测试 +7 共 180 全过
+  - 文档：CONFIG_GUIDE 深度组新增"训练稳健性护栏"段；README 模型清单更新
+- 关键决策：y 标准化放适配器内部（模型自治）；坍缩推理侧软告警（保留人工通道）；桩模型模块级类（pickle 教训）
+- 未决问题：无新增
+- 相关文件/分支：nilm/models/seq_models.py、nilm/pipeline/user_task.py、tests/test_ml_models.py、tests/test_batch.py、docs/CONFIG_GUIDE.md、README.md；分支 arena/019ffeb6-nilm-new

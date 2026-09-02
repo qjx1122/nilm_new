@@ -82,14 +82,34 @@ class _SeqTorchModel(BaseModel):
 
         Xw = _padded_windows(np.asarray(X, np.float32), window)
         yt = np.asarray(y, np.float32)
+        # —— 标签标准化（0800 均值坍缩修复，2026-09-02）：y 原瓦数直接进 MSE 时，
+        # 随机初始化网络前期梯度全在「常数输出爬向 y 均值」方向；小样本×大 batch
+        # 下总步数不足以爬完，预测坍缩在远低于 on_thr_w 的窄带（F1=0 且 FP=0，
+        # 貌似保守实为未收敛）。训练在标准化域进行，predict 反标准化还原瓦数——
+        # 对照实验：0800 其他参数不动仅此一项，test F1 0→0.889。
+        self._y_mean = yt.mean(axis=0)
+        self._y_std = yt.std(axis=0)
+        self._y_std[self._y_std < 1e-6] = 1.0   # 常量标签防除零
+        yt = (yt - self._y_mean) / self._y_std
         has_val = X_val is not None and y_val is not None and len(X_val) > 0
         if has_val:
             Xw_val = _padded_windows(np.asarray(X_val, np.float32), window)
-            yv = torch.from_numpy(np.asarray(y_val, np.float32)).to(device)
+            yv_n = (np.asarray(y_val, np.float32) - self._y_mean) / self._y_std
+            yv = torch.from_numpy(yv_n).to(device)   # 早停损失与训练同域
 
         opt = torch.optim.Adam(self._net.parameters(), lr=float(self.params["lr"]))
         loss_fn = torch.nn.MSELoss()
-        bs = int(self.params["batch_size"])
+        # —— batch 自适应护栏：保证每 epoch ≥8 步梯度更新（下限 16），
+        # 避免小样本×大 batch 的「每 epoch 2 步」欠训练；总步数过少时显式告警。
+        bs = min(int(self.params["batch_size"]), max(16, len(Xw) // 8))
+        total_steps = -(-len(Xw) // bs) * int(self.params["epochs"])
+        if bs < int(self.params["batch_size"]):
+            log.info("[%s] batch_size 自适应 %d→%d（训练样本 %d，保证每 epoch ≥8 步）",
+                     self.name, int(self.params["batch_size"]), bs, len(Xw))
+        if total_steps < 500:
+            log.warning("[%s] UNDER_TRAINED 风险：总梯度步数≈%d（<500），样本 %d×epochs %s "
+                        "可能不足以收敛，建议增大 epochs 或补充训练数据",
+                        self.name, total_steps, len(Xw), self.params["epochs"])
         best_val, best_state, bad = float("inf"), None, 0
 
         for epoch in range(int(self.params["epochs"])):
@@ -149,7 +169,11 @@ class _SeqTorchModel(BaseModel):
         self._net.eval()
         with torch.no_grad():
             out = self._predict_windows(Xw, device)
-        return out.cpu().numpy().reshape(len(X), self._n_out)
+        pred = out.cpu().numpy().reshape(len(X), self._n_out)
+        # 标签标准化的反变换（旧模型 pickle 无该属性时兼容直通）
+        if getattr(self, "_y_mean", None) is not None:
+            pred = pred * self._y_std + self._y_mean
+        return pred
 
     # ---- 持久化：nn.Module 为局部类不可直接 pickle——只序列化权重 state_dict，
     #      反序列化时经 _build_net 重建结构再载入权重（BaseModel.load 路径不变）。
