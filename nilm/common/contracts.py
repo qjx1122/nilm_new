@@ -156,6 +156,13 @@ CONFIG_RULES: dict[str, dict] = {
 # 以下划线开头的顶级配置键不得作为用户数据名加载（§12.1）
 RESERVED_CONFIG_KEYS = ("_default",)
 
+# 顶级全局配置键（非用户键、非 _ 保留键）：作用于所有用户的全局默认，
+# 沿既有优先级链插入在硬编码默认之上、_default 之下：
+#   用户级 infer_model > _default.infer_model > 顶级全局 infer_model
+#   > base_cfg.infer_model（default.yaml）> 训练综合最优 best_model。
+# 即：配置了顶级 infer_model 则所有用户默认用它推理；未配置走原有逻辑。
+GLOBAL_CONFIG_KEYS = ("infer_model",)
+
 
 def is_reserved_config_key(key: str) -> bool:
     return key.startswith("_")

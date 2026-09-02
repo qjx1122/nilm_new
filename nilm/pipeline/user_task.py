@@ -524,7 +524,9 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         X = scaler.transform(valid.to_numpy(np.float64))
 
         # 模型选择：配置指定 > 训练最优；只用本用户模型
-        # 模型选择优先级：用户级 infer_model > 全局 infer_model > 训练综合最优
+        # 优先级：用户级 infer_model > _default.infer_model > JSON 顶级全局
+        # infer_model（三者已在 resolve_user_config 合并进 user_cfg）
+        # > base_cfg.infer_model（default.yaml）> 训练综合最优 best_model
         model_name = (user_cfg.get("infer_model") or base_cfg.get("infer_model")
                       or meta.get("best_model") or meta["models"][0])
         if model_name not in meta["models"]:

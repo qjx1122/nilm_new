@@ -64,3 +64,44 @@ def test_sections_passthrough():
     merged = resolve_user_config(UK, cfg)
     assert merged["train"]["include"] == [["2026-01-01", "2026-01-31"]]
     assert "val" in merged["splits"]
+
+
+# ---------------------------------------------------------------- 顶级全局 infer_model
+def test_global_infer_model_applies_to_all_users():
+    """顶级 infer_model：配置后作为所有用户的全局默认推理模型。"""
+    cfg = _cfg(infer_model="ridge")
+    merged = resolve_user_config(UK, cfg)
+    assert merged["infer_model"] == "ridge"
+    assert merged["_provenance"]["infer_model"] == "global(顶级)"
+
+
+def test_global_infer_model_absent_keeps_original_logic():
+    """未配置顶级 infer_model：维持硬编码默认 None（推理走 best_model 原逻辑）。"""
+    merged = resolve_user_config(UK, _cfg())
+    assert merged["infer_model"] is None
+
+
+def test_user_level_overrides_global_infer_model():
+    """优先级：用户级 > _default > 顶级全局。"""
+    cfg = _cfg(infer_model="ridge")
+    cfg[UK]["infer_model"] = "history_profile"
+    merged = resolve_user_config(UK, cfg)
+    assert merged["infer_model"] == "history_profile"
+    assert merged["_provenance"]["infer_model"] == UK
+
+    cfg2 = _cfg(infer_model="ridge")
+    cfg2["_default"]["infer_model"] = "proportional"
+    merged2 = resolve_user_config(UK, cfg2)
+    assert merged2["infer_model"] == "proportional"
+    assert merged2["_provenance"]["infer_model"] == "_default"
+
+
+def test_global_infer_model_not_a_user_key():
+    """顶级 infer_model 是全局配置键，不得被当作用户数据名加载。"""
+    keys = list_user_keys(_cfg(infer_model="ridge"))
+    assert keys == [UK]
+
+
+def test_global_infer_model_must_be_string():
+    with pytest.raises(UserConfigError, match="infer_model"):
+        resolve_user_config(UK, _cfg(infer_model=123))

@@ -13,8 +13,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from nilm.common.contracts import (CONFIG_RULES, RE_USER_DIR,
-                                   is_reserved_config_key)
+from nilm.common.contracts import (CONFIG_RULES, GLOBAL_CONFIG_KEYS,
+                                   RE_USER_DIR, is_reserved_config_key)
 from nilm.common.logging import get_logger
 
 log = get_logger("pipeline.user_config")
@@ -39,7 +39,7 @@ def list_user_keys(cfg: dict) -> list[str]:
         raise UserConfigError("_user_id_map 必须是 {user_id: user_key} 映射对象")
     keys: list[str] = []
     for k in cfg:
-        if is_reserved_config_key(k):
+        if is_reserved_config_key(k) or k in GLOBAL_CONFIG_KEYS:
             continue
         if RE_USER_DIR.match(k):
             keys.append(k)
@@ -82,7 +82,12 @@ def resolve_user_config(user_key: str, cfg: dict) -> dict:
     """按优先级合并并校验单个用户的配置（§12.1/§12.3）。"""
     merged: dict = {}
     provenance: dict = {}
+    # 顶级全局键层（如 infer_model）：所有用户共享的全局默认，
+    # 优先级在硬编码默认之上、_default 与用户级之下
+    global_layer = {k: cfg[k] for k in GLOBAL_CONFIG_KEYS
+                    if k in cfg and cfg[k] is not None}
     for layer_name, layer in (("default(硬编码)", {f: r["default"] for f, r in CONFIG_RULES.items()}),
+                              ("global(顶级)", global_layer),
                               ("_default", cfg.get("_default") or {}),
                               (user_key, cfg.get(user_key) or {})):
         for k, v in layer.items():

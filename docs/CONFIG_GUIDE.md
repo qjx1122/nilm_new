@@ -102,6 +102,7 @@ ua: {ch: 1, column: load_iden_data9, multiplier: 0.001, unit: V}
 ## 9. `infer_model`（默认注释）
 
 推理模型选择：不配置 = 用该用户训练对比综合最优（`best_model`）；配置则强制指定（必须在该用户训练清单内；§13 禁止借用他人模型）。
+注意：用户 JSON 侧的 `infer_model`（用户级 / `_default` / 顶级全局，见第 11 节）优先级均高于此处 yaml 全局项。
 
 ---
 
@@ -183,7 +184,8 @@ ua: {ch: 1, column: load_iden_data9, multiplier: 0.001, unit: V}
 {
   "<device>_<user>": { ...单用户配置... },
   "_default":        { ...全局默认... },
-  "_user_id_map":    { "<user_id>": "<device>_<user>" }
+  "_user_id_map":    { "<user_id>": "<device>_<user>" },
+  "infer_model":     "ridge"
 }
 ```
 
@@ -192,10 +194,16 @@ ua: {ch: 1, column: load_iden_data9, multiplier: 0.001, unit: V}
 | `<device>_<user>` | 用户配置键，必须严格匹配 user_key 格式（如 `800080252842_4206894986488`）|
 | `_default` | 全局默认层：所有用户共享，被具体 user_key 配置覆盖 |
 | `_user_id_map` | 单独 user_id 键的**显式映射层**（`{user_id: user_key}`）。§12.1 禁止隐式猜测——不在映射中的非法键直接报错 |
+| `infer_model` | **全局推理模型**（`contracts.GLOBAL_CONFIG_KEYS`）：配置后所有用户默认用该模型推理；未配置走原逻辑（用户级 infer_model / best_model）。可被 `_default` 与用户级同名字段覆盖 |
 | 其他 `_` 前缀键 | 保留键（如 `_note_`/`_comment_`），不作为用户数据加载 |
 
-**优先级**：具体 user_key 配置 > `_default` > 代码硬编码默认（`contracts.CONFIG_RULES`）。
+**优先级**：具体 user_key 配置 > `_default` > 顶级全局键（如 `infer_model`）> 代码硬编码默认（`contracts.CONFIG_RULES`）。
 合并来源记录在运行时配置的 `_provenance` 字段（可在日志/调试中溯源每个值来自哪层）。
+
+**infer_model 完整回退链**（推理模型选择，`user_task.run_user_infer`）：
+用户级 `infer_model` → `_default.infer_model` → JSON 顶级全局 `infer_model` →
+`default.yaml` 的 `infer_model` → 该用户训练综合最优 `best_model`。
+指定的模型必须在该用户训练清单内（§13 禁止借用他人模型），否则报 `MODEL_NOT_FOUND`。
 
 ## 12. 用户级标量字段（校验规则见 `CONFIG_RULES` + `user_config.py`）
 

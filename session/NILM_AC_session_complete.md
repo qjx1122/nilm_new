@@ -694,3 +694,16 @@
 - 关键决策：算法侧"无解"结论维持且证据从统计重叠升级为确定性几何重叠；线性模型权重级归因三步法沉淀入决策记录
 - 未决问题：方案②风险标记落地待用户拍板（涉及推理产物列/契约变更）
 - 相关文件/分支：REPORT_TEST.md（新专题）、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-09-02] 会话纪要（第 58 次）
+- 任务：time_filters.json 增加顶级全局 infer_model 配置——有配置则默认用指定模型推理，无配置走原逻辑
+- 完成内容：
+  - contracts.py 新增 GLOBAL_CONFIG_KEYS=("infer_model",)（顶级全局配置键白名单）
+  - user_config.py：list_user_keys 跳过全局键（不再当非法用户键报错）；resolve_user_config 插入 global(顶级) 合并层，优先级=用户级 > _default > 顶级全局 > 硬编码默认，_provenance 可溯源
+  - user_task.py 推理模型选择注释更新为完整回退链：用户级 → _default → JSON 顶级全局 → yaml infer_model → best_model（选择表达式本身无需改动，合并层已注入 user_cfg）
+  - 测试 +5（tests/test_user_config.py）：全局生效/未配置回落 None/用户级与 _default 覆盖全局/全局键不作用户键/类型校验——172 项全过
+  - 778 端到端三场景验证：顶级 proportional→model=proportional；无顶级→model=history_profile(best)；顶级 proportional+用户级 ridge→model=ridge
+  - 文档：CONFIG_GUIDE §11 顶级键表+完整回退链、§9 yaml 侧提示；README 配置结构段更新
+- 关键决策：顶级全局键插位在 _default 之下（_default 是显式默认段更具体）；用白名单豁免而非放开全部非 _ 顶级键（保持非法键报错契约）
+- 未决问题：无新增
+- 相关文件/分支：nilm/common/contracts.py、nilm/pipeline/user_config.py、nilm/pipeline/user_task.py、tests/test_user_config.py、docs/CONFIG_GUIDE.md、README.md；分支 arena/019ffeb6-nilm-new

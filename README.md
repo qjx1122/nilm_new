@@ -63,8 +63,10 @@ data/
 - `configs/default.yaml`：基础配置（质量门禁 / 聚合策略 / 特征 / L=96 窗口 / 模型清单 / 字段映射）
   ——**逐项详解见 [`docs/CONFIG_GUIDE.md`](docs/CONFIG_GUIDE.md)**（v2.0：yaml + 用户 JSON 全字段、8 模型说明与训练效率因素、字段生效位置速查）
 - `--time-filter-config` 用户 JSON（指南 §12）：键 = `user_key=<device>_<user>`，优先级
-  `具体 user_key > _default > 硬编码默认`；字段校验规则见指南 §12.3（target_col、on_thr_w、
-  split_ratios、split_strategy、post_min_on、post_fill_short_off、weather_* 等）
+  `具体 user_key > _default > 顶级全局键 > 硬编码默认`；字段校验规则见指南 §12.3（target_col、on_thr_w、
+  split_ratios、split_strategy、post_min_on、post_fill_short_off、weather_* 等）；
+  顶级 `infer_model` 为全局推理模型（配置后所有用户默认用它推理，可被 `_default`/用户级覆盖；
+  未配置走原逻辑：用户级 infer_model → yaml infer_model → 训练综合最优 best_model）
 
 ## 输出产物（不入库）
 
