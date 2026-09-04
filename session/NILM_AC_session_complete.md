@@ -787,3 +787,14 @@
 - 关键决策：B1 单独使用即最优（组合阈值反降 F1）；「容量与数据量匹配比更大更好重要」负结果入档
 - 未决问题：B1 参数为离线矩阵口径，正式启用时 --force 重跑以产物为准；train 期 4 月漂移 FP 若需治理走季节分段建模（当前 test/推理均夏季模式，无必要）
 - 相关文件/分支：configs/default.yaml（注释更新）、REPORT_TEST.md、STATUS.md；分支 arena/019ffeb6-nilm-new
+
+## [2026-09-04] 会话纪要（第 65 次）
+- 任务：查看所有用户数据 transformer 模型指标
+- 完成内容：
+  - 5 户全量批跑（transformer B1 推荐参数 epochs 150/patience 20 + infer_model=transformer，--force train+infer）：8 OK / 2844 训练+推理均 DATA_QUALITY_FAILED（bus 69.63<70，既有数据问题）
+  - 训练 test F1：2842 **0.9886**（B1 参数流水线实跑与离线矩阵 0.9880 一致，早停 epoch 47）、778 0.9610、789 0.9533、0800 0.6215（可见性缺失户）；4 户 best_model 均为 transformer
+  - 推理 F1：2842 **0.9913（该户历史最好**，超 ridge 0.986）、789 0.9709（开机天 28/28，超预期——on_thr_w=60 待议项可降级）、778 0.9003（recall 1.0 但 FP 208 待查，该户 hp 0.9925/xgb 更优，生产不建议 transformer）、0800 0.4671（既有结论范围内）
+  - PRED_COLLAPSED 第二次实战命中（0800 hp/ridge 双坍缩正确标记）
+- 关键决策：transformer B1 参数在质量合格+可见性正常的 3 户全部 F1>0.9 确认为可用基线；模型选择仍应按户（778 用 hp/xgb）
+- 未决问题：778 FP 208 形态待查；2844 数据侧修复
+- 相关文件/分支：REPORT_TEST.md（新专题）、STATUS.md；分支 arena/019ffeb6-nilm-new
