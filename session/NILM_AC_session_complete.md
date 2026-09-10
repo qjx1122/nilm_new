@@ -78,3 +78,14 @@
 - 关键决策：只增显式通道不改自动判定（向后兼容 v1.3）；两条防呆对应本 session 真实教训（2.5h 级沙盒长跑、模式判定违背用户意图）
 - 未决问题：其余 4 户重训、W-1 回推上游、REPORT.md 落版（候选三条）仍待用户指示
 - 相关文件/分支：ROLE.md、STATUS.md、session/NILM_AC_session_complete.md｜本回合全量推送（tip 见 git log）
+
+## [2026-09-10] 会话纪要（Session 8：2842 模式 B 重训闭环）
+- 目标：重训 2842（用户显式指定模式 B，ROLE v1.4）
+- 本会话角色：资深电力算法专家（默认）
+- 完成项：
+  - 执行包 v1（bash 语法）在用户 PowerShell 报错 → v2 修正（PowerShell 原生命令、base_t5.yaml 入库）
+  - 用户 RTX 3080 本地执行成功（全程约 30 秒），实录判读：test F1 0.9833/MAE 91.5/R² 0.810/SAE 0.074、infer F1 0.9897/P 0.984/FP 19/MAE 250.9；W-1 修复三重验证（分段日志 12/7/11/2 段、窗口 4666 个 0 跨间断与沙盒完全一致、早停 epoch 47）；对 B1 历史最好 infer F1 0.9913 实质持平，幅值全面改善；日级 SAE 递增确认 7 月幅值漂移（既有数据侧问题）
+  - REPORT_TEST.md 2842 专题结果/结论落盘；STATUS 更新
+- 关键决策：执行包默认 PowerShell 优先/bash 备选；配置文件入库优于本地创建（BOM 坑）；2842 基线候选入 REPORT.md
+- 未决问题：其余 3 户（800/778/2844）模式 B 重训；W-1 回推上游；REPORT.md 落版（候选四条）；7 月幅值漂移治理；W-2/W-3
+- 相关文件/分支：REPORT_TEST.md、STATUS.md、configs/base_t5.yaml｜本回合全量推送
