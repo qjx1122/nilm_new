@@ -1,0 +1,31 @@
+{
+  "800080270708_4206602981958": {
+    "target_col": "p1+p2",
+    "on_thr_w": 50.0,
+    "split_ratios": [0.70, 0.15, 0.15],
+    "split_strategy": "global_stratified",
+    "post_min_on": 2,
+    "post_fill_short_off": 3,
+    "weather_latitude": 30.59,
+    "weather_longitude": 114.31,
+    "use_weather_features": true,
+    "use_temp_based_season": true,
+    "train": {
+      "include": [["2025-07-10", "2026-06-28"]],
+      "exclude": [["2026-04-02 17:45", "2026-04-02 23:59:59"]]
+    },
+    "infer": {
+      "exclude": [["2026-06-05", "2026-06-05"]]
+    },
+    "splits": {
+      "train": {"exclude": [["2026-06-12", "2026-06-12"]]},
+      "val": {"include": [["2026-06-20", "2026-06-20"]]},
+      "test": {"include": [["2026-06-25", "2026-06-25"]]}
+    }
+  },
+  "_default": {
+    "on_thr_w": 10.0,
+    "split_ratios": [0.6, 0.2, 0.2],
+    "split_strategy": "stratified_day"
+  }
+}

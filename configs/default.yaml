@@ -1,0 +1,90 @@
+# NILM 负荷辨识流水线 —— 基础配置（对齐《工商业负荷辨识算法开发指南 V2.1》）
+# 用户级配置在 --time-filter-config 指定的 JSON 中（指南 §12），优先级高于本文件默认值。
+
+experiment_name: guide_v2_1
+seed: 42
+output_dir: outputs
+
+data:
+  trains_root: data/trains     # §3.1：data/trains/<device>_<user>/
+  infers_root: data/infers     # §3.1：data/infers/<device>_<user>/（分路仅离线评估）
+  sentinel_values: [-2147483648, 2147483647]   # INT32_MIN/MAX 哨兵值 → NaN（实测数据确认）
+  derive_phase_from_ptotal: true   # 分相功率缺失时 ptotal/3 均分（临时假设，报告显式标记）
+
+quality:                       # §6 质量门禁（阈值按 5 用户实测数据校准，见 STATUS.md 决策记录）
+  max_missing_rate: 0.9
+  min_coverage: 0.15
+  min_score: 70                # 数据质量得分阈值（2026-08-18 由 10 上调：门禁与逐天质量表/双达标口径共用）
+  min_days: 3                  # 与 time_filters.json 中最短训练窗口（6 天）相容
+  max_daily_missing_rate: 0.9  # 日级无效天阈值：全天缺失或当日缺失率超此值的天，
+                               #   不参与模型训练与训练/推理阶段的评估指标计算
+
+preprocess:
+  clip_negative: true
+  allow_negative_power: false  # §2.3：原则上非负；允许反送电必须显式改为 true
+  max_gap_interp: 2
+  save_cleaned_csv: true       # 清洗后数据落盘 cleaned/{bus,branch}_cleaned.csv（false 关闭）
+  min_overlap: 0.3             # 母线/分路时间重叠率门禁（稀疏用户实测放宽，见 STATUS.md）
+  agg_strategy:                # §5.2：聚合策略可配置且必须记录（落盘 agg_strategy.json）
+    u: mean
+    i: mean
+    p: mean
+    pf: recompute              # 优先 P/S 重算；禁止无说明直接平均
+
+features:                      # §8（FFT/THD 禁用，§8.5）
+  lags: [1, 2, 3, 4]
+  rolling_windows: ["1h", "6h", "24h"]
+
+dataset:                       # §10
+  window: 96                   # L=96，过去 24 小时
+  mode: seq2seq                # 默认 Seq2Seq，可配置 seq2point
+
+# 总线字段映射（§3.2/§4）：ChN 只是通道标识，物理含义必须由本配置确认。
+# 官方点位表（2026-08-14 确认）：三相电压/电流/有功功率/功率因素 → load_iden_dataN。
+# 倍率规则（官方确认）：实际物理量 = 文件原始数据 / 1000（multiplier: 0.001），
+#   如 PF 原始 916 → 0.916；CT/PT 倍率统一经 multiplier 配置化（§4）。
+# 规则：文件中找不到对应列时，日志提示并将该列数据置 0（MISSING_COLUMN_ZERO_FILLED）。
+# 说明：不同设备文件列集合可能不同（如实测 842 缺 data9/45/81/37/44），置 0 规则保证流程可用。
+bus_field_map:
+  ua:    {ch: 1, column: load_iden_data9,  multiplier: 0.001, unit: V}
+  ub:    {ch: 1, column: load_iden_data45, multiplier: 0.001, unit: V}
+  uc:    {ch: 1, column: load_iden_data81, multiplier: 0.001, unit: V}
+  ia:    {ch: 1, column: load_iden_data1,  multiplier: 0.001, unit: A}
+  ib:    {ch: 1, column: load_iden_data37, multiplier: 0.001, unit: A}
+  ic:    {ch: 1, column: load_iden_data73, multiplier: 0.001, unit: A}
+  pa:    {ch: 1, column: load_iden_data7,  multiplier: 0.001, unit: W}
+  pb:    {ch: 1, column: load_iden_data43, multiplier: 0.001, unit: W}
+  pc:    {ch: 1, column: load_iden_data79, multiplier: 0.001, unit: W}
+  pfa:   {ch: 1, column: load_iden_data8,  multiplier: 0.001, unit: ""}
+  pfb:   {ch: 1, column: load_iden_data44, multiplier: 0.001, unit: ""}
+  pfc:   {ch: 1, column: load_iden_data80, multiplier: 0.001, unit: ""}
+
+models:                        # 多模型对比：注册表 + 配置驱动
+  # 当前只保留 3 个基线/线性模型（2026-08-17 用户要求，其余临时注释；恢复取消注释即可）
+  # 压 FP 调参（2026-08-18，2842 实测）：history_profile 中位画像（FP 363→184）；
+  # ridge 关态样本加权 off_weight=5（FP 481→342）——两者均为默认关闭的可选参数
+  - name: history_profile
+    params: {agg: median}
+  - name: proportional
+  - name: ridge
+    params: {alpha: 1.0, off_weight: 5.0, off_thr_w: 10.0}
+  # - name: random_forest      # 随机森林回归（sklearn，原生 multioutput）
+  #   params: {n_estimators: 200, min_samples_leaf: 2}
+  # - name: xgboost            # XGBoost 回归（每分路一回归器；有 val 时早停）
+  #   params: {n_estimators: 400, max_depth: 6, learning_rate: 0.05}
+  # 深度模型 device 默认 auto：自动检测 GPU（CUDA→MPS→CPU）；可显式 {device: cpu|cuda}
+  # - name: lstm               # LSTM 时序回归（L=96 滑窗，Seq2Point 逐点输出）
+  #   params: {window: 96, hidden_size: 64, epochs: 60, patience: 8}
+  # - name: cnn1d              # 1D-CNN 时序回归（卷积堆叠+全局池化）
+  #   params: {window: 96, channels: 32, epochs: 60, patience: 8}
+  # - name: transformer        # Transformer 时序回归（Encoder+位置编码）
+  #   params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 60, patience: 8}
+  #   分类指标调优（2026-09-03，2842 实测）：epochs 150 + patience 20 更优——
+  #   test F1 0.984→0.988、precision 0.981→0.996（FP 19→4）、日级 precision 中位 0.980→1.000；
+  #   代价 CPU 训练 6→22 分钟；加宽 d_model=128/layers=3 反而过拟合（最差天 0.825），勿加宽
+
+# 指标：回归（mae/rmse/r2/sae）+ 状态分类（f1/accuracy/precision/recall，按 on_thr_w 二值化）
+#      + 混淆矩阵计数（tp/fp/fn/tn，同一二值化口径，诊断输出不参与最优模型排序）
+metrics: [mae, rmse, r2, sae, f1, accuracy, precision, recall, tp, fp, fn, tn]
+
+# infer_model: ridge           # 推理模型；缺省采用该用户训练对比的综合最优
