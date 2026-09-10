@@ -46,3 +46,14 @@
   - REPORT.md 暂不创建（候选稳定结论两条待用户确认）
 - 未决问题：W-1/W-2 修复与重训复核；W-3 合并语义拍板；OQ-01/02 附件缺文件；OQ-11 倍率口径待采集方核对
 - 相关文件/分支：REPORT_TEST.md、NILM_DATA_DICT.md、STATUS.md、session/NILM_AC_session_complete.md｜评审对象 origin/arena/019ffeb6-nilm-new｜本分支 commit 见 git log
+
+## [2026-09-10] 会话纪要（Session 5：W-1 修复复核 + 快照回退重建 + ROLE v1.3 执行分级）
+- 目标：修复 W-1（分段构窗+单测）后重训深度模型复核指标；执行推送；分析并落盘 ROLE.md 执行环境分级
+- 本会话角色：资深电力算法专家 + 工程实现工程师（交付验证优先）
+- 完成项：
+  - W-1 修复与对照实验（首次完成于本 session 前段）：segment_bounds 原语+分段构窗+接口扩展+13 项守卫测试（193/193）；5 户真实数据前后对照——跨间断窗 1045/1109→0（2842 曾跨 231 天）、2842 幅值四段全线改善（test MAE -15.6%/SAE -30.5%/R² 0.765→0.808、infer 不降）、800 train/val/test MAE·R² 改善+infer F1 0.467→0.750、分类 F1 行为修正（precision 升/recall 回落）如实归因；基线模型前后一致（回归锚）
+  - **快照回退灾后重建**（第 2 次回退，恰逢 GitHub token 失效）：未推送 5 commit+`/tmp` 实验现场灭失；按远端 34670d5+会话上下文重建（C1 基线 stat 80/8626 对账一致、C2 重打后 193/193 复验、C4 报告补实录灭失注记），推送 7a2c02f 并 ls-remote 核验
+  - ROLE.md v1.3：新增全角色「执行环境分级与协作模式」（A 沙盒自执行默认 / B 用户本地执行）+ 三个技术角色挂接条款；决策依据=本 session 沙盒瓶颈实证与调参教练既有模式
+- 关键决策：双模式分级而非一刀切（≤15min 轻量留沙盒）；未推送=随时不存在→推送失败必须下回合优先重试；重要结论当场写 REPORT_TEST.md（/tmp 日志不可依赖）
+- 未决问题：W-1 修复是否回推 019ffeb6 上游；800 recall 回落业务拍板；W-2/W-3 未修；778/789 生产口径复核（模式 B 候选）；OQ-01/02/11 外部依赖
+- 相关文件/分支：nilm/{common/schema,preprocess/dataset,models/*,pipeline/user_task}.py、tests/test_window_continuity.py、REPORT_TEST.md、ROLE.md、STATUS.md｜分支 tip 7a2c02f 后续提交见 git log
