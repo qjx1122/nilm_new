@@ -136,3 +136,100 @@
 - 与修复前历史对照：点级 infer F1 0.9709→0.9566（-0.014，小幅回落）、开机天 28/28 持平——**789 受 W-1 影响很小**（14 天连续训练窗、跨间断面小），与其数据形态预期一致；幅值类（infer MAE 482W/SAE 0.55）反映 7 月负荷水平高于训练窗（其既有「训练期与推理期负荷漂移」结论口径不变）
 - 是否进入 REPORT.md（稳定结论）：**是（建议登记）**——「789 合法口径基线（2026-09-10）：infer F1 0.957/P 0.974/R 0.940、开机天 28/28、日级 F1 中位 0.967；受 W-1 影响可忽略」
 - 遗留问题：①test 段 R² 0.429/SAE 0.428 偏弱——test 天数少（约 2 天）且幅值形态与训练窗差异大，属小样本+漂移，非缺陷；②其余 4 户（2842/800/778/2844）重训待用户指示（2842 ~23min/户、2844 门禁拦截预期不变）；③infer 幅值漂移老问题不在本任务范围
+
+## [2026-09-10] 专题：2842 transformer 重训（模式 B 执行包）
+- 类型：实验专题（用户显式指定模式 B，ROLE v1.4）
+- 目标与假设：
+  - 用 W-1 修复后代码（本分支，tip ≥ 537d9a6）对 2842 以其生产配置（time_filters.json：target p1+p2、on_thr_w 50、训练窗 2025-07-10~2026-06-30、infer 2026-07）重训 transformer（B1 推荐参数 epochs150/patience20/window96）
+  - 预期（基于修复前后同条件对照实验）：幅值指标改善（修复前同配置实测 test MAE 105.5→修复后 89.0、R² 0.765→0.808、SAE 0.137→0.095）、F1 大致持平或略降（0.9886→0.9832）、infer 不降（0.9930→0.9922）
+- 方法 / 数据 / 参数：见下方执行包
+- 用户执行命令（实录路径：待用户回报后补记）：
+
+### 📦 执行包（用户本地执行，建议 GPU 环境）
+**① 环境准备**（已有可用 Conda/pip 环境且装过本流水线依赖的可跳过）：
+```bash
+git fetch origin
+git checkout arena/01a0896c-nilm-new        # W-1 修复后代码（含 configs/time_filters.json）
+# 自检：以下应能找到（修复标识）
+grep -c "segment_bounds" nilm/common/schema.py   # 应 ≥1
+pip install -r requirements.txt -r requirements-ml.txt   # 需 torch>=2.0；GPU 机自动用 CUDA（device: auto）
+```
+**② 数据就位**（data/ 不在代码分支，在 arena/019ffeb6-nilm-new 工作区）：
+```bash
+# 从 019ffeb6 工作区把 data/ 链接或复制到当前目录（Windows 用 mklink /J data <路径>\data）
+ln -s <你的019ffeb6工作区>/data data      # 或复制 data/trains/800080252842_4206894986488 与 data/infers/同名目录
+```
+**③ 配置文件**：新建 `base_t5.yaml`（内容如下，与本流水线 default.yaml 同构、仅 transformer）：
+```yaml
+experiment_name: t5_transformer_retrain
+seed: 42
+output_dir: outputs
+data:
+  trains_root: data/trains
+  infers_root: data/infers
+  sentinel_values: [-2147483648, 2147483647]
+  derive_phase_from_ptotal: true
+quality:
+  max_missing_rate: 0.9
+  min_coverage: 0.15
+  min_score: 70
+  min_days: 3
+  max_daily_missing_rate: 0.9
+preprocess:
+  clip_negative: true
+  allow_negative_power: false
+  max_gap_interp: 2
+  save_cleaned_csv: true
+  min_overlap: 0.3
+  agg_strategy: {u: mean, i: mean, p: mean, pf: recompute}
+features:
+  lags: [1, 2, 3, 4]
+  rolling_windows: ["1h", "6h", "24h"]
+dataset:
+  window: 96
+  mode: seq2seq
+bus_field_map:
+  ua:    {ch: 1, column: load_iden_data9,  multiplier: 0.001, unit: V}
+  ub:    {ch: 1, column: load_iden_data45, multiplier: 0.001, unit: V}
+  uc:    {ch: 1, column: load_iden_data81, multiplier: 0.001, unit: V}
+  ia:    {ch: 1, column: load_iden_data1,  multiplier: 0.001, unit: A}
+  ib:    {ch: 1, column: load_iden_data37, multiplier: 0.001, unit: A}
+  ic:    {ch: 1, column: load_iden_data73, multiplier: 0.001, unit: A}
+  pa:    {ch: 1, column: load_iden_data7,  multiplier: 0.001, unit: W}
+  pb:    {ch: 1, column: load_iden_data43, multiplier: 0.001, unit: W}
+  pc:    {ch: 1, column: load_iden_data79, multiplier: 0.001, unit: W}
+  pfa:   {ch: 1, column: load_iden_data8,  multiplier: 0.001, unit: ""}
+  pfb:   {ch: 1, column: load_iden_data44, multiplier: 0.001, unit: ""}
+  pfc:   {ch: 1, column: load_iden_data80, multiplier: 0.001, unit: ""}
+models:
+  - name: transformer
+    params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 150, patience: 20}
+metrics: [mae, rmse, r2, sae, f1, accuracy, precision, recall, tp, fp, fn, tn]
+```
+**④ 执行**（输出写入独立目录，避免与历史产物混淆）：
+```bash
+python scripts/run_batch_users.py --time-filter-config configs/time_filters.json \
+  --base-config base_t5.yaml --data-root data --output-root outputs_t5_2842 \
+  --user-key 800080252842_4206894986488
+```
+预计耗时：GPU 数分钟；纯 CPU 约 20~25 分钟。正常结束标志：`批量[infer] 800080252842_4206894986488 -> OK`。
+**⑤ 结果回收**（回报以下内容即可，其余我来判读）：
+- 控制台最后 5 行（含两行 `批量[...] -> 状态`，以及训练中出现的 `滑窗按时间连续段构造：N 段` 日志行）
+- 文件：`outputs_t5_2842/800080252842_4206894986488/train/<时间戳>/` 下 `metrics_by_split.csv`、`train_window_index.csv`；`infer/<时间戳>/` 下 `offline_metrics.json`、`metrics_daily.csv`（可直接粘贴内容或放入仓库后告知路径）
+- 便捷自检（可选，一条命令验证窗口连续性，期望 cross_gap=0）：
+```bash
+python -c "import pandas as pd;w=pd.read_csv('outputs_t5_2842/800080252842_4206894986488/train'.__import__('glob').glob('/*/')[-1]+'/train_window_index.csv');s=pd.to_datetime(w.win_end)-pd.to_datetime(w.win_start);print('windows',len(w),'cross_gap',(s>pd.Timedelta('23h45m')).sum(),'max',s.max())"
+```
+- 回收格式模板：
+```
+train 段: MAE=__ R2=__ SAE=__ F1=__ P=__ R=__
+val   段: MAE=__ R2=__ SAE=__ F1=__ P=__ R=__
+test  段: MAE=__ R2=__ SAE=__ F1=__ P=__ R=__ (FP=__ FN=__)
+infer : MAE=__ R2=__ SAE=__ F1=__ P=__ R=__
+windows=__ cross_gap=__ max_span=__
+训练日志是否出现"滑窗按时间连续段构造": 是/否
+批量状态: train=__ infer=__
+```
+- 结果 / 结论：**待用户执行回报后填写**（判读基准：修复前同配置实测 test F1 0.9886/MAE 105.5/R² 0.765/SAE 0.137、infer F1 0.9930/MAE 262.7；其 B1 报告 infer F1 0.9913 为修复前历史最好）
+- 是否进入 REPORT.md（稳定结论）：待结果回报后定
+- 遗留问题：无（等待回报）
