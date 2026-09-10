@@ -109,3 +109,30 @@
   - 778/789 本次为默认配置口径（tf_two 未含其生产节），生产配置下的复核建议后续补做
   - 修复代码目前在本 session 分支，019ffeb6 原分支未动；是否回推上游由用户决定
   - 实验原始日志因沙箱快照回退灭失于 /tmp，本表数字为当时提取值；完整复跑路径见「用户执行命令」节
+
+## [2026-09-10] 专题：指定用户 800080270789 transformer 重训（W-1 修复后合法口径基线）
+- 类型：实验专题（用户指定单户；原「5 户全量」任务按用户指示收窄至 789）
+- 目标与假设：
+  - 用 W-1 修复后代码（本分支 tip 6b3f9bb）对 789 以其**生产配置**（time_filters.json：target p1+p2、on_thr_w 60、训练窗 2026-05-21~06-04、infer 7 月）重训 transformer（B1 推荐参数 epochs150/patience20/window96），建立合法口径基线
+  - 假设：修复后该户指标应与其修复前历史（B1 全景 infer F1 0.9709、开机天 28/28）大体相当——789 训练窗仅 14 天且连续，跨间断面小，受 W-1 影响预计有限
+- 方法 / 数据 / 参数：
+  - 代码：本分支（含 W-1 分段构窗修复）；数据：`origin/arena/019ffeb6-nilm-new` worktree（/tmp/wt_data，symlink 只读复用）；配置：/tmp/audit/base_t5.yaml（transformer-only）+ configs/time_filters.json 789 生产节
+  - 执行模式：模式 A（ROLE v1.3——单命令 ~6min，全程已推送）
+  - 过程：首次启动因会话中断被杀客户端但训练进程存活，等待其自然完成（总 ~6min）后提取
+- 用户执行命令（实录：沙盒 /tmp/wt_run/outputs/800080270789_4206894986488 同名 789 目录内 metrics_by_split.csv / train_window_index.csv / metrics_daily.csv / offline_metrics.json；⚠️/tmp 不持久，复跑命令如下）：
+  - `git worktree add /tmp/wt_data origin/arena/019ffeb6-nilm-new && git worktree add /tmp/wt_run <本分支tip> && ln -s /tmp/wt_data/data /tmp/wt_run/data`
+  - `cd /tmp/wt_run && python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config /tmp/audit/base_t5.yaml --data-root data --output-root outputs --user-key 800080270789_4206680982373`
+- 结果 / 结论（transformer，生产口径）：
+
+| 段 | MAE | RMSE | R² | SAE | F1 | P / R | FP/FN |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| train | 89.7 | 151.3 | 0.939 | 0.014 | 0.9658 | .958 / .974 | 18/11 |
+| val | 169.0 | 262.2 | 0.797 | 0.015 | 0.9650 | .950 / .981 | 16/6 |
+| test | 121.1 | 169.5 | 0.429 | 0.428 | 0.9623 | .927 / 1.000 | 4/0 |
+| **infer（7 月，2630 点）** | 481.8 | 695.2 | 0.304 | 0.553 | **0.9566** | **.974 / .940** | — |
+
+- **窗口连续性：570 训练窗，0 跨间断（最大跨度=23.75h 标称）**；best=transformer，无 PRED_COLLAPSED/UNDER_TRAINED
+- **开机天识别 28/28（与其修复前 B1 报告 28/28 持平）**；日级 F1 中位 0.9673、达标天（>0.9）27/28；最差日 2026-07-27（0.739）即其历史已审查「中午 1.5h 真实停机」日，两口径互相印证
+- 与修复前历史对照：点级 infer F1 0.9709→0.9566（-0.014，小幅回落）、开机天 28/28 持平——**789 受 W-1 影响很小**（14 天连续训练窗、跨间断面小），与其数据形态预期一致；幅值类（infer MAE 482W/SAE 0.55）反映 7 月负荷水平高于训练窗（其既有「训练期与推理期负荷漂移」结论口径不变）
+- 是否进入 REPORT.md（稳定结论）：**是（建议登记）**——「789 合法口径基线（2026-09-10）：infer F1 0.957/P 0.974/R 0.940、开机天 28/28、日级 F1 中位 0.967；受 W-1 影响可忽略」
+- 遗留问题：①test 段 R² 0.429/SAE 0.428 偏弱——test 天数少（约 2 天）且幅值形态与训练窗差异大，属小样本+漂移，非缺陷；②其余 4 户（2842/800/778/2844）重训待用户指示（2842 ~23min/户、2844 门禁拦截预期不变）；③infer 幅值漂移老问题不在本任务范围

@@ -57,3 +57,14 @@
 - 关键决策：双模式分级而非一刀切（≤15min 轻量留沙盒）；未推送=随时不存在→推送失败必须下回合优先重试；重要结论当场写 REPORT_TEST.md（/tmp 日志不可依赖）
 - 未决问题：W-1 修复是否回推 019ffeb6 上游；800 recall 回落业务拍板；W-2/W-3 未修；778/789 生产口径复核（模式 B 候选）；OQ-01/02/11 外部依赖
 - 相关文件/分支：nilm/{common/schema,preprocess/dataset,models/*,pipeline/user_task}.py、tests/test_window_continuity.py、REPORT_TEST.md、ROLE.md、STATUS.md｜分支 tip 7a2c02f 后续提交见 git log
+
+## [2026-09-10] 会话纪要（Session 6：指定用户 789 transformer 重训）
+- 目标：用户在 5 户重训任务启动后收窄指示——针对 800080270789 进行 transformer 重训
+- 本会话角色：资深电力算法专家（默认）｜执行模式：模式 A（ROLE v1.3）
+- 完成项：
+  - 789 重训完成（生产配置，~6min）：train F1 0.966/val 0.965/test 0.9623/infer 0.9566（P 0.974/R 0.940）；**开机天 28/28 与修复前历史持平**；日级 F1 中位 0.9673、27/28 达标（最差 7-27=0.739 与其历史真实停机审查互证）；窗口连续性 570/570
+  - 判读：789 受 W-1 影响可忽略（14 天连续训练窗）；合法口径基线成立；test R² 0.429 属小样本+漂移非缺陷
+  - 专题报告落盘 REPORT_TEST.md（第三专题）
+- 关键决策：范围收窄留痕；先核查残留进程再等待（中断只杀客户端，训练孤儿进程存活至完成）避免重复训练
+- 未决问题：其余 4 户重训待指示；W-1 回推上游待拍板；REPORT.md 落版待确认（候选三条）；W-2/W-3/OQ 待办
+- 相关文件/分支：REPORT_TEST.md、STATUS.md、session/NILM_AC_session_complete.md｜分支 tip 见 git log（本回合全量推送）
