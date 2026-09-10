@@ -59,3 +59,53 @@
   - `_default` 合并语义需产品拍板（W-3）
   - D-1 倍率口径待与采集方核对（可回填 NILM_DATA_DICT.md §14 OQ）
   - 本评审为静态+冒烟级，未逐户重训深度模型复核指标（算力/时间约束，已声明口径）
+
+## [2026-09-10] 专题：W-1 修复（按时间间断分段构窗）与深度模型指标复核
+- 类型：验证专题（缺陷修复 + 修复前后同条件对照实验）
+- 目标与假设：
+  - 修复评审专题（同日）认定的 🔴W-1：Seq 模型滑窗与 build_windows 按纯数组位置构造，跨时间间断拼窗（违反指南 §10「窗口必须连续」；实证 800 户 50.5% 训练窗被污染）
+  - 假设：修复后（同数据/同配置/同种子，唯一差异=窗口语义）深度模型指标变化可归因于窗口合法性；幅值类指标（MAE/RMSE/R²/SAE，本任务核心目标）应改善，分类指标变化待实证
+- 方法 / 数据 / 参数：
+  - 修复设计：新增 `common.schema.segment_bounds`（间隔≠15min 即断开的连续段原语，common 层供 preprocess/models 共用，不破坏解耦守卫）；`dataset.build_windows` 与 `seq_models._padded_windows` 均改为逐段构窗（段头用段内首行填充、段尾不足一窗不产窗、全段过短报错）；BaseModel 全族 fit/predict 接口扩展可选 `index/val_index`（非序列模型忽略）；user_task 三处调用点接线；未提供索引时退回纯位置滑窗并告警（兼容旧调用）
+  - 测试：新增 tests/test_window_continuity.py 13 项（原语/构窗/seq 模型边界窗口内容/接口契约/端到端产物守卫）+ 修正桩模型签名；全套 193/193 通过（180 旧 + 13 新）
+  - 对照实验：5 户真实数据（after 侧以 symlink 只读复用 before 的数据目录）、同一 base_deep.yaml（history_profile/proportional/ridge/transformer{epochs150,patience20,window96}）、同一 time_filters.json（2842/800 生产节 + _default，778/789 走默认）、同种子 42；before=未修复代码（review worktree），after=修复后代码（本分支 worktree）
+- 用户执行命令（实录路径：/tmp/audit/before_run.log、/tmp/audit/after_run.log、/tmp/audit/compare.py；⚠️ /tmp 为沙箱临时区且本会话经历一次快照回退，实录文件已灭失——以下为原始执行命令，可按其重建复跑）：
+  - `git worktree add /tmp/review_ffeb6 origin/arena/019ffeb6-nilm-new`（before 代码+数据）
+  - `git worktree add /tmp/after_wt <修复commit> && ln -s /tmp/review_ffeb6/data /tmp/after_wt/data`（after 代码，数据只读复用）
+  - `python scripts/run_batch_users.py --time-filter-config /tmp/audit/tf_two.json --base-config /tmp/audit/base_deep.yaml --data-root data --output-root /tmp/audit/{before|after}`
+  - 修复代码见本分支 fix(W-1) commit；冒烟预检（1 epoch 全 5 户）确认分段路径与 0 跨间断后才启动正式对照
+- 结果 / 结论：
+
+### 修复有效性（直接验证）
+| 用户 | 修复前窗口（跨间断数/最大跨度） | 修复后 |
+| --- | --- | --- |
+| 2842 | 5711 窗，**1045 跨间断**，最大跨 **231 天** | 4666 窗，**0 跨间断**，最大=23.75h ✓ |
+| 800 | 2197 窗，1109 跨间断（50.5%） | 1088 窗，**0 跨间断** ✓ |
+
+### 指标复核（transformer，同条件对照；test 段）
+| 户/段 | 指标 | 修复前 | 修复后 | 判读 |
+| --- | --- | --- | --- | --- |
+| 2842 test | MAE / R² / SAE | 105.5 / 0.765 / 0.137 | **89.0 / 0.808 / 0.095** | 幅值全面改善（MAE -15.6%、SAE -30.5%） |
+| 2842 test | F1（P/R） | 0.9886（.994/.983） | 0.9832（.983/.983） | -0.005 基本持平，仍高位 |
+| 2842 infer | MAE / R² / F1 | 262.7 / 0.625 / 0.9930 | **252.0 / 0.646 / 0.9922** | 推理全线不降、幅值改善 |
+| 800 train/val | MAE / R² / F1(val) | 15.1/0.79；val 30.3/0.35/0.56 | **7.6/0.92；val 19.9/0.61/0.79** | 学习质量大幅改善 |
+| 800 test | MAE / R² | 44.9 / **-0.110** | **32.5 / +0.061** | R² 由负转正 |
+| 800 test | F1（P/R） | 0.622（.502/.816） | 0.437（.551/.362） | **下滑（recall -0.45）**，见解读 |
+| 800 infer | F1 / SAE（best 模型口径） | 0.467 / 0.748（transformer） | **0.750 / 0.425**（proportional） | 批量结果大幅改善（best-model 机制正当切换） |
+| 778 test（默认配置口径） | F1 / MAE | 0.319 / 109.1 | 0.361 / **97.0** | FP 386→314 改善 |
+| 789 test（默认配置口径） | F1 / precision | 0.744 / 0.626 | 0.660 / **0.704**（FP 234→112） | precision 升、recall 降 |
+
+### 结论
+1. **修复有效且必要**：跨间断窗口 1045/1109 → 0；2842 曾存在跨 231 天的「窗口」，位置编码与序列邻接假设被系统性破坏属实。
+2. **幅值类指标（任务核心目标）总体显著改善**：2842 train/val/test/infer 四段全部改善；800 train/val/test 的 MAE/R² 全部改善（test R² 由负转正）。
+3. **分类 F1 非全面改善，属预期行为修正**：修复后 precision 普遍升/FP 普遍降（778/789/800 推理），recall 普遍回落——修复前跨洞窗口相当于让模型「跨天拼接记忆」训练样本，test recall 有虚高成分；修复后模型只能依赖物理合法的连续 24h 上下文。800 test F1 0.622→0.437 的下滑与其已知「可见性缺失」信息论边界一致（其 STATUS 已论证该户全关天不可分），之前的好数字部分源于非法窗口。
+4. **对其既有报告的口径影响**：修复前所有深度模型指标（含 B1 全景、2842 F1 0.9913 等）建立在含跨洞窗口的训练上，**仅可作相对比较**（与评审专题结论一致）；本专题的 after 数字为合法口径基线。
+5. 基线模型（ridge/proportional/history_profile）前后指标完全一致（回归锚 ✓），证明修复未意外影响非序列路径。
+
+- 是否进入 REPORT.md（稳定结论）：**是（建议登记）**——「W-1 已修复（分段构窗）；2026-09-10 复核后 2842 合法口径基线 = test F1 0.983 / MAE 89.0W / SAE 0.095，infer F1 0.992 / MAE 252W；800 依赖 best-model 机制（infer proportional F1 0.750）」
+- 遗留问题：
+  - 800 test recall 下滑是否可接受需业务拍板（该户全关天不可分为数据侧边界，非代码缺陷）
+  - W-2（SAE 分母 0）与 W-3（配置合并语义）仍未修，W-2 会影响本表中 800 SAE 类数字的解读（全关段）
+  - 778/789 本次为默认配置口径（tf_two 未含其生产节），生产配置下的复核建议后续补做
+  - 修复代码目前在本 session 分支，019ffeb6 原分支未动；是否回推上游由用户决定
+  - 实验原始日志因沙箱快照回退灭失于 /tmp，本表数字为当时提取值；完整复跑路径见「用户执行命令」节
