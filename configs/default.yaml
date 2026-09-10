@@ -77,7 +77,7 @@ models:                        # 多模型对比：注册表 + 配置驱动
   #   params: {window: 96, hidden_size: 64, epochs: 60, patience: 8}
   # - name: cnn1d              # 1D-CNN 时序回归（卷积堆叠+全局池化）
   #   params: {window: 96, channels: 32, epochs: 60, patience: 8}
-  # - name: transformer        # Transformer 时序回归（Encoder+位置编码）
+  # - name: transformer        # Transformer 时序回归（Encoder+位置编码；W-1 修复后滑窗按时间连续段构造）
   #   params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 60, patience: 8}
   #   分类指标调优（2026-09-03，2842 实测）：epochs 150 + patience 20 更优——
   #   test F1 0.984→0.988、precision 0.981→0.996（FP 19→4）、日级 precision 中位 0.980→1.000；

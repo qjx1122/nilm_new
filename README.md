@@ -39,7 +39,7 @@ python3 -m venv .venv
 .venv/bin/python scripts/merge_user_data.py --sources <源1> <源2> [<源3> ...] \
     [--output-root outputs/merged] [--log-dir <日志目录>] [--no-keep-original]
 
-.venv/bin/python -m pytest tests/ -q             # 98 项测试（含解耦守卫与合并逻辑）
+.venv/bin/python -m pytest tests/ -q             # 193 项测试（含解耦守卫/合并逻辑/W-1 时间连续性守卫）
 ```
 
 合并脚本输出：`<output-root>/<数据源名>/<终端号_用户号>/` 复刻原层级（阶段一结果）+
@@ -118,6 +118,12 @@ scripts/run_batch_users.py   CLI 入口
 
 ## 当前状态
 
+- **W-1 已修复（2026-09-10）**：Seq 模型（lstm/cnn1d/transformer）与 build_windows
+  的滑窗改为**按时间连续段构造**（`common.schema.segment_bounds`：相邻间隔 ≠15min
+  即视为间断）——间断两侧不拼窗、段头用段内首行填充；`fit/predict` 新增可选
+  `index/val_index` 时间索引参数（全模型接口一致，非序列模型忽略）。修复前
+  按位置滑窗会把切分锚定/排除日造成的时间洞拼进窗口（实测 800 户 50.5% 训练窗
+  跨间断），违反指南 §10「窗口必须连续」。tests/test_window_continuity.py 13 项守卫。
 - 已对齐指南 V2.1：数据契约（RE_BUS/RE_BR/user_key）、用户 JSON 配置、时间过滤与切分锚定、
   可辨识性分析、批量执行（失败隔离/断点续跑/状态码）、单用户与多用户同路径执行
 - 内置 8 个模型：3 基线/线性（history_profile/proportional/ridge，零 ML 依赖）+
