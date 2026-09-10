@@ -145,81 +145,39 @@
 - 方法 / 数据 / 参数：见下方执行包
 - 用户执行命令（实录路径：待用户回报后补记）：
 
-### 📦 执行包（用户本地执行，建议 GPU 环境）
-**① 环境准备**（已有可用 Conda/pip 环境且装过本流水线依赖的可跳过）：
-```bash
+### 📦 执行包（v2 修订：Windows PowerShell 原生命令；v1 含 bash 语法致用户环境报错，已替换）
+> 适用环境：Windows + PowerShell；macOS/Linux 用户把「PowerShell 版」换成「bash 版」即可（两者都给出）。
+
+**① 拉代码 + 自检**（配置文件已入库 `configs/base_t5.yaml`，无需本地创建）：
+```powershell
 git fetch origin
-git checkout arena/01a0896c-nilm-new        # W-1 修复后代码（含 configs/time_filters.json）
-# 自检：以下应能找到（修复标识）
-grep -c "segment_bounds" nilm/common/schema.py   # 应 ≥1
-pip install -r requirements.txt -r requirements-ml.txt   # 需 torch>=2.0；GPU 机自动用 CUDA（device: auto）
+git checkout arena/01a0896c-nilm-new
+git pull origin arena/01a0896c-nilm-new          # 确保拿到 configs/base_t5.yaml
+(Select-String -Path nilm\common\schema.py -Pattern "segment_bounds").Count   # 期望 ≥1（W-1 修复标识）
 ```
-**② 数据就位**（data/ 不在代码分支，在 arena/019ffeb6-nilm-new 工作区）：
-```bash
-# 从 019ffeb6 工作区把 data/ 链接或复制到当前目录（Windows 用 mklink /J data <路径>\data）
-ln -s <你的019ffeb6工作区>/data data      # 或复制 data/trains/800080252842_4206894986488 与 data/infers/同名目录
+bash 版：`grep -c "segment_bounds" nilm/common/schema.py`
+
+**② 数据就位**（data/ 在 019ffeb6 工作区，用 Junction 链接；也可直接复制）：
+```powershell
+New-Item -ItemType Junction -Path data -Target "<你的019ffeb6工作区绝对路径>\data"
+Get-ChildItem data\trains                          # 验证：应能看到 5 个用户目录
 ```
-**③ 配置文件**：新建 `base_t5.yaml`（内容如下，与本流水线 default.yaml 同构、仅 transformer）：
-```yaml
-experiment_name: t5_transformer_retrain
-seed: 42
-output_dir: outputs
-data:
-  trains_root: data/trains
-  infers_root: data/infers
-  sentinel_values: [-2147483648, 2147483647]
-  derive_phase_from_ptotal: true
-quality:
-  max_missing_rate: 0.9
-  min_coverage: 0.15
-  min_score: 70
-  min_days: 3
-  max_daily_missing_rate: 0.9
-preprocess:
-  clip_negative: true
-  allow_negative_power: false
-  max_gap_interp: 2
-  save_cleaned_csv: true
-  min_overlap: 0.3
-  agg_strategy: {u: mean, i: mean, p: mean, pf: recompute}
-features:
-  lags: [1, 2, 3, 4]
-  rolling_windows: ["1h", "6h", "24h"]
-dataset:
-  window: 96
-  mode: seq2seq
-bus_field_map:
-  ua:    {ch: 1, column: load_iden_data9,  multiplier: 0.001, unit: V}
-  ub:    {ch: 1, column: load_iden_data45, multiplier: 0.001, unit: V}
-  uc:    {ch: 1, column: load_iden_data81, multiplier: 0.001, unit: V}
-  ia:    {ch: 1, column: load_iden_data1,  multiplier: 0.001, unit: A}
-  ib:    {ch: 1, column: load_iden_data37, multiplier: 0.001, unit: A}
-  ic:    {ch: 1, column: load_iden_data73, multiplier: 0.001, unit: A}
-  pa:    {ch: 1, column: load_iden_data7,  multiplier: 0.001, unit: W}
-  pb:    {ch: 1, column: load_iden_data43, multiplier: 0.001, unit: W}
-  pc:    {ch: 1, column: load_iden_data79, multiplier: 0.001, unit: W}
-  pfa:   {ch: 1, column: load_iden_data8,  multiplier: 0.001, unit: ""}
-  pfb:   {ch: 1, column: load_iden_data44, multiplier: 0.001, unit: ""}
-  pfc:   {ch: 1, column: load_iden_data80, multiplier: 0.001, unit: ""}
-models:
-  - name: transformer
-    params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 150, patience: 20}
-metrics: [mae, rmse, r2, sae, f1, accuracy, precision, recall, tp, fp, fn, tn]
+bash 版：`ln -s <019ffeb6工作区>/data data`
+
+**③ 执行**（单行命令，无续行符；GPU 机自动用 CUDA，纯 CPU 约 20~25 分钟）：
+```powershell
+python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_t5.yaml --data-root data --output-root outputs_t5_2842 --user-key 800080252842_4206894986488
 ```
-**④ 执行**（输出写入独立目录，避免与历史产物混淆）：
-```bash
-python scripts/run_batch_users.py --time-filter-config configs/time_filters.json \
-  --base-config base_t5.yaml --data-root data --output-root outputs_t5_2842 \
-  --user-key 800080252842_4206894986488
+正常结束标志：`批量[infer] 800080252842_4206894986488 -> OK`；训练中应出现日志「滑窗按时间连续段构造：N 段」（W-1 修复生效标识）。
+
+**④ 窗口连续性自检**（可选，期望 cross_gap=0）：
+```powershell
+python -c "import pandas as pd, glob; f=sorted(glob.glob('outputs_t5_2842/800080252842_4206894986488/train/*/'))[-1]+'train_window_index.csv'; w=pd.read_csv(f); s=pd.to_datetime(w.win_end)-pd.to_datetime(w.win_start); print('windows',len(w),'cross_gap',(s>pd.Timedelta('23h45m')).sum(),'max',s.max())"
 ```
-预计耗时：GPU 数分钟；纯 CPU 约 20~25 分钟。正常结束标志：`批量[infer] 800080252842_4206894986488 -> OK`。
+
 **⑤ 结果回收**（回报以下内容即可，其余我来判读）：
-- 控制台最后 5 行（含两行 `批量[...] -> 状态`，以及训练中出现的 `滑窗按时间连续段构造：N 段` 日志行）
-- 文件：`outputs_t5_2842/800080252842_4206894986488/train/<时间戳>/` 下 `metrics_by_split.csv`、`train_window_index.csv`；`infer/<时间戳>/` 下 `offline_metrics.json`、`metrics_daily.csv`（可直接粘贴内容或放入仓库后告知路径）
-- 便捷自检（可选，一条命令验证窗口连续性，期望 cross_gap=0）：
-```bash
-python -c "import pandas as pd;w=pd.read_csv('outputs_t5_2842/800080252842_4206894986488/train'.__import__('glob').glob('/*/')[-1]+'/train_window_index.csv');s=pd.to_datetime(w.win_end)-pd.to_datetime(w.win_start);print('windows',len(w),'cross_gap',(s>pd.Timedelta('23h45m')).sum(),'max',s.max())"
-```
+- 控制台最后 5 行（两行 `批量[...] -> 状态` + 是否出现「滑窗按时间连续段构造」）
+- 4 个文件内容：`outputs_t5_2842/800080252842_4206894986488/train/<时间戳>/` 下 `metrics_by_split.csv`、`train_window_index.csv`；`infer/<时间戳>/` 下 `offline_metrics.json`、`metrics_daily.csv`（粘贴或入仓库告知路径均可）
 - 回收格式模板：
 ```
 train 段: MAE=__ R2=__ SAE=__ F1=__ P=__ R=__
@@ -230,6 +188,7 @@ windows=__ cross_gap=__ max_span=__
 训练日志是否出现"滑窗按时间连续段构造": 是/否
 批量状态: train=__ infer=__
 ```
+
 - 结果 / 结论：**待用户执行回报后填写**（判读基准：修复前同配置实测 test F1 0.9886/MAE 105.5/R² 0.765/SAE 0.137、infer F1 0.9930/MAE 262.7；其 B1 报告 infer F1 0.9913 为修复前历史最好）
 - 是否进入 REPORT.md（稳定结论）：待结果回报后定
 - 遗留问题：无（等待回报）

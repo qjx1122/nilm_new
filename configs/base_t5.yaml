@@ -1,0 +1,56 @@
+# transformer-only base config (W-1 fixed pipeline; B1-recommended params)
+# Use: python scripts/run_batch_users.py --time-filter-config configs/time_filters.json \
+#        --base-config configs/base_t5.yaml --data-root data --output-root outputs_t5_2842 \
+#        --user-key 800080252842_4206894986488
+experiment_name: t5_transformer_retrain
+seed: 42
+output_dir: outputs
+
+data:
+  trains_root: data/trains
+  infers_root: data/infers
+  sentinel_values: [-2147483648, 2147483647]
+  derive_phase_from_ptotal: true
+
+quality:
+  max_missing_rate: 0.9
+  min_coverage: 0.15
+  min_score: 70
+  min_days: 3
+  max_daily_missing_rate: 0.9
+
+preprocess:
+  clip_negative: true
+  allow_negative_power: false
+  max_gap_interp: 2
+  save_cleaned_csv: true
+  min_overlap: 0.3
+  agg_strategy: {u: mean, i: mean, p: mean, pf: recompute}
+
+features:
+  lags: [1, 2, 3, 4]
+  rolling_windows: ["1h", "6h", "24h"]
+
+dataset:
+  window: 96
+  mode: seq2seq
+
+bus_field_map:
+  ua:    {ch: 1, column: load_iden_data9,  multiplier: 0.001, unit: V}
+  ub:    {ch: 1, column: load_iden_data45, multiplier: 0.001, unit: V}
+  uc:    {ch: 1, column: load_iden_data81, multiplier: 0.001, unit: V}
+  ia:    {ch: 1, column: load_iden_data1,  multiplier: 0.001, unit: A}
+  ib:    {ch: 1, column: load_iden_data37, multiplier: 0.001, unit: A}
+  ic:    {ch: 1, column: load_iden_data73, multiplier: 0.001, unit: A}
+  pa:    {ch: 1, column: load_iden_data7,  multiplier: 0.001, unit: W}
+  pb:    {ch: 1, column: load_iden_data43, multiplier: 0.001, unit: W}
+  pc:    {ch: 1, column: load_iden_data79, multiplier: 0.001, unit: W}
+  pfa:   {ch: 1, column: load_iden_data8,  multiplier: 0.001, unit: ""}
+  pfb:   {ch: 1, column: load_iden_data44, multiplier: 0.001, unit: ""}
+  pfc:   {ch: 1, column: load_iden_data80, multiplier: 0.001, unit: ""}
+
+models:
+  - name: transformer
+    params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 150, patience: 20}
+
+metrics: [mae, rmse, r2, sae, f1, accuracy, precision, recall, tp, fp, fn, tn]
