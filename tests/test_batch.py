@@ -545,10 +545,11 @@ def _register_constant_stub():
     class ConstantStub(BaseModel):
         name = "constant_stub"
 
-        def fit(self, X, y, feature_names=None, X_val=None, y_val=None):
+        def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+                index=None, val_index=None):   # W-1 接口扩展：接受并忽略时间索引
             self._k = y.shape[1]
 
-        def predict(self, X):
+        def predict(self, X, index=None):
             import numpy as np
             return np.full((len(X), self._k), 3.0)
 

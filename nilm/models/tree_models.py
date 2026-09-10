@@ -29,7 +29,8 @@ class RandomForestDisaggregator(BaseModel):
                          min_samples_leaf=min_samples_leaf, n_jobs=n_jobs,
                          random_state=random_state, **params)
 
-    def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
+    def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+            index=None, val_index=None) -> None:  # index 仅为接口一致（W-1），不使用
         from sklearn.ensemble import RandomForestRegressor  # 惰性导入
 
         self._n_out = y.shape[1]
@@ -41,7 +42,7 @@ class RandomForestDisaggregator(BaseModel):
             random_state=int(self.params["random_state"]))
         self._model.fit(X, y if self._n_out > 1 else y.ravel())
 
-    def predict(self, X) -> np.ndarray:
+    def predict(self, X, index=None) -> np.ndarray:  # index 仅为接口一致（W-1），不使用
         pred = self._model.predict(X)
         return pred.reshape(len(X), self._n_out)
 
@@ -76,7 +77,8 @@ class XGBoostDisaggregator(BaseModel):
                                    if use_early_stop else None),
             n_jobs=-1, verbosity=0)
 
-    def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
+    def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+            index=None, val_index=None) -> None:  # index 仅为接口一致（W-1），不使用
         self._n_out = y.shape[1]
         has_val = X_val is not None and y_val is not None and len(X_val) > 0
         self._models = []
@@ -88,5 +90,5 @@ class XGBoostDisaggregator(BaseModel):
                 m.fit(X, y[:, k])
             self._models.append(m)
 
-    def predict(self, X) -> np.ndarray:
+    def predict(self, X, index=None) -> np.ndarray:  # index 仅为接口一致（W-1），不使用
         return np.column_stack([m.predict(X) for m in self._models])

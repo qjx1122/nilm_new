@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from nilm.common.logging import get_logger
+from nilm.common.schema import MODEL_STEP, segment_bounds
 
 log = get_logger("preprocess.dataset")
 
@@ -29,13 +30,19 @@ def drop_invalid_rows(features: pd.DataFrame, target: pd.Series) -> tuple[pd.Dat
 
 def build_windows(X: np.ndarray, y: np.ndarray, index: pd.DatetimeIndex,
                   window: int = DEFAULT_WINDOW, stride: int = 1,
-                  mode: str = "seq2seq") -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+                  mode: str = "seq2seq",
+                  step: pd.Timedelta | None = MODEL_STEP) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """滑窗样本（§10）。
 
     mode='seq2seq'  : y_w = 整个窗口的标签序列 (m, window)（默认，§10）
     mode='seq2point': y_w = 窗口末点标签 (m,)
     返回 (X_w, y_w, 样本元信息[窗口序号/起止时间/日期])。
     调用方必须传入单一划分内部的数据，保证窗口不跨 split（防泄漏）。
+
+    时间连续性（§10「窗口必须连续」，W-1 修复 2026-09-10）：
+    窗口只在时间连续段内构造（common.schema.segment_bounds，间隔 != step 视为
+    间断）——间断两侧不拼窗；段尾不足一窗的点不产窗（记日志）。
+    ``step=None`` 退化为纯位置滑窗（旧行为，仅建议合成数据测试使用）。
     """
     if mode not in ("seq2seq", "seq2point"):
         raise ValueError(f"未知窗口模式: {mode}（指南 §10：默认 Seq2Seq，可配置 Seq2Point）")
@@ -44,7 +51,21 @@ def build_windows(X: np.ndarray, y: np.ndarray, index: pd.DatetimeIndex,
     n = len(X)
     if n < window:
         raise ValueError(f"样本数 {n} 小于窗口长度 {window}（L={window}）")
-    starts = np.arange(0, n - window + 1, stride)
+    idx = pd.DatetimeIndex(index)
+    if len(idx) != n:
+        raise ValueError(f"index 长度 {len(idx)} 与样本数 {n} 不一致")
+
+    bounds = segment_bounds(idx, step) if step is not None else [(0, n)]
+    starts_list = [np.arange(s, e - window + 1, stride) for s, e in bounds
+                   if e - s >= window]
+    if not starts_list:
+        raise ValueError(f"无长度 ≥ window({window}) 的时间连续段，无法构造窗口"
+                         f"（共 {len(bounds)} 段，最长段 {max(e - s for s, e in bounds)} 点）")
+    starts = np.concatenate(starts_list)
+    n_windowed = len(starts) + (window - 1) * len(starts_list)
+    if n_windowed < n:
+        log.info("时间连续段构窗：%d 段中段尾不足一窗的 %d 个点不产窗（§10 窗口必须连续）",
+                 len(bounds), n - n_windowed)
     Xw = np.stack([X[s:s + window] for s in starts], axis=0)
     if mode == "seq2seq":
         yw = np.stack([y[s:s + window] for s in starts], axis=0)
@@ -52,9 +73,9 @@ def build_windows(X: np.ndarray, y: np.ndarray, index: pd.DatetimeIndex,
         yw = y[starts + window - 1]
     meta = pd.DataFrame({
         "sample_id": np.arange(len(starts)),
-        "win_start": index[starts],
-        "win_end": index[starts + window - 1],
-        "date": index[starts + window - 1].date,
+        "win_start": idx[starts],
+        "win_end": idx[starts + window - 1],
+        "date": idx[starts + window - 1].date,
     })
     return Xw, yw, meta
 

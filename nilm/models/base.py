@@ -28,12 +28,21 @@ class BaseModel(ABC):
     def fit(self, X: np.ndarray, y: np.ndarray,
             feature_names: Sequence[str] | None = None,
             X_val: np.ndarray | None = None,
-            y_val: np.ndarray | None = None) -> None:
-        """训练。X_val/y_val 供早停类模型使用，其余模型可忽略。"""
+            y_val: np.ndarray | None = None,
+            index=None, val_index=None) -> None:
+        """训练。X_val/y_val 供早停类模型使用，其余模型可忽略。
+
+        index/val_index : 样本时间索引（DatetimeIndex，与 X/X_val 行对应）——
+        序列模型用于按时间连续段构造滑窗（指南 §10「窗口必须连续」，W-1）；
+        非序列模型可忽略。
+        """
 
     @abstractmethod
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """输出 (n_samples, n_branches) 的各分路有功功率估计。"""
+    def predict(self, X: np.ndarray, index=None) -> np.ndarray:
+        """输出 (n_samples, n_branches) 的各分路有功功率估计。
+
+        index : X 的时间索引（可缺省）；序列模型用于按连续段构窗（W-1）。
+        """
 
     # ---- 持久化：默认 pickle，子类可覆盖（如 DL 模型保存权重） ----
     def save(self, path: str | Path) -> None:

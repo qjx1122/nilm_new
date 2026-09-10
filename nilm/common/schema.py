@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+import numpy as np
 import pandas as pd
 
 # ---- 频率与点数约定（指南 §1/§2）----
@@ -16,6 +17,33 @@ BUS_POINTS_PER_DAY_FAST = 288
 FREQ_MAIN = "15min"             # 统一建模频率（指南 §1：统一建模频率为 15 分钟）
 POINTS_PER_DAY_MAIN = 96
 BRANCH_POINTS_PER_DAY = 96
+MODEL_STEP = pd.Timedelta(FREQ_MAIN)   # 建模采样步长（连续段判定基准）
+
+
+# ---- 时间连续段（指南 §10「窗口必须连续」的公共实现）----
+def segment_bounds(index: pd.DatetimeIndex,
+                   step: pd.Timedelta = MODEL_STEP) -> list[tuple[int, int]]:
+    """把时间索引切成连续段 [s, e)：相邻间隔 != step 即视为间断并断开。
+
+    指南 §10 要求「窗口必须连续」：滑窗样本只允许在段内构造，
+    不得把间断两侧的时间点拼进同一个窗口；预处理（dataset.build_windows）
+    与序列模型内部构窗（models.seq_models）共用本实现，保证口径一致。
+    """
+    n = len(index)
+    if n == 0:
+        return []
+    if n == 1:
+        return [(0, 1)]
+    d = (index[1:] - index[:-1]).to_numpy()            # timedelta64[ns]
+    breaks = np.flatnonzero(d != np.timedelta64(step.value, "ns"))
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    for b in breaks:
+        bounds.append((start, int(b) + 1))
+        start = int(b) + 1
+    bounds.append((start, n))
+    return bounds
+
 
 # ---- 标准列（指南 §4/§2.2）----
 BUS_REQUIRED = [

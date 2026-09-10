@@ -55,7 +55,8 @@ class HistoryProfile(BaseModel):
     def _agg_fn(self, arr: np.ndarray) -> np.ndarray:
         return np.median(arr, axis=0) if self.agg == "median" else arr.mean(axis=0)
 
-    def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
+    def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+            index=None, val_index=None) -> None:  # index 仅为接口一致（W-1），不使用
         self._slot_idx = _col_index(feature_names, "slot")
         slots = X[:, self._slot_idx].astype(int)
         n_slots = max(96, int(slots.max()) + 1)
@@ -84,7 +85,7 @@ class HistoryProfile(BaseModel):
         self._seen = np.zeros(n_slots, dtype=bool)
         self._seen[np.unique(slots)] = True
 
-    def predict(self, X) -> np.ndarray:
+    def predict(self, X, index=None) -> np.ndarray:  # index 仅为接口一致（W-1），不使用
         slots = np.clip(X[:, self._slot_idx].astype(int), 0, len(self._profile) - 1)
         if self._cond_profile is not None:  # 条件画像路径
             pbus = X[:, self._pbus_idx].astype(float)
@@ -110,12 +111,13 @@ class ProportionalAllocation(BaseModel):
 
     name = "proportional"
 
-    def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
+    def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+            index=None, val_index=None) -> None:  # index 仅为接口一致（W-1），不使用
         self._p_idx = _col_index(feature_names, "pbus")
         total = float(y.sum())
         self._shares = y.sum(axis=0) / total if total > 0 else np.full(y.shape[1], 1.0 / y.shape[1])
 
-    def predict(self, X) -> np.ndarray:
+    def predict(self, X, index=None) -> np.ndarray:  # index 仅为接口一致（W-1），不使用
         p_bus = X[:, self._p_idx]
         return np.clip(p_bus[:, None] * self._shares[None, :], 0.0, None)
 
@@ -140,7 +142,8 @@ class RidgeDisaggregator(BaseModel):
         self.off_weight = float(off_weight)
         self.off_thr_w = float(off_thr_w)
 
-    def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
+    def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+            index=None, val_index=None) -> None:  # index 仅为接口一致（W-1），不使用
         Xb = np.hstack([X, np.ones((len(X), 1))])
         reg = self.alpha * np.eye(Xb.shape[1])
         reg[-1, -1] = 0.0  # 不惩罚截距
@@ -153,6 +156,6 @@ class RidgeDisaggregator(BaseModel):
         else:
             self._W = np.linalg.solve(Xb.T @ Xb + reg, Xb.T @ y)
 
-    def predict(self, X) -> np.ndarray:
+    def predict(self, X, index=None) -> np.ndarray:  # index 仅为接口一致（W-1），不使用
         Xb = np.hstack([X, np.ones((len(X), 1))])
         return Xb @ self._W

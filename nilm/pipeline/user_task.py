@@ -306,15 +306,18 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         for spec in base_cfg.get("models", []):
             name, params = spec["name"], spec.get("params", {})
             model = MODEL_REGISTRY.create(name, **params)
+            # index/val_index：序列模型按时间连续段构窗（§10，W-1 修复）；其余模型忽略
             model.fit(scaled["train"][0], scaled["train"][1], feature_names=names,
-                      X_val=scaled["val"][0], y_val=scaled["val"][1])
+                      X_val=scaled["val"][0], y_val=scaled["val"][1],
+                      index=splits["train"][2],
+                      val_index=(splits["val"][2] if split_sizes.get("val", 0) > 0 else None))
             model.save(out / "models" / f"{name}.pkl")
 
             results_by_split[name] = {}
             for split in ("train", "val", "test"):
                 if len(scaled[split][0]) == 0:
                     continue
-                y_hat = model.predict(scaled[split][0])
+                y_hat = model.predict(scaled[split][0], index=splits[split][2])
                 y_hat = apply_constraints(y_hat, splits[split][0][:, pbus_col],
                                           nonnegative=not allow_negative,
                                           sum_consistency=False)
@@ -554,7 +557,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if not model_path.exists():
             raise UserTaskError(Status.MODEL_NOT_FOUND, f"模型文件缺失: {model_path}")
         model = BaseModel.load(model_path)
-        pred = model.predict(X).reshape(-1)
+        pred = model.predict(X, index=valid.index).reshape(-1)
         pred = apply_constraints(pred[:, None], valid["pbus"].to_numpy(),
                                  nonnegative=not allow_negative, sum_consistency=False)[:, 0]
 

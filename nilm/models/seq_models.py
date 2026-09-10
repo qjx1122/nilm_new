@@ -10,6 +10,9 @@
 窗口语义（Seq2Point 逐点版）：预测时刻 t 的输入为 [t-L+1, t] 的特征序列
 （序列头部不足 L 时复制首行填充），标签为 t 时刻分路功率——推理时每个
 时间点都有输出，与扁平模型输出对齐。
+时间连续性（W-1 修复，2026-09-10）：fit/predict 接受 ``index`` 时间索引，
+窗口按 common.schema.segment_bounds 的连续段构造——间断两侧不拼窗、
+段头用段内首行填充；未提供索引时退回纯位置滑窗并告警（仅建议测试用）。
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import numpy as np
 
 from nilm.common.logging import get_logger
+from nilm.common.schema import MODEL_STEP, segment_bounds
 from nilm.models.base import BaseModel
 from nilm.models.registry import MODEL_REGISTRY
 
@@ -45,12 +49,21 @@ def resolve_device(device: str = "auto") -> str:
     return device
 
 
-def _padded_windows(X: np.ndarray, window: int) -> np.ndarray:
-    """(n, f) → (n, window, f) 滑窗视图；头部复制首行填充（零拷贝 stride 视图）。"""
-    pad = np.repeat(X[:1], window - 1, axis=0)
-    Xp = np.concatenate([pad, X], axis=0)
-    win = np.lib.stride_tricks.sliding_window_view(Xp, window, axis=0)
-    return np.swapaxes(win, 1, 2)  # (n, window, f)
+def _padded_windows(X: np.ndarray, window: int,
+                    bounds: list[tuple[int, int]] | None = None) -> np.ndarray:
+    """(n, f) → (n, window, f) 滑窗视图；头部复制首行填充（零拷贝 stride 视图）。
+
+    W-1 修复（2026-09-10，指南 §10「窗口必须连续」）：给定 ``bounds``
+    （common.schema.segment_bounds 的时间连续段）时，逐段构造——
+    每段头部只复制**该段首行**，间断两侧的时间点绝不进入同一窗口；
+    ``bounds=None`` 保留旧行为（整体头填充，纯位置滑窗，仅建议测试用）。
+    """
+    if bounds is None or (len(bounds) == 1 and bounds[0] == (0, len(X))):
+        pad = np.repeat(X[:1], window - 1, axis=0)
+        Xp = np.concatenate([pad, X], axis=0)
+        win = np.lib.stride_tricks.sliding_window_view(Xp, window, axis=0)
+        return np.swapaxes(win, 1, 2)  # (n, window, f)
+    return np.concatenate([_padded_windows(X[s:e], window) for s, e in bounds], axis=0)
 
 
 class _SeqTorchModel(BaseModel):
@@ -69,7 +82,21 @@ class _SeqTorchModel(BaseModel):
     def _build_net(self, n_feat: int, n_out: int):
         raise NotImplementedError
 
-    def fit(self, X, y, feature_names=None, X_val=None, y_val=None) -> None:
+    def _bounds(self, index, n: int) -> list[tuple[int, int]]:
+        """由时间索引求连续段；index 缺省时退回纯位置单段（并告警，W-1）。"""
+        if index is None:
+            log.warning("[%s] 未提供时间索引，滑窗按纯位置构造（可能跨时间间断，"
+                        "违反指南 §10「窗口必须连续」）", self.name)
+            return [(0, n)]
+        import pandas as pd
+
+        bounds = segment_bounds(pd.DatetimeIndex(index), MODEL_STEP)
+        log.info("[%s] 滑窗按时间连续段构造：%d 段（步长 %s，间断处不跨段）",
+                 self.name, len(bounds), MODEL_STEP)
+        return bounds
+
+    def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+            index=None, val_index=None) -> None:
         import torch
 
         seed = int(self.params["random_state"])
@@ -80,7 +107,8 @@ class _SeqTorchModel(BaseModel):
         self._n_feat, self._n_out = X.shape[1], y.shape[1]
         self._net = self._build_net(self._n_feat, self._n_out).to(device)
 
-        Xw = _padded_windows(np.asarray(X, np.float32), window)
+        Xw = _padded_windows(np.asarray(X, np.float32), window,
+                             self._bounds(index, len(X)))
         yt = np.asarray(y, np.float32)
         # —— 标签标准化（0800 均值坍缩修复，2026-09-02）：y 原瓦数直接进 MSE 时，
         # 随机初始化网络前期梯度全在「常数输出爬向 y 均值」方向；小样本×大 batch
@@ -93,7 +121,8 @@ class _SeqTorchModel(BaseModel):
         yt = (yt - self._y_mean) / self._y_std
         has_val = X_val is not None and y_val is not None and len(X_val) > 0
         if has_val:
-            Xw_val = _padded_windows(np.asarray(X_val, np.float32), window)
+            vb = self._bounds(val_index, len(X_val))
+            Xw_val = _padded_windows(np.asarray(X_val, np.float32), window, vb)
             yv_n = (np.asarray(y_val, np.float32) - self._y_mean) / self._y_std
             yv = torch.from_numpy(yv_n).to(device)   # 早停损失与训练同域
 
@@ -159,13 +188,14 @@ class _SeqTorchModel(BaseModel):
             outs.append(self._net(xb))
         return torch.cat(outs, dim=0)
 
-    def predict(self, X) -> np.ndarray:
+    def predict(self, X, index=None) -> np.ndarray:
         import torch
 
         # 每次推理独立解析设备：GPU 机器训练的模型可在 CPU 机器加载推理（反之亦然）
         device = torch.device(resolve_device(self.params["device"]))
         self._net.to(device)
-        Xw = _padded_windows(np.asarray(X, np.float32), int(self.params["window"]))
+        Xw = _padded_windows(np.asarray(X, np.float32), int(self.params["window"]),
+                             self._bounds(index, len(X)))
         self._net.eval()
         with torch.no_grad():
             out = self._predict_windows(Xw, device)
