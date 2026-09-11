@@ -266,3 +266,54 @@ windows=__ cross_gap=__ max_span=__
 
 - 是否进入 REPORT.md（稳定结论）：**是（建议登记）**——「2844 被质量门禁拦截系 bus 质量分 69.63<70（差 0.37）；根因=总线/分路活跃窗口错位（59 天错位，bus 294 天断录），叠加标签 p3+p4 NaN 80.5%（有效标签天 30/390）；修复方向为补数而非调参」。
 - 遗留问题：2844 断录原因待采集方确认（新 OQ 候选）；「门禁 vs 时间过滤顺序」是否调整待立项评审；配置缺 on_thr_w 若未来放行需显式配置（现走硬编码默认 10W）。
+
+## [2026-09-11] 专题：2842/2844 目标分路修正重跑（模式 B 执行包 v3）
+- 类型：实验专题（**重大输入修正**：用户核查分路归属；**用户显式指定模式 B**，ROLE v1.4）
+- 修正内容（用户核查 2026-09-11）：**2842 目标分路=p1**（原配置 p1+p2 有误）、**2844=p2**（原 p3+p4 有误）。字典登记 OQ-13（NILM_DATA_DICT v0.2.2）；`configs/time_filters.json` 已同步修正入库（2842 的 on_thr_w=50 保留观察；2844 无 on_thr_w，走硬编码默认 10W）；**旧目标口径下的全部历史结论降级为「错误目标参考」，仅可作相对比较**
+- 数据旁证（两户分路 CSV 同名 `4206894986488-*.csv` 但内容不同，md5 各异）：
+  - **p2 列在两户文件中统计逐位相同**（NaN 7.89%、非零占比 13.78%、非零中位 709.3W、max 899W）→ 同一物理通道、两装置导出窗口不同；2844 取 p2 自洽
+  - **p1 仅在 2842 导出中覆盖健康**：NaN 5.25%、非零占比 40.5%、非零中位 709.8W、有效天 144/390（2844 文件中 p1 非零占比仅 27.9% 且有效天少）
+  - p3/p4 大面积缺失（2842：90.7%/42.3%；2844：64.0%/29.6%）恰为原配置错选通道——与「分路有误」结论互证
+- 沙盒预检（模式 A 尝试的遗留产物，**非权威参照**；用户改令模式 B 后已中止沙盒训练）：
+  - **2844（p2）全流程**：`DATA_QUALITY_FAILED: bus 质量分 69.63 < 70`——与 2844 归因专题逐位一致（**总线门禁与目标分路无关，修正后仍拦**）；但 **branch 质量分 53.29→92.10（PASS，缺失率 0.467→0.079）**，双达标天 28/149→**74/149（50%）**——标签侧短板随目标修正基本消除，唯一拦截点收窄为 bus 差 0.37 分（2844 专题 A/B/C 选项待拍板不变，补数仍是根本路径）
+  - **2842（p1）**：门禁 PASS、目标 p1 生效（丢弃 p2/p3/p4）、剔除无效天 7 天（07-15/17、04-17、06-13/14/20/22）、滑窗按时间连续段构造（train 11 段/val 5 段，W-1 生效）、训练启动正常
+- 结果 / 结论：**待用户模式 B 回报后填写**（判读注意：新目标 p1/p2 与旧口径 p1+p2/p3+p4 不可直接比绝对值）
+- 是否进入 REPORT.md（稳定结论）：待回报后定
+- 遗留问题：2844 放行路径（补数/门禁架构/降阈值）仍待用户拍板
+
+### 📦 执行包 v3（Windows PowerShell 原生；两户各一条命令）
+**① 拉代码 + 自检**（time_filters.json 修正已入库，无需本地改配置）：
+```powershell
+git fetch origin
+git checkout arena/01a0896c-nilm-new
+git pull origin arena/01a0896c-nilm-new
+(Select-String -Path configs\time_filters.json -Pattern "p3\+p4").Count     # 期望 0（旧目标已移除）
+(Select-String -Path nilm\common\schema.py -Pattern "segment_bounds").Count # 期望 ≥1（W-1 修复仍在）
+```
+**② 数据就位**（上轮已建 Junction 或已复制的跳过）：
+```powershell
+Get-ChildItem data\trains    # 应见 5 个用户目录（含 ...2842_4206894986488 与 ...2844_4206894986488）
+```
+**③ 执行**（`conda activate test_gpu` 后；各一条单行命令）
+2842（预期正常完成，GPU 秒级~分钟级；结束标志 `批量[infer] 800080252842_4206894986488 -> OK`，训练中应见「滑窗按时间连续段构造：N 段」）：
+```powershell
+python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_t5.yaml --data-root data --output-root outputs_t5_2842_p1 --user-key 800080252842_4206894986488
+```
+2844（**预期报错属正常**：`批量[train] 800080252844_4206894986488 -> DATA_QUALITY_FAILED bus 质量分 69.63 < 70`——修正后 branch 92.1 已达标、唯总线不足；该行出现=执行成功，修正口径质量报告已产出；infer 报 MODEL_NOT_FOUND 无需处理）：
+```powershell
+python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_t5.yaml --data-root data --output-root outputs_t5_2844_p2 --user-key 800080252844_4206894986488
+```
+**④ 窗口连续性自检（可选，仅 2842，期望 cross_gap=0）**：
+```powershell
+python -c "import pandas as pd, glob; f=sorted(glob.glob('outputs_t5_2842_p1/800080252842_4206894986488/train/*/'))[-1]+'train_window_index.csv'; w=pd.read_csv(f); s=pd.to_datetime(w.win_end)-pd.to_datetime(w.win_start); print('windows',len(w),'cross_gap',(s>pd.Timedelta('23h45m')).sum(),'max',s.max())"
+```
+**⑤ 结果回收**（回报以下内容即可，其余我来判读）：
+- 2842：console 最后 5 行 + 4 件套（`outputs_t5_2842_p1/800080252842_4206894986488/train/<时间戳>/` 下 `metrics_by_split.csv`、`train_window_index.csv`；`infer/<时间戳>/` 下 `offline_metrics.json`、`metrics_daily.csv`）
+- 2844：console 的 `DATA_QUALITY_FAILED` 行 + （可选）`outputs_t5_2844_p2/800080252844_4206894986488/train/<时间戳>/` 下 `daily_quality.csv`、`quality_advice.json`
+- 回收格式模板：
+```
+2842 train: MAE=__ R2=__ SAE=__ F1=__ P=__ R=__ (FP=__ FN=__)
+2842 test : MAE=__ R2=__ SAE=__ F1=__ P=__ R=__ (FP=__ FN=__)
+2842 infer: MAE=__ R2=__ SAE=__ F1=__ P=__ R=__ (FP=__ FN=__)
+2844 状态行: ____
+```
