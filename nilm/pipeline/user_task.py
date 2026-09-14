@@ -205,7 +205,21 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         # 改判「时间过滤后的训练范围」（全范围报告仍产出仅供诊断；配合 time_filters 缩窗）
         gate_scope = str((user_cfg.get("quality") or {}).get("gate_scope")
                          or qcfg.get("gate_scope", "full"))
-        if gate_scope != "train_range":
+        # 日级放行机制（任务⑭策略，用户级 quality.day_gate 启用）：以「总线与分路
+        # 同时达标天」为放行/训练单位，优先级高于 gate_scope（day 级比 range 级更细）；
+        # min_on_day_ratio 为可选开机日占比门禁（0~1，缺省不启用）
+        day_gate = bool((user_cfg.get("quality") or {}).get("day_gate")
+                        or qcfg.get("day_gate", False))
+        _ratio_cfg = (user_cfg.get("quality") or {}).get("min_on_day_ratio")
+        if _ratio_cfg is None:
+            _ratio_cfg = qcfg.get("min_on_day_ratio")
+        min_on_ratio = float(_ratio_cfg) if _ratio_cfg is not None else None
+        if day_gate:
+            log.info("[%s] 日级放行机制启用（quality.day_gate）：训练天=总线与分路同时达标天"
+                     "（逐天得分≥%.0f）%s", user_key, float(qcfg.get("min_score", 50)),
+                     f"；开机日占比门禁 {min_on_ratio:.0%}" if min_on_ratio is not None
+                     else "（未配置开机日占比门禁，双达标天默认全部参与训练）")
+        elif gate_scope != "train_range":
             assert_quality(q_bus, qcfg.get("max_missing_rate", 0.3),
                            qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
             assert_quality(q_br, qcfg.get("max_missing_rate", 0.3),
@@ -220,7 +234,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         # —— 训练范围质量门禁（gate_scope=train_range，任务⑬ 2844 放行 B）：
         #    判「缩窗后实际参与训练的范围」；总线离线段已被时间过滤剔除，全范围门禁不适用
-        if gate_scope == "train_range":
+        if gate_scope == "train_range" and not day_gate:
             q_bus_tr = quality_report(bus_al, "bus(训练范围)", 96, allow_negative,
                                       on_thr_w=float(user_cfg["on_thr_w"]))
             q_br_tr = quality_report(branch_al, "branch(训练范围)", 96, allow_negative,
@@ -253,6 +267,46 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "max_daily_missing_rate": daily_thr,
             "excluded_days": [d.strftime("%Y-%m-%d") for d in bad_days],
         })
+
+        # —— 日级放行筛选（day_gate，任务⑭策略步骤③）：只保留「总线与分路同时达标」
+        #    的天参与训练/评估；可选 min_on_day_ratio 对双达标天中的开机日占比设门禁
+        if day_gate:
+            qual = set(daily_q.loc[daily_q["qualified"] == 1, "date"].astype(str))
+            kept = sorted({d.strftime("%Y-%m-%d") for d in bus_al.index.normalize()}
+                          | {d.strftime("%Y-%m-%d") for d in branch_al.index.normalize()})
+            drop_days = sorted(set(kept) - qual)
+            if not qual.intersection(kept):
+                raise UserTaskError(Status.DATA_QUALITY_FAILED,
+                                    f"训练范围内无双达标天（逐天质量得分均<"
+                                    f"{float(qcfg.get('min_score', 50)):.0f}），无可训练数据")
+            if drop_days:
+                drop_set = {pd.Timestamp(d) for d in drop_days}
+                bus_al = bus_al[~bus_al.index.normalize().isin(drop_set)]
+                branch_al = branch_al[~branch_al.index.normalize().isin(drop_set)]
+                target = target[~target.index.normalize().isin(drop_set)]
+                log.warning("[%s] 日级放行剔除非双达标天 %d 天: %s", user_key, len(drop_days),
+                            drop_days[:12] + (["…"] if len(drop_days) > 12 else []))
+            t_d = target.dropna()
+            day_max = (t_d.groupby(t_d.index.normalize()).max()
+                       if len(t_d) else pd.Series(dtype=float))
+            off_n = int((day_max < float(user_cfg["on_thr_w"])).sum())
+            on_n = int((day_max >= float(user_cfg["on_thr_w"])).sum())
+            n_both = on_n + off_n
+            ratio = (on_n / n_both) if n_both else 0.0
+            gate_line = f"双达标天 {n_both}（开机日 {on_n} / 全关日 {off_n}，开机日占比 {ratio:.1%}）"
+            if min_on_ratio is not None and n_both and ratio < min_on_ratio:
+                raise UserTaskError(Status.DATA_QUALITY_FAILED,
+                                    f"开机日占比 {ratio:.1%} < 配置阈值 {min_on_ratio:.0%}"
+                                    f"（{gate_line}）")
+            log.info("[%s] 日级放行统计: %s%s", user_key, gate_line,
+                     f"；门禁 {min_on_ratio:.0%} PASS" if min_on_ratio is not None else "")
+            dg = {"enabled": True, "min_on_day_ratio": min_on_ratio,
+                  "both_qualified_days": n_both, "on_days": on_n, "off_days": off_n,
+                  "on_day_ratio": round(ratio, 4),
+                  "excluded_unqualified_days": drop_days}
+            q_bus["day_gate"] = dg       # 随 result JSON 留痕
+            q_br["day_gate"] = dg
+            _dump(out / "day_gate.json", dg)
 
         if len(bus_al) < 96 * float(qcfg.get("min_days", 14)):
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE,

@@ -650,3 +650,92 @@ def test_quality_gate_scope_train_range(tmp_path, base_cfg):
     assert r1["status"] == Status.OK, r1["message"]      # 门禁后移 → 训练范围合格 → 放行
     assert r2["status"] == Status.DATA_QUALITY_FAILED    # 默认 full → 全范围拦截（现状语义）
     assert "质量分" in r2["message"]
+
+
+def _degrade_bus_days(d: Path, end_day: int, hours: int = 18) -> None:
+    """把总线 CSV 前 end_day 天的 00:00~hours 点**整段连续**置 NaN（重采样后该段 15min
+    窗全 NaN；PF 列 resample 会 fillna(0)，有效缺失按剩余功率/电压列计）：日缺失率
+    ≈hours/24×6/12=0.375（<0.9，无效天机制不剔）、日质量得分≈62.5<70（日级不达标），
+    day_gate 关闭时样本碎段无法构窗（现状管线失败）。"""
+    f = next(d.glob("e241_*-Ch1-*.csv"))
+    df = pd.read_csv(f)
+    t = pd.to_datetime(df["event_time"])
+    mask = (t.dt.day <= end_day) & (t.dt.hour < hours)
+    cols = [c for c in df.columns if c.startswith("load_iden_data")]
+    df.loc[df.index[mask], cols] = float("nan")
+    df.to_csv(f, index=False)
+
+
+def test_day_gate_filters_unqualified_days(tmp_path, base_cfg):
+    """任务⑭：day_gate——非双达标天剔除、全范围门禁跳过；默认关闭保持拦截（对照）。"""
+    import yaml
+
+    data_root = tmp_path / "data"
+    d1 = write_user_dir(data_root, USER_KEY, days=21)
+    d2 = write_user_dir(data_root, OTHER_KEY, days=21, seed=7)
+    write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+    write_user_dir(data_root, OTHER_KEY, days=21, seed=7, mode_dir="infers")
+    _degrade_bus_days(d1, 14)   # 前 14 天 00-12 时缺失：日分≈50（不达标）、全范围分≈67（可拦截）
+    _degrade_bus_days(d2, 14)
+
+    base = dict(base_cfg)
+    base["quality"] = {"max_missing_rate": 0.9, "min_coverage": 0.15,
+                       "min_score": 70, "min_days": 3}
+    base_p = tmp_path / "base.yaml"
+    base_p.write_text(yaml.safe_dump(base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tcfg = {USER_KEY: {"target_col": "p1", "on_thr_w": 10.0, "split_strategy": "time",
+                       "quality": {"day_gate": True}},
+            OTHER_KEY: {"target_col": "p1", "on_thr_w": 10.0, "split_strategy": "time"}}
+    t_p = tmp_path / "tf.json"
+    t_p.write_text(json.dumps(tcfg), encoding="utf-8")
+
+    info = run_batch(t_p, base_config_path=base_p, data_root=data_root,
+                     output_root=tmp_path / "outputs", stages=("train",))
+    table = pd.read_csv(info["status_csv"])
+    r1 = table[(table["user_key"] == USER_KEY) & (table["mode"] == "train")].iloc[0]
+    r2 = table[(table["user_key"] == OTHER_KEY) & (table["mode"] == "train")].iloc[0]
+    assert r1["status"] == Status.OK, r1["message"]          # 日级放行 → 只训双达标天
+    assert r2["status"] != Status.OK                         # 默认关闭 → 劣化天未剔、现状管线无法正常训练（对照）
+    train_dir = sorted((tmp_path / "outputs" / USER_KEY / "train").iterdir())[-1]
+    dg = json.loads((train_dir / "day_gate.json").read_text(encoding="utf-8"))
+    assert dg["both_qualified_days"] == 7                    # 01-15~21
+    assert dg["excluded_unqualified_days"] == [f"2026-01-{d:02d}" for d in range(1, 15)]
+    assert dg["on_day_ratio"] == 1.0                         # 合成数据恒开机
+    assert dg["min_on_day_ratio"] is None
+
+
+def test_day_gate_min_on_day_ratio(tmp_path, base_cfg):
+    """任务⑭：可选开机日占比门禁——全关双达标天占比超限不放行；正例（开机占比 1.0≥0.9）放行。"""
+    import yaml
+
+    data_root = tmp_path / "data"
+    d1 = write_user_dir(data_root, USER_KEY, days=21)
+    d2 = write_user_dir(data_root, OTHER_KEY, days=21, seed=7)
+    write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+    write_user_dir(data_root, OTHER_KEY, days=21, seed=7, mode_dir="infers")
+    for d in (d1,):                                          # USER：分路恒 1W（全关日）
+        f = next(d.glob("4206602981958-*.csv"))
+        df = pd.read_csv(f)
+        df["p1"] = df["p2"] = 1.0
+        df.to_csv(f, index=False)
+
+    base = dict(base_cfg)
+    base["quality"] = {"max_missing_rate": 0.9, "min_coverage": 0.15,
+                       "min_score": 70, "min_days": 3}
+    base_p = tmp_path / "base.yaml"
+    base_p.write_text(yaml.safe_dump(base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tcfg = {USER_KEY: {"target_col": "p1", "on_thr_w": 10.0, "split_strategy": "time",
+                       "quality": {"day_gate": True, "min_on_day_ratio": 0.3}},
+            OTHER_KEY: {"target_col": "p1", "on_thr_w": 10.0, "split_strategy": "time",
+                        "quality": {"day_gate": True, "min_on_day_ratio": 0.9}}}
+    t_p = tmp_path / "tf.json"
+    t_p.write_text(json.dumps(tcfg), encoding="utf-8")
+
+    info = run_batch(t_p, base_config_path=base_p, data_root=data_root,
+                     output_root=tmp_path / "outputs", stages=("train",))
+    table = pd.read_csv(info["status_csv"])
+    r1 = table[(table["user_key"] == USER_KEY) & (table["mode"] == "train")].iloc[0]
+    r2 = table[(table["user_key"] == OTHER_KEY) & (table["mode"] == "train")].iloc[0]
+    assert r1["status"] == Status.DATA_QUALITY_FAILED
+    assert "开机日占比" in r1["message"]
+    assert r2["status"] == Status.OK, r2["message"]          # 开机占比 1.0 ≥ 0.9 → 放行
