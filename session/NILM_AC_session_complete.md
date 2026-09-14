@@ -142,3 +142,12 @@
 - 未决问题：2844 day_gate 试点拍板；day_gate 全局默认拍板；REPORT.md 落版（候选 8）；D-7/A 补数；789/778/800 归属
 - 环境事件：第 12 次回退（同前形态，指针修复零损失）
 - 相关文件/分支：nilm/pipeline/user_task.py、configs/default.yaml、tests/test_batch.py｜本回合全量推送
+
+## [2026-09-14] 会话纪要（Session 13 续：2844 day_gate 试点全链路验收，任务⑮完结）
+- 目标：2844 切换 day_gate 试点（用户三项拍板：试点+min_on_day_ratio 0.2+全局默认）——配置变更、预检复验、执行包、实录判读落盘
+- 本会话角色：资深电力算法专家（默认）
+- 完成项：v1 拦截三重修复（base_t5 补 day_gate+2844 用户级显式 true+配置守卫测试，197 过）；执行包 v1→v3；v2 train 判读（池 45 天跨版本逐位互证；p2 更新坐实 32/13 vs 旧 14/31）；v3 infer 判读（F1 0.891/P 0.804/R 0.999/SAE 0.090；失效模式定位=全关天虚报，val 异常同源）；⑮ 完结；字典 v0.2.8（OQ-15）
+- 关键决策/教训：base-config 单文件加载坑（全局默认键须同步各 base 配置）；发现层 fail-fast=任一 CSV 违约整目录 INVALID（数据更新后必核文件名契约）；resume 基于 _DONE 产物标记（重复触发无害）；SAE/R² 全关天度量退化
+- 未决问题：REPORT.md 落版（候选 8）；全关天虚报治理立项；2844 数据更新方式确认；OQ-15 真实性；D-7/A 补数；789/778/800 归属；OQ-14
+- 环境事件：第 13 次回退（新形态：工作区文件清空）+第 14 次回退（旧签名），均指针修复零损失
+- 相关文件/分支：REPORT_TEST.md（⑮ 专题+复盘+判读）、STATUS.md、NILM_DATA_DICT.md、configs/{default,base_t5,time_filters}、tests/test_config_defaults.py｜本回合全量推送
