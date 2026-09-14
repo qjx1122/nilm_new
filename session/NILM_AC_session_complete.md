@@ -124,3 +124,12 @@
 - 关键决策：同文件并行 edit 禁令（本轮三度竞态、user_task.py 曾损坏）；输出扩展不改门禁/双达标口径；README 免更新
 - 未决问题：REPORT.md 落版（候选 6 条）；2844 放行 A/B/C；789/778/800 目标归属复核；800/778 模式 B；W-1 回推 019ffeb6
 - 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/test_quality_stats.py、tests/test_batch.py｜commit 85390f0/0922769 起，本回合全量推送
+
+## [2026-09-14] 会话纪要（Session 12：2844 放行 B 实录判读，任务⑬完结）
+- 目标：2844 放行路径 B（gate_scope 门禁后移+缩窗）× 模式 B——用户 GPU 实录判读并完结
+- 本会话角色：资深电力算法专家（默认）
+- 完成项：实录判读落盘 REPORT_TEST（A 过程逐位互证/B train-val-test/C infer/D 日级/E 结论）；STATUS ⑬完结+TODO 重建；D-7 缺陷登记（日级 SAE 除零伪值）
+- 关键结论：工程通道验证成功（2844 首次全程 train+infer OK，门禁/无效天与预检逐位互证）；效果=当前数据上限（infer F1 0.852 初步可用、R² −0.261 幅值不达标）——**放行≠达标，A 补数为幅值达标必要路径**；REPORT.md 候选第 7 条
+- 环境事件：第 11 次回退（同前形态，纯指针修复，零损失）
+- 未决问题：REPORT.md 落版（候选 7）；2844 A 补数/D-7/分类微调；789/778/800 归属复核；800/778 模式 B；W-1 回推
+- 相关文件/分支：REPORT_TEST.md（2844 放行 B 专题）、STATUS.md｜本回合全量推送
