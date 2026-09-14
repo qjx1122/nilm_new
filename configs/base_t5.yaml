@@ -18,6 +18,8 @@ quality:
   min_score: 70
   min_days: 3
   max_daily_missing_rate: 0.9
+  day_gate: true               # 日级放行机制（⑮起与 default.yaml 全局默认对齐；2026-09-14 修复：
+                               #   base-config 只加载单文件，缺此键曾致 2844 试点首跑回退全范围门禁）
 
 preprocess:
   clip_negative: true

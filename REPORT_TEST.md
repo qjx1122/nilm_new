@@ -479,3 +479,10 @@ python -c "import pandas as pd, glob; f=sorted(glob.glob('outputs_t5_2842_p1/800
 - 结果 / 结论：（待用户实录判读）
 - 是否进入 REPORT.md（稳定结论）：若试点成立，并入候选第 8 条（day_gate 机制）实证部分
 - 遗留问题：①实录与预检逐位互证后⑮完结；②2842 未来重跑按新口径重建基线（OQ-14）；③day_gate 全局默认下的 778/800/789 首跑质量筛选行为待观察
+
+### ⑮ 执行包 v1 首跑拦截复盘（2026-09-14 17:43，用户提供实录）
+- 现象：2844 仍 `DATA_QUALITY_FAILED: bus 质量分 69.63 < 70`（全范围门禁照旧拦截，day_gate 未生效）
+- **根因（Agent 失误）**：`day_gate` 全局默认只写入 `configs/default.yaml`，而执行包用 `--base-config configs/base_t5.yaml`——**run_batch 只加载 base-config 单文件，default.yaml 不参与**；base_t5 无 day_gate 键 → 回退 False → 全范围门禁拦截。⑬ 的 gate_scope 恰好配在用户级（time_filters）所以未踩此坑，⑭⑮ 把默认放 base 级即踩
+- 修复（三重）：①`configs/base_t5.yaml` quality 补 `day_gate: true`（与全局默认对齐）②2844 用户级显式 `"day_gate": true`（免疫 base 配置漂移）③新增配置一致性守卫测试 `tests/test_config_defaults.py`（default.yaml 与 base_t5.yaml 的 day_gate 必须同为 true）；全量 **197 过**（196+1）；门禁解析复现（base_t5+新 time_filters → day_gate=True/ratio=0.2）✓
+- **数据漂移观察（重要）**：实录中 2844 分路开机分析=「137 天/开机段 63/全关 76」，而同日 15:16 ⑬ 轮为「139 天/43 段/97 全关」；清洗后 NaN 17124（前 15108，+2016≈14 天量）；trains 出现第 6 个目录（合法 5）+INVALID_FILENAME 1 行、infers 合法 4/5——**用户本地数据已更新**（疑似补数/换数据导出）。后果：沙盒旧快照预检数字（无效天 70/双达标 45/占比 31.1%/9 段）**不再适用**，以实录实际为准；**⑬ 基线（45 天池/infer F1 0.852）与本次试点的可比性存疑**——若数据确已更新，试点对照应声明「数据版本不同」
+- 执行包 v2：同命令重跑（先 git pull 取修复）；自检改查 base_t5/time_filters 的 day_gate
