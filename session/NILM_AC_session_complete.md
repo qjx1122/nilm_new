@@ -116,3 +116,11 @@
 - 关键决策：跨环境互证方法论再验证（构窗段数/无效天清单/开机分析逐位一致）；778/789/800 目标归属列入用户复核项
 - 未决问题：REPORT.md 落版（候选 5）；2844 A/B/C；789/778/800 归属复核；800/778 模式 B；W-1 回推
 - 相关文件/分支：REPORT_TEST.md（2842/2844 专题）、STATUS.md、configs/time_filters.json、NILM_DATA_DICT.md v0.2.2｜本回合全量推送
+
+## [2026-09-14] 会话纪要（Session 11：质量报告各自达标天数统计，任务⑫）
+- 目标：清洗后数据统计增加总线/分路各自达标天数（用户指令，模式 A 沙盒自执行）
+- 本会话角色：资深电力算法专家（默认）
+- 完成项：qualified_days_counts（validator）+ HTML 三处呈现 + train/infer JSON 挂接 + 5 新用例；全量 193 测试过；2842/2844 真实冒烟（2844 双达标 74/149 与实录互证；新诊断：双达标瓶颈=总线侧，61 天分路达标而总线不达标）
+- 关键决策：同文件并行 edit 禁令（本轮三度竞态、user_task.py 曾损坏）；输出扩展不改门禁/双达标口径；README 免更新
+- 未决问题：REPORT.md 落版（候选 6 条）；2844 放行 A/B/C；789/778/800 目标归属复核；800/778 模式 B；W-1 回推 019ffeb6
+- 相关文件/分支：nilm/data_io/validator.py、nilm/pipeline/user_task.py、tests/test_quality_stats.py、tests/test_batch.py｜commit 85390f0/0922769 起，本回合全量推送
