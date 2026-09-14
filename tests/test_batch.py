@@ -606,3 +606,47 @@ def test_collapsed_model_detected_and_flagged(tmp_path, base_cfg, time_filter_fi
     t2 = pd.read_csv(info2["status_csv"])
     assert (t2["status"] == Status.OK).all()
     assert any("PRED_COLLAPSED" in m for m in records)
+
+
+def test_quality_gate_scope_train_range(tmp_path, base_cfg):
+    """任务⑬（2844 放行 B）：gate_scope=train_range 门禁后移——全范围不合格但
+    缩窗后训练范围合格 → 放行训练；默认 full 维持全范围拦截。"""
+    import yaml
+
+    data_root = tmp_path / "data"
+    d1 = write_user_dir(data_root, USER_KEY, days=21)
+    d2 = write_user_dir(data_root, OTHER_KEY, days=21, seed=7)
+    write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+    write_user_dir(data_root, OTHER_KEY, days=21, seed=7, mode_dir="infers")
+    # 总线前 10 天数值置 NaN（行保留）：全范围 bus 得分≈52<70；训练范围（后 11 天）健康
+    for d in (d1, d2):
+        f = next(d.glob("e241_*-Ch1-*.csv"))
+        df = pd.read_csv(f)
+        mask = pd.to_datetime(df["event_time"]) < pd.Timestamp("2026-01-11")
+        df.loc[mask, [c for c in df.columns if c.startswith("load_iden_data")]] = float("nan")
+        df.to_csv(f, index=False)
+
+    base = dict(base_cfg)
+    base["quality"] = {"max_missing_rate": 0.9, "min_coverage": 0.15,
+                       "min_score": 70, "min_days": 3}
+    base_p = tmp_path / "base.yaml"
+    base_p.write_text(yaml.safe_dump(base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    tcfg = {
+        USER_KEY: {"target_col": "p1", "on_thr_w": 10.0, "split_strategy": "time",
+                   "quality": {"gate_scope": "train_range"},
+                   "train": {"include": [["2026-01-11", "2026-01-21"]]}},
+        OTHER_KEY: {"target_col": "p1", "on_thr_w": 10.0, "split_strategy": "time",
+                    "train": {"include": [["2026-01-11", "2026-01-21"]]}},
+    }
+    t_p = tmp_path / "tf.json"
+    t_p.write_text(json.dumps(tcfg), encoding="utf-8")
+
+    info = run_batch(t_p, base_config_path=base_p, data_root=data_root,
+                     output_root=tmp_path / "outputs", stages=("train",))
+    table = pd.read_csv(info["status_csv"])
+    r1 = table[(table["user_key"] == USER_KEY) & (table["mode"] == "train")].iloc[0]
+    r2 = table[(table["user_key"] == OTHER_KEY) & (table["mode"] == "train")].iloc[0]
+    assert r1["status"] == Status.OK, r1["message"]      # 门禁后移 → 训练范围合格 → 放行
+    assert r2["status"] == Status.DATA_QUALITY_FAILED    # 默认 full → 全范围拦截（现状语义）
+    assert "质量分" in r2["message"]

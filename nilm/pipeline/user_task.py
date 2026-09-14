@@ -201,10 +201,15 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         _dump(out / "quality_advice.json", {"advice": advice})
         write_quality_html(out / "data_quality_report.html", [q_bus, q_br],
                            daily_quality=daily_q, advice=advice)
-        assert_quality(q_bus, qcfg.get("max_missing_rate", 0.3),
-                       qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
-        assert_quality(q_br, qcfg.get("max_missing_rate", 0.3),
-                       qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
+        # 质量门禁范围（任务⑬ 2844 放行 B）：full=全范围（现状默认）；train_range=门禁后移——
+        # 改判「时间过滤后的训练范围」（全范围报告仍产出仅供诊断；配合 time_filters 缩窗）
+        gate_scope = str((user_cfg.get("quality") or {}).get("gate_scope")
+                         or qcfg.get("gate_scope", "full"))
+        if gate_scope != "train_range":
+            assert_quality(q_bus, qcfg.get("max_missing_rate", 0.3),
+                           qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
+            assert_quality(q_br, qcfg.get("max_missing_rate", 0.3),
+                           qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
 
         # —— §12.4 train 时间过滤
         tspec = user_cfg.get("train") or {}
@@ -212,6 +217,24 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             bus_al = filter_dataframe(bus_al, tspec.get("include"), tspec.get("exclude"))
             branch_al = filter_dataframe(branch_al, tspec.get("include"), tspec.get("exclude"))
             target = target.loc[target.index.intersection(bus_al.index)]
+
+        # —— 训练范围质量门禁（gate_scope=train_range，任务⑬ 2844 放行 B）：
+        #    判「缩窗后实际参与训练的范围」；总线离线段已被时间过滤剔除，全范围门禁不适用
+        if gate_scope == "train_range":
+            q_bus_tr = quality_report(bus_al, "bus(训练范围)", 96, allow_negative,
+                                      on_thr_w=float(user_cfg["on_thr_w"]))
+            q_br_tr = quality_report(branch_al, "branch(训练范围)", 96, allow_negative,
+                                     on_thr_w=float(user_cfg["on_thr_w"]))
+            q_bus["train_range_quality"] = q_bus_tr      # 随 result JSON 留痕
+            q_br["train_range_quality"] = q_br_tr
+            log.info("[%s] 训练范围质量门禁（gate_scope=train_range）: bus %.2f / branch %.2f"
+                     "（阈值 %.0f，范围约 %d 天）",
+                     user_key, q_bus_tr["quality_score"], q_br_tr["quality_score"],
+                     float(qcfg.get("min_score", 50)), q_bus_tr["n_days_approx"])
+            assert_quality(q_bus_tr, qcfg.get("max_missing_rate", 0.3),
+                           qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
+            assert_quality(q_br_tr, qcfg.get("max_missing_rate", 0.3),
+                           qcfg.get("min_coverage", 0.5), qcfg.get("min_score", 50))
 
         # —— 日级无效天剔除：总线或分路全天缺失/缺失率超阈值的天不参与训练与评估
         daily_thr = float(qcfg.get("max_daily_missing_rate", 1.0))
