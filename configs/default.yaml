@@ -18,9 +18,10 @@ quality:                       # §6 质量门禁（阈值按 5 用户实测数�
   gate_scope: full             # 质量门禁范围（任务⑬ 2844 放行 B）：full=全范围（默认，现状）；
                                #   train_range=门禁后移——改判「时间过滤后的训练范围」，
                                #   需用户级 quality.gate_scope 启用并配合 time_filters 缩窗
-  day_gate: false              # 日级放行机制（任务⑭策略，用户级 quality.day_gate 启用）：训练天=
-                               #   总线与分路同时达标天（逐天得分≥min_score）；启用后跳过
-                               #   全范围/训练范围门禁（优先级 day > train_range > full）
+  day_gate: true               # 日级放行机制（任务⑭实现；2026-09-14 任务⑮起全局默认，用户拍板；
+                               #   可用户级 quality.day_gate=false 显式关闭）：训练天=总线与分路
+                               #   同时达标天（逐天得分≥min_score）；启用后跳过全范围/训练范围
+                               #   门禁（优先级 day > train_range > full）
   # min_on_day_ratio: 0.2      # 可选开机日占比门禁（0~1，默认不启用）：双达标天中开机日
                                #   占比低于此值不放行（DATA_QUALITY_FAILED）
   min_days: 3                  # 与 time_filters.json 中最短训练窗口（6 天）相容
