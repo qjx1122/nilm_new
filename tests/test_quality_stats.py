@@ -5,8 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from nilm.data_io.validator import (cleaned_daily_stats, quality_report,
-                                    write_quality_html)
+from nilm.data_io.validator import (cleaned_daily_stats, daily_quality_table,
+                                    qualified_days_counts, qualified_days_detail,
+                                    quality_report, write_quality_html)
 
 
 def _frame(days: int = 4, on_days: list[int] | None = None,

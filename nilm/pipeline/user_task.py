@@ -24,7 +24,8 @@ from nilm.common.timefilter import filter_dataframe
 from nilm.data_io.csv_source import CsvBranchLoader, CsvBusLoader
 from nilm.data_io.validator import (QualityError, assert_quality,
                                     daily_quality_table, invalid_data_days,
-                                    qualified_days_detail, qualified_days_summary,
+                                    qualified_days_counts, qualified_days_detail,
+                                    qualified_days_summary,
                                     quality_advice, quality_report,
                                     split_coverage_advice, write_quality_html,
                                     write_schema_report)
@@ -191,8 +192,12 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         daily_q = daily_quality_table(bus_al, branch_al, 96, min_score, allow_negative)
         daily_q.to_csv(out / "daily_quality.csv", index=False, encoding="utf-8")
         advice = quality_advice(daily_q, float(qcfg.get("min_days", 14)))
-        q_br["both_qualified_days"] = int((daily_q["qualified"] == 1).sum())
-        q_br["daily_total_days"] = int(len(daily_q))
+        # 各自达标天数（任务⑫）：总线/分路单独达标+仅单侧达标，随质量报告进 result JSON
+        q_side = qualified_days_counts(daily_q)
+        q_br["both_qualified_days"] = q_side["both_qualified_days"]
+        q_br["daily_total_days"] = q_side["total_days"]
+        q_bus["qualified_days_by_side"] = q_side
+        q_br["qualified_days_by_side"] = q_side
         _dump(out / "quality_advice.json", {"advice": advice})
         write_quality_html(out / "data_quality_report.html", [q_bus, q_br],
                            daily_quality=daily_q, advice=advice)
@@ -512,8 +517,11 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             advice_i = quality_advice(daily_q_i,
                                       float(base_cfg.get("quality", {})
                                             .get("min_days", 14)))
-            q_br_i["both_qualified_days"] = int((daily_q_i["qualified"] == 1).sum())
-            q_br_i["daily_total_days"] = int(len(daily_q_i))
+            q_side_i = qualified_days_counts(daily_q_i)
+            q_br_i["both_qualified_days"] = q_side_i["both_qualified_days"]
+            q_br_i["daily_total_days"] = q_side_i["total_days"]
+            q_bus_i["qualified_days_by_side"] = q_side_i
+            q_br_i["qualified_days_by_side"] = q_side_i
             _dump(out / "quality_advice.json", {"advice": advice_i})
             infer_quality = {"bus": q_bus_i, "branch": q_br_i}
             write_quality_html(out / "data_quality_report.html", [q_bus_i, q_br_i],

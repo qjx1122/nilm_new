@@ -217,6 +217,35 @@ def qualified_days_summary(detail: pd.DataFrame) -> dict:
     }
 
 
+def qualified_days_counts(daily_quality: pd.DataFrame | None) -> dict:
+    """清洗后逐天质量表的「各自达标天数」计数：总线/分路各自达标 + 仅单侧达标。
+
+    - 达标口径与 daily_quality_table 一致：该侧质量得分 ≥ score_threshold；
+    - total_days = 逐天质量表天数（总线∪分路出现数据的天，清洗后口径）；
+    - bus_only_days / branch_only_days = 仅一侧达标的天——用于定位短板侧
+      （如总线达标而分路不达标 → 标签侧是瓶颈，与 quality_advice 同一判读方向）；
+    - 双达标数与 qualified 列一致，供「清洗后数据统计」段补充各自达标行。
+    """
+    empty = {"total_days": 0, "bus_qualified_days": 0, "branch_qualified_days": 0,
+             "both_qualified_days": 0, "bus_only_days": 0, "branch_only_days": 0}
+    if daily_quality is None or len(daily_quality) == 0:
+        return empty
+    need = {"bus_score", "branch_score", "score_threshold", "qualified"}
+    if not need <= set(daily_quality.columns):
+        return empty
+    d = daily_quality
+    b_ok = d["bus_score"] >= d["score_threshold"]
+    r_ok = d["branch_score"] >= d["score_threshold"]
+    return {
+        "total_days": int(len(d)),
+        "bus_qualified_days": int(b_ok.sum()),
+        "branch_qualified_days": int(r_ok.sum()),
+        "both_qualified_days": int((d["qualified"] == 1).sum()),
+        "bus_only_days": int((b_ok & ~r_ok).sum()),
+        "branch_only_days": int((r_ok & ~b_ok).sum()),
+    }
+
+
 def quality_advice(daily: pd.DataFrame, min_days: float = 3.0) -> list[str]:
     """基于逐天质量表生成训练数据集划分与模型训练建议（规则式，供报告呈现）。
 
@@ -378,8 +407,10 @@ def write_quality_html(path: str | Path, reports: list[dict],
                        advice: list[str] | None = None,
                        qualified_detail: pd.DataFrame | None = None) -> Path:
     """data_quality_report.html（§4 输出物）：质量简表 + 双达标统计 +
-    逐天质量表 + 双达标天清洗后统计（总/全关/训练/验证/测试天数）+
-    双达标天每天明细（全关日/阈值/所属数据集）+ 训练建议。"""
+    总线/分路各自达标天数 + 逐天质量表 + 双达标天清洗后统计
+    （总/全关/训练/验证/测试天数）+ 双达标天每天明细（全关日/阈值/所属数据集）
+    + 训练建议。「各自达标天数」在同时达标统计段、清洗后数据统计段（双达标
+    口径导语与旧口径表加列）三处呈现，口径均为该侧质量得分 ≥ 得分阈值。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = "\n".join(
@@ -389,11 +420,23 @@ def write_quality_html(path: str | Path, reports: list[dict],
         for r in reports)
 
     # 清洗后数据统计段（总天数/实际天数/全天缺失天/全关天，有 cleaned_stats 才输出）
+    # 达标天数（任务⑫）：bus/branch 行为该侧得分≥阈值的天数（口径=逐天质量表）；
+    # 无逐天质量表时显示 —（该流程未计算日级得分，无法给出达标口径）
+    side_q = (qualified_days_counts(daily_quality)
+              if daily_quality is not None and len(daily_quality) else None)
+
+    def _q_cell(kind: str) -> str:
+        if not side_q or "·" in kind:
+            return "—"
+        return (str(side_q["bus_qualified_days"]) if kind == "bus"
+                else str(side_q["branch_qualified_days"]))
+
     def _stat_row(label: str, cs: dict) -> str:
         return (f"<tr><td>{label}</td><td>{cs['total_days']}</td>"
                 f"<td>{cs.get('actual_days', cs['total_days'])}</td>"
                 f"<td>{cs.get('missing_days', 0)}</td>"
-                f"<td>{cs['all_off_days']}</td></tr>")
+                f"<td>{cs['all_off_days']}</td>"
+                f"<td>{_q_cell(label)}</td></tr>")
 
     def _list_section(label: str, cs: dict) -> str:
         parts = []
@@ -411,6 +454,13 @@ def write_quality_html(path: str | Path, reports: list[dict],
     cleaned_html = ""
     if qualified_detail is not None and len(qualified_detail):
         s = qualified_days_summary(qualified_detail)
+        side_line = ""
+        if daily_quality is not None and len(daily_quality):
+            sq = qualified_days_counts(daily_quality)
+            side_line = (f"<p>总线达标 <b>{sq['bus_qualified_days']}</b> / {sq['total_days']} 天、"
+                         f"分路达标 <b>{sq['branch_qualified_days']}</b> / {sq['total_days']} 天"
+                         f"（仅总线达标 {sq['bus_only_days']} 天、仅分路达标 {sq['branch_only_days']} 天）；"
+                         f"下表仅统计双达标 {s['total_days']} 天</p>")
         detail_rows = "\n".join(
             f"<tr{' style=background:#eef' if r.all_off else ''}>"
             f"<td>{r.date}</td><td>{'是' if r.all_off else '否'}</td>"
@@ -418,6 +468,7 @@ def write_quality_html(path: str | Path, reports: list[dict],
             for r in qualified_detail.itertuples())
         cleaned_html = f"""
 <h2>清洗后数据统计（总线与分路同时达标的天）</h2>
+{side_line}
 <table><tr><th>总天数</th><th>全关天数量</th><th>训练集天数</th>
 <th>验证集天数</th><th>测试集天数</th><th>推理集天数</th><th>未使用天数</th></tr>
 <tr><td>{s['total_days']}</td><td>{s['all_off_days']}</td><td>{s['train_days']}</td>
@@ -442,9 +493,10 @@ def write_quality_html(path: str | Path, reports: list[dict],
         if cleaned_rows:
             cleaned_html = f"""
 <h2>清洗后数据统计</h2>
-<table><tr><th>数据集</th><th>总天数</th><th>实际天数</th><th>全天缺失天</th><th>全关天数量</th></tr>
+<table><tr><th>数据集</th><th>总天数</th><th>实际天数</th><th>全天缺失天</th><th>全关天数量</th><th>达标天数</th></tr>
 {chr(10).join(cleaned_rows)}
 </table>
+<p>达标天数=该侧逐天质量得分 ≥ 得分阈值的天数{f"（得分阈值见逐天质量表；总线 {side_q['bus_qualified_days']} 天、分路 {side_q['branch_qualified_days']} 天、双达标 {side_q['both_qualified_days']} 天 / 共 {side_q['total_days']} 天）" if side_q else "（本流程未计算逐天质量得分，以 — 显示）"}；切分行不适用</p>
 {chr(10).join(off_sections)}"""
 
     # 逐天质量表 + 双达标统计 + 建议（daily_quality / advice 参数存在才输出）
@@ -452,6 +504,7 @@ def write_quality_html(path: str | Path, reports: list[dict],
     if daily_quality is not None and len(daily_quality):
         d = daily_quality
         n_ok = int((d["qualified"] == 1).sum())
+        sq = qualified_days_counts(d)
         day_rows = "\n".join(
             f"<tr{' style=background:#fdd' if r.qualified == 0 else ''}>"
             f"<td>{r.date}</td><td>{r.bus_score}</td><td>{r.branch_score}</td>"
@@ -459,7 +512,10 @@ def write_quality_html(path: str | Path, reports: list[dict],
             for r in d.itertuples())
         daily_html = f"""
 <h2>总线与分路数据同时达标统计</h2>
-<p>同时达标天数：<b>{n_ok}</b> / {len(d)} 天（得分阈值 {d['score_threshold'].iloc[0]}）</p>
+<p>总线达标 <b>{sq['bus_qualified_days']}</b> / {len(d)} 天、
+分路达标 <b>{sq['branch_qualified_days']}</b> / {len(d)} 天、
+同时达标 <b>{n_ok}</b> / {len(d)} 天（得分阈值 {d['score_threshold'].iloc[0]}；
+仅总线达标 {sq['bus_only_days']} 天、仅分路达标 {sq['branch_only_days']} 天）</p>
 <h2>每天数据质量情况</h2>
 <table><tr><th>日期</th><th>总线质量得分</th><th>目标分路质量得分</th>
 <th>得分阈值</th><th>当天是否合格</th></tr>

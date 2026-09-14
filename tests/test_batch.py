@@ -102,8 +102,9 @@ def test_batch_multi_user_isolation_and_resume(tmp_path, base_cfg_file, time_fil
     assert len(qd) == qs["total_days"]
     assert int((qd["all_off"] == 1).sum()) == qs["all_off_days"]
     assert qd["dataset"].str.contains("训练集").sum() == qs["train_days"]
-    # 逐天质量表 + 双达标统计 + 建议（新增产物与 HTML 段）
-    assert "每天数据质量情况" in html and "同时达标天数" in html
+    # 逐天质量表 + 各自达标/双达标统计 + 建议（新增产物与 HTML 段；任务⑫起含各自达标天数）
+    assert "每天数据质量情况" in html
+    assert "总线达标" in html and "分路达标" in html and "同时达标" in html
     assert "训练数据集划分与模型训练建议" in html
     dq = pd.read_csv(train_dir / "daily_quality.csv")
     assert {"date", "bus_score", "branch_score", "score_threshold",
