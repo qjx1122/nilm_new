@@ -7,7 +7,7 @@
 - 生效范围：本 session 全部任务
 
 ## 当前目标
-- [进行中] 任务⑪：**2842/2844 目标分路修正重跑（模式 B，用户显式指定）**——2842→p1、2844→p2（原配置有误，字典 OQ-13/time_filters.json 已修正并入库）；执行包 v3 已交付 REPORT_TEST.md（两户各一条命令、2844 预期 DATA_QUALITY_FAILED 属正常）；待用户本地 GPU 执行回报实录后判读落盘
+- [进行中] 任务⑪：**2842/2844 目标分路修正重跑（模式 B）**——用户已回报 console 实录（2026-09-14）：2842 p1 全流程 OK（早停 79、test MAE 119.5/R² 0.5013/F1 0.8025、过程证据与沙盒预检逐位互证）、2844 p2 如预期 DATA_QUALITY_FAILED bus 69.63<70；**已判读落盘 REPORT_TEST.md；待用户重发附件（offline_metrics.json/metrics_daily.csv，本轮沙盒回退致 uploads 丢失）后补 infer 判读并完结**
 
 ## 已完成
 - [x] 项目协议初始化：BOOTSTRAP.md（v2.2→v2.3）、ROLE.md（v1.2→v1.3 执行环境分级）
