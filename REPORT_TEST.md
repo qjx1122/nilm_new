@@ -743,3 +743,11 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 
 **B. 第二层：`scripts/audit_user_run.py` 一键审计工具（本 commit，211 测试全过）**——T1 metrics_by_split 计数和==段行数（跨产物）/T2 state_strategy tp+fn 恒等+raw 对账/T3 train_predictions **按段** pred_state 重放/I1 行数==meta/I2 列==INFER_RESULT_COLUMNS 逐列/I3 值域与单值/I4 时间戳递增+15min 断点+逐日行数+全关天/I5 pred_state 重放/I6 pred_prob≈sigmoid 契约/I7 总混淆+全关日 fp+逐日/I8 期望值断言/I9 offline 与 baseline 逐键对照（模型逐位复现校验）。**工具 bug 教训（测试抓住）**：流水线 pred_state 按 split 分块计算（user_task pred_frames[split]），审计必须同口径按段重放——整列重放会在段边界跨块回填产生假 ✗。
 
+**C. TP/FP/FN/TN 统计方法论（自 inference_result.csv，交付判态口径）**：
+1. **参与列**：`target_state`（真值判态：target 按 on_thr_w=10 二值化；**空=无分路真值，剔除不进混淆矩阵**）、`pred_state`（判决链输出：pred 经 decision_thr_w=400 + min_on=1 + fill_off=3）；on_thr_w/decision_thr_w 列=口径自描述（读数前先核对）。
+2. **逐行判定（2×2）**：TP=(ts=1∧ps=1)、FP=(ts=0∧ps=1)、FN=(ts=1∧ps=0)、TN=(ts=0∧ps=0)；**只数 pred_state，不自行二值化 pred**（offline_metrics 的 fp 258/fn 1 是 raw pred@10 口径=模型能力口径，与 chain 口径 77/21 并行存在，两次口径踩坑教训）。
+3. **不变式（自查锚点）**：①Σ=有效行数（7 月=2629）②TP+FN=真值开点总数，**与阈值无关**（7 月=1057；@10/@30/@400 三口径恒等）③P=TP/(TP+FP)、R=TP/(TP+FN)、F1=2TP/(2TP+FP+FN)。
+4. **全关日分解**：按 timestamp 前 10 位分日；某日 target_state 全 0=全关天（7 月=07-01~04），其上的 FP 计入全关日 fp（⑯ 治理指标）。
+5. **实现**：PowerShell 逐行计数（先 Where target_state 非空，再四象限 Count；ChainConfusion=逐日版本）；pandas 同构；`audit_user_run.py` I7+I8=断言化版本（期望值 1036,77,21,1495 / off 18）。
+
+
