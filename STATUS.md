@@ -59,7 +59,7 @@
 - （当前无进行中任务——⑮ 已完结；下一任务待用户拍板后立项）
 
 ## 下一步（TODO）
-1. **⑯ 终判拍板与收尾**：用户三选一——**A 维持 400 交付 7 月（推荐）**：登记适用边界+月度 threshold_sweep 校准 SOP+幅值漂移立项升级；**B 折中阈值**：先跑 6 月侧曲线（`python scripts/threshold_sweep.py --csv <thr400 的 train_predictions.csv> --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,250,300,400,500`）再定量；**C 回调 30** → 拍板后 ⑯ 收尾仪式（REPORT.md 注记：decision_thr 治理结论+幅值线立项/STATUS 完结/Session 纪要/commit+push）
+1. **⑯ 7 月口径直接验证 → 终判拍板与收尾**：①用户在 thr400 产物上跑验证三件（PowerShell 总混淆求和期望 1036/77/21/1495；`threshold_sweep --thresholds 400` 期望同行+复现校验 ✓；offline_metrics.json 期望=⑮ 逐位 fp 258/fn 1/mae 49.45）→ ②三选一拍板——**A 维持 400 交付 7 月（推荐）**：登记适用边界+月度 threshold_sweep 校准 SOP+幅值漂移立项升级；**B 折中阈值**：先跑 6 月侧曲线（`python scripts/threshold_sweep.py --csv <thr400 的 train_predictions.csv> --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,250,300,400,500`）再定量；**C 回调 30** → ③拍板后 ⑯ 收尾仪式（REPORT.md 注记：decision_thr 治理结论+幅值线立项/STATUS 完结/Session 纪要/commit+push）
 2. 用户复核 789/778/800 的 target_col 归属；800/778 模式 B 重训拍板（可顺带 day_gate+off_day_weight，待 ⑯ 结论）
 3. D-7 修复立项（日级 SAE 除零伪值）；2844 A 补数立项（幅值达标根本路径：val mae 105.8/test 144.2）
 4. W-1 是否回推 019ffeb6 拍板；7 月幅值漂移治理排期；W-2/W-3 修复；OQ-11 倍率口径核对；OQ-14（2842 重跑按 day_gate 新口径重建基线）
