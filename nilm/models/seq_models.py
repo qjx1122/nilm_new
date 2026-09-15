@@ -73,14 +73,48 @@ class _SeqTorchModel(BaseModel):
 
     def __init__(self, window: int = 96, epochs: int = 60, batch_size: int = 256,
                  lr: float = 1e-3, patience: int = 8, device: str = "auto",
-                 random_state: int = 42, **params) -> None:
+                 random_state: int = 42, off_day_weight: float = 1.0,
+                 off_day_thr_w: float = 10.0, **params) -> None:
         super().__init__(window=window, epochs=epochs, batch_size=batch_size,
                          lr=lr, patience=patience, device=device,
-                         random_state=random_state, **params)
+                         random_state=random_state, off_day_weight=off_day_weight,
+                         off_day_thr_w=off_day_thr_w, **params)
 
     # 子类实现：返回 nn.Module，输入 (B, L, F) 输出 (B, K)
     def _build_net(self, n_feat: int, n_out: int):
         raise NotImplementedError
+
+    def _off_day_weights(self, y: np.ndarray, index) -> np.ndarray:
+        """全关日样本加权（⑯ 全关天虚报治理，2026-09-15）。
+
+        目标日为「全关日」（当日目标功率峰值 < off_day_thr_w）的点，损失权重乘
+        off_day_weight；权重按均值归一（整体损失量级不变，只改天型间相对权重），
+        用于对消「训练池开机天占比高 → 全关天 MSE 占比过小 → 全关日虚报得不到
+        充分抑制」的失效模式（2844 day_gate 试点 infer 实录定位）。
+        off_day_weight=1.0（默认）恒返回全 1，与历史行为逐位一致；
+        早停验证损失不加权（与基线早停语义一致，便于对照）。
+        index 缺省时退化为点级判定（管线恒提供时间索引，正常不达此分支）。
+        """
+        w = np.ones(len(y), np.float32)
+        boost = float(self.params.get("off_day_weight", 1.0))
+        if boost == 1.0 or len(y) == 0:
+            return w
+        thr = float(self.params.get("off_day_thr_w", 10.0))
+        y2 = np.asarray(y, np.float32)
+        y0 = y2[:, 0] if y2.ndim == 2 else y2
+        if index is None:
+            peak = y0
+        else:
+            import pandas as pd
+            day = pd.DatetimeIndex(index).floor("D")
+            peak = pd.Series(y0).groupby(day).transform("max").to_numpy()
+        off = peak < thr
+        w[off] = np.float32(boost)
+        if w.mean() > 0:
+            w = w / w.mean()
+        log.info("[%s] 全关日加权 off_day_weight=%.1f（thr=%.1fW）：全关日点 %d/%d，"
+                 "权重均值归一 1.0", self.name, boost, thr, int(off.sum()), len(w))
+        return w
 
     def _bounds(self, index, n: int) -> list[tuple[int, int]]:
         """由时间索引求连续段；index 缺省时退回纯位置单段（并告警，W-1）。"""
@@ -110,6 +144,10 @@ class _SeqTorchModel(BaseModel):
         Xw = _padded_windows(np.asarray(X, np.float32), window,
                              self._bounds(index, len(X)))
         yt = np.asarray(y, np.float32)
+        # —— 全关日样本加权（⑯，2026-09-15）：在全关日虚报主导的户上按需启用
+        # （用户级 model_params: {"transformer": {"off_day_weight": 3.0}}）；
+        # 权重由原始瓦数量纲计算，须在标签标准化之前。
+        w_train = self._off_day_weights(yt, index)
         # —— 标签标准化（0800 均值坍缩修复，2026-09-02）：y 原瓦数直接进 MSE 时，
         # 随机初始化网络前期梯度全在「常数输出爬向 y 均值」方向；小样本×大 batch
         # 下总步数不足以爬完，预测坍缩在远低于 on_thr_w 的窄带（F1=0 且 FP=0，
@@ -150,7 +188,9 @@ class _SeqTorchModel(BaseModel):
                 xb = torch.from_numpy(np.ascontiguousarray(Xw[idx])).to(device)
                 yb = torch.from_numpy(yt[idx]).to(device)
                 opt.zero_grad()
-                loss = loss_fn(self._net(xb), yb)
+                wb = torch.from_numpy(w_train[idx]).to(device)
+                diff = self._net(xb) - yb
+                loss = (wb.unsqueeze(1) * diff * diff).mean()   # 加权 MSE（w 均值已归一）
                 loss.backward()
                 opt.step()
                 total += float(loss.detach()) * len(idx)

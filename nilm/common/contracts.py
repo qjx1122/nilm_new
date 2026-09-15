@@ -147,6 +147,11 @@ CONFIG_RULES: dict[str, dict] = {
     # base_cfg.infer_model（全局）→ 训练综合最优 best_model 的既有链路。
     # 用途：综合最优被退化指标（如 recall=1 的全漏报基线）带偏时人工锁定。
     "infer_model":           {"default": None},
+    # 用户级模型参数覆盖（⑯ 全关天虚报治理，2026-09-15）：{model_name: {param: value}}，
+    # 按模型名浅合并到 base_cfg.models[].params 之上（用户级 > base；逐键合并非整节
+    # 替换，W-3 教训）。仅写在用户键或 _default 下（非顶级键）。典型用途：
+    # off_day_weight / off_day_thr_w（seq 模型全关日样本加权）。
+    "model_params":          {"default": {}},
     "weather_latitude":      {"default": 30.59, "min": -90.0, "max": 90.0},
     "weather_longitude":     {"default": 114.31, "min": -180.0, "max": 180.0},
     "use_weather_features":  {"default": True},

@@ -151,3 +151,12 @@
 - 未决问题：REPORT.md 落版（候选 8）；全关天虚报治理立项；2844 数据更新方式确认；OQ-15 真实性；D-7/A 补数；789/778/800 归属；OQ-14
 - 环境事件：第 13 次回退（新形态：工作区文件清空）+第 14 次回退（旧签名），均指针修复零损失
 - 相关文件/分支：REPORT_TEST.md（⑮ 专题+复盘+判读）、STATUS.md、NILM_DATA_DICT.md、configs/{default,base_t5,time_filters}、tests/test_config_defaults.py｜本回合全量推送
+
+## [2026-09-15] 会话纪要（Session 14：REPORT.md 落版 + 全关天虚报治理立项与实现，任务⑯）
+- 目标：回收用户四项拍板（OQ-15 假期停产/2844 p2 补数确认/REPORT.md 落版/⑯ 立项）；落版稳定结论库；实现全关日加权
+- 本会话角色：资深电力算法专家（默认）
+- 完成项：REPORT.md v1.0 落版（8 条，原候选 3/4 按 OQ-13 降级）；字典 v0.2.9（OQ-15 关闭+补数事实）；⑯ 实现（seq 模型 _off_day_weights+model_params 用户级逐键合并+CONFIG_RULES 登记）；6 新测试全量 203 过；执行包 v4 交付（2844 offw3 新输出目录）
+- 关键决策/教训：治理选型=训练侧日型加权首选（推理侧规则抑制备选有误杀风险）；权重均值归一+早停不加权=对照纯净；模型 pkl 落时间戳子目录（测试 rglob 定位）；pytorch.org 出口阻断→PyPI cu130 轮子 CPU 回退
+- 环境事件：第 15 次回退（旧签名+索引重置全 untracked），reset 8d0692e 零损失；venv/torch 重建
+- 未决问题：执行包 v4 实录回收判读；789/778/800 归属复核；D-7/A 补数；W-1 回推；OQ-14
+- 相关文件/分支：REPORT.md（新建）、REPORT_TEST.md（⑯ 专题）、NILM_DATA_DICT.md、nilm/models/seq_models.py、nilm/{common/contracts,pipeline/user_config,pipeline/user_task}.py、configs/time_filters.json、tests/test_off_day_weight.py｜本回合全量推送

@@ -385,8 +385,14 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                              "on_thr_w": on_thr, "decision_thr_w": dec_thr})
             for s in ("train", "val", "test") if split_sizes.get(s, 0) > 0}
         best = None
+        mp_override = user_cfg.get("model_params") or {}
         for spec in base_cfg.get("models", []):
-            name, params = spec["name"], spec.get("params", {})
+            name, params = spec["name"], dict(spec.get("params", {}))
+            # 用户级模型参数覆盖（⑯）：按模型名浅合并（用户级 > base，逐键非整节）
+            extra = mp_override.get(name) or {}
+            if extra:
+                log.info("[train] 用户级模型参数覆盖 %s: %s", name, extra)
+                params.update(extra)
             model = MODEL_REGISTRY.create(name, **params)
             # index/val_index：序列模型按时间连续段构窗（§10，W-1 修复）；其余模型忽略
             model.fit(scaled["train"][0], scaled["train"][1], feature_names=names,

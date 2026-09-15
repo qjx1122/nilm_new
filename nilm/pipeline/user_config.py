@@ -86,11 +86,30 @@ def resolve_user_config(user_key: str, cfg: dict) -> dict:
     # 优先级在硬编码默认之上、_default 与用户级之下
     global_layer = {k: cfg[k] for k in GLOBAL_CONFIG_KEYS
                     if k in cfg and cfg[k] is not None}
-    for layer_name, layer in (("default(硬编码)", {f: r["default"] for f, r in CONFIG_RULES.items()}),
-                              ("global(顶级)", global_layer),
-                              ("_default", cfg.get("_default") or {}),
-                              (user_key, cfg.get(user_key) or {})):
+    layers = (("default(硬编码)", {f: r["default"] for f, r in CONFIG_RULES.items()}),
+              ("global(顶级)", global_layer),
+              ("_default", cfg.get("_default") or {}),
+              (user_key, cfg.get(user_key) or {}))
+    # model_params 特殊合并（⑯）：{model_name: {param: value}} 逐键跨层合并，
+    # 不走通用「整键覆盖」循环（W-3 教训：避免用户节把 _default 的模型参数整体顶掉）。
+    mp_merged: dict = {}
+    for layer_name, layer in layers:
+        mp = layer.get("model_params") or {}
+        if not isinstance(mp, dict):
+            raise UserConfigError(
+                "model_params 必须为 {model_name: {param: value}} 对象: "
+                f"{layer_name} 层={mp!r}")
+        for m, kv in mp.items():
+            if not isinstance(kv, dict):
+                raise UserConfigError(f"model_params.{m} 必须为参数对象: {kv!r}")
+            if kv:
+                mp_merged.setdefault(m, {}).update(kv)
+                provenance[f"model_params.{m}"] = layer_name
+    merged["model_params"] = mp_merged
+    for layer_name, layer in layers:
         for k, v in layer.items():
+            if k == "model_params":
+                continue
             merged[k] = v
             provenance[k] = layer_name
 
