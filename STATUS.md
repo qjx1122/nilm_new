@@ -59,13 +59,14 @@
 - （当前无进行中任务——⑮ 已完结；下一任务待用户拍板后立项）
 
 ## 下一步（TODO）
-1. **⑯ 7 月口径直接验证 → 终判拍板与收尾**：①用户在 thr400 产物上跑验证三件（PowerShell 总混淆求和期望 1036/77/21/1495；`threshold_sweep --thresholds 400` 期望同行+复现校验 ✓；offline_metrics.json 期望=⑮ 逐位 fp 258/fn 1/mae 49.45）→ ②三选一拍板——**A 维持 400 交付 7 月（推荐）**：登记适用边界+月度 threshold_sweep 校准 SOP+幅值漂移立项升级；**B 折中阈值**：先跑 6 月侧曲线（`python scripts/threshold_sweep.py --csv <thr400 的 train_predictions.csv> --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,250,300,400,500`）再定量；**C 回调 30** → ③拍板后 ⑯ 收尾仪式（REPORT.md 注记：decision_thr 治理结论+幅值线立项/STATUS 完结/Session 纪要/commit+push）
+1. **⑯ thr400 产物直接审计 → 终判拍板与收尾**：①用户一键审计（工作区先同步）`python scripts/audit_user_run.py --run-root outputs_t5_2844_thr400 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs_t5_2844_thr30b`（期望：全部 ✓，含 offline 与 thr30b 逐键一致=模型逐位复现）→ ②三选一拍板——**A 维持 400 交付 7 月（推荐）**：登记适用边界+月度 threshold_sweep 校准 SOP+幅值漂移立项升级；**B 折中阈值**：先跑 6 月侧曲线（`python scripts/threshold_sweep.py --csv <thr400 的 train_predictions.csv> --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,250,300,400,500`）再定量；**C 回调 30** → ③拍板后 ⑯ 收尾仪式（REPORT.md 注记：decision_thr 治理结论+幅值线立项/STATUS 完结/Session 纪要/commit+push）
 2. 用户复核 789/778/800 的 target_col 归属；800/778 模式 B 重训拍板（可顺带 day_gate+off_day_weight，待 ⑯ 结论）
 3. D-7 修复立项（日级 SAE 除零伪值）；2844 A 补数立项（幅值达标根本路径：val mae 105.8/test 144.2）
 4. W-1 是否回推 019ffeb6 拍板；7 月幅值漂移治理排期；W-2/W-3 修复；OQ-11 倍率口径核对；OQ-14（2842 重跑按 day_gate 新口径重建基线）
 5. trains/infers 各余 1 非法目录（非 2844，全量批量前需处理）
 
 ## 决策记录 / 踩坑
+- [2026-09-15] **⑯ 全链路产物审计（I 节）+审计工具**：五次运行实录交叉核验全自洽（数据链全同/day_gate 金标准/三段计数和==段行数/strategy tp+fn 恒 202/infer Σ=2629·ts1=1057/offline 不受 dec_thr 影响）；交付 `scripts/audit_user_run.py`（T1-T3/I1-I9 一键审计，含列契约/重放/pred_prob/baseline 逐键对照，211 测试）。**工具教训：pred_state 审计必须按 split 分块重放（流水线语义），整列重放会因段边界跨块回填产生假 ✗——测试先行抓住**；今后每次模式 B 交付前跑 audit_user_run 作为标准门禁
 - [2026-09-15] **⑯ thr400 确认 run（H 节）——跨月护栏判读**：护栏未过（6 月 F1 0.6816→0.5088、fn 19→115）但机理分明：**全关日幻觉幅值两月同构**（<400W 主体，高 thr 通杀 -83/-87%）vs **开机真值功率带跨月漂移**（pred≥400 占开点 6 月 43.1%/7 月 98.0%）——护栏抓到的不是「400 坏」而是「静态阈值不可跨月复用」；交付口径（7 月）400 达标（F1 0.9548/全关日 -85.9%）。**教训：单月数据选出的判决阈值必须过跨月护栏（state_strategy test 段），且上线策略=月度 sweep 校准而非静态值**。工具链补全：threshold_sweep 增 --pred-col/--state-col/--split（train_predictions.csv 跨段曲线，208 测试全过）
 - [2026-09-15] **⑯ 膝点判读（G 节）与阈值推荐**：F1 峰值 500 但 R 余量仅 +0.0112 且边界贴真值 pred 密集带 [500,700)（205 点，占真值开机 19.4%）——**推荐 400**（R 余量 +0.0301、fn 减半 41→21、F1 仅让 0.0037）：单月经验拟合的阈值须给漂移留余量，预登记护栏线（R≥0.95）优先于峰值微差；真值开机功率带 ≈[500,1000)（tp@700=811/@1000=0）与全关日幻觉主体 <500W 构成分离带——**on_thr=10 真值判态与实际开机功率量级差 ~50 倍，判决阈与真值阈解耦的实证**（2842=50/50 同构先行）
 - [2026-09-15] **沙盒回退第 16 次（.git 层）**：本地 HEAD 退回分支起点 b93f2a2、session 提交链本地丢失（远端完好，push 被拒=防线生效）；/tmp/venv 同事件灭失。恢复：fetch 真实 tip→diff 取证（工作树=tip+本轮 2 文件编辑，其余逐位一致）→`reset --soft`+重放提交。教训重申：**每轮收尾必须 push**（本轮两次 push 拒绝均因远端领先=历史未损）

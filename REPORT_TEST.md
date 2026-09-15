@@ -729,3 +729,17 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 - **B·折中阈值**：取两月联合最优需 6 月侧曲线定量——工具已扩展（`--pred-col/--state-col/--split`，train_predictions.csv test 段即可扫，208 测试全过），但 6 月 R@400=0.43 的量级预示折中点会显著牺牲 7 月治理成效；
 - **C·回调 30**：跨月最稳（6 月 F1 净升）但 7 月治理基本放弃。
 - 拍板后 → ⑯ 收尾仪式（REPORT.md 注记：decision_thr 治理结论+幅值线立项；STATUS 完结；Session 纪要）。
+
+#### I. 2844 全链路产物审计（2026-09-15 用户指令「重新检查训练与推理每一步输出，含 inference_result.csv 内容」）——两层审计 + 一键审计工具交付
+
+**A. 第一层：沙盒侧五次运行实录交叉核验（⑮v3+⑯v4/v5/thr30b/thr400）——全部自洽**：
+1. 数据链五次全同：目录 6→5、bus 25362×12、branch 14400×1、NaN 17124、对齐 14254（98.99%/38.07%）、schema 警告 3 列置 0 历次一致；
+2. day_gate 金标准复现：剔 70+3→45 天（32/13=71.1%），门禁 PASS，跨 5 运行+2 数据版本逐位一致；
+3. 切分 2588/959/768，Σ=4315==train_predictions 行数 ✓；
+4. 三段计数不变式：train 1154+32+6+1396=2588 ✓、val 143+179+5+632=959 ✓、test 183+150+19+416=768 ✓；v5/thr30b/thr400 指标逐位同（早停 0.349628，第 5 次复现）；
+5. state_strategy 三次 thr 的 tp+fn 恒=202（真值不变式）✓、off+on 分解自洽 ✓、raw 行==metrics_by_split test 行（跨产物对账）✓；
+6. 推理五次 n=2629、剔除 16 天清单全同；各口径 Σ=2629、tp+fn=1057（ts=1 不变式）全 ✓；
+7. offline（模型能力口径）⑮=thr30b=thr400 全同、dec_thr 不进 offline=契约实证 ✓。
+
+**B. 第二层：`scripts/audit_user_run.py` 一键审计工具（本 commit，211 测试全过）**——T1 metrics_by_split 计数和==段行数（跨产物）/T2 state_strategy tp+fn 恒等+raw 对账/T3 train_predictions **按段** pred_state 重放/I1 行数==meta/I2 列==INFER_RESULT_COLUMNS 逐列/I3 值域与单值/I4 时间戳递增+15min 断点+逐日行数+全关天/I5 pred_state 重放/I6 pred_prob≈sigmoid 契约/I7 总混淆+全关日 fp+逐日/I8 期望值断言/I9 offline 与 baseline 逐键对照（模型逐位复现校验）。**工具 bug 教训（测试抓住）**：流水线 pred_state 按 split 分块计算（user_task pred_frames[split]），审计必须同口径按段重放——整列重放会在段边界跨块回填产生假 ✗。
+
