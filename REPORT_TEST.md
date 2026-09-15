@@ -528,3 +528,18 @@ python -c "import pandas as pd, glob; f=sorted(glob.glob('outputs_t5_2842_p1/800
 
 #### G. ⑮ 验收结论（完结）
 三项拍板全链路验证 ✓：①day_gate 试点（配置→预检→train→infer 全通，池 45 天跨版本逐位互证）②min_on_day_ratio=0.2 生效（剔非双达标 3 天）③day_gate 全局默认（base_t5+default 双写+守卫测试，197 过）。**遗留观察项**：全关天虚报治理（待立项）；2844 p2 数据更新方式待用户确认；07 月数据疑点=字典 OQ-15。
+
+## [2026-09-15] 专题：全关天虚报治理——训练侧日型加权 off_day_weight（任务⑯，实现+测试；实录待回收）
+- 类型：用户专题（机制实现 + 单元/e2e + 模式 B 执行包 v4）
+- 目标与假设：⑮ v3 判读定位失效模式=**全关天虚报**（07-01~04 假期停产日 fp 139=全月虚报 70%，val 同模式 fp 179；OQ-15 确认停产日数据为真）。机理假设=day_gate 后训练池开机天占比 71% → 全关天 MSE 占比过小、虚报梯度不足。治理选型：**训练侧日型加权（首选，直接改损失分布）**＞推理侧全关日规则抑制（备选，有误杀低负荷开机日风险）＞难例挖掘（同族）
+- 实现三点：①seq 模型 `_off_day_weights`——目标日峰值<`off_day_thr_w`（默认 10W）=全关日，整日窗口损失 ×`off_day_weight`，权重均值归一（整体损失量级不变、只改天型间相对权重）；**默认 1.0=历史行为逐位一致**；早停验证损失不加权（与基线早停语义一致，对照纯净）②用户级 `model_params` 覆盖机制——`{model_name: {param: value}}` 跨层逐键合并（_default→用户级），禁绝整键替换（W-3 教训）；CONFIG_RULES 登记+校验；权重在标签标准化前由原始瓦数计算
+- 测试（新增 6，全量 203）：4 单元（日级判定/默认不变回归锚/峰值日不误判/无索引退化）+ e2e 参数流闭环（覆盖用户 pkl off_day_weight=3.0、未覆盖用户=1.0）+ 合并语义与非法结构校验
+- 📦 **执行包 v4**（Windows PowerShell 原生；新输出目录免 --force，⑮ v3 产物不动）：
+```powershell
+python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_t5.yaml --data-root data --output-root outputs_t5_2844_offw3 --user-key 800080252844_4206894986488
+```
+- 配置变更（随本专题入库）：`configs/time_filters.json` 2844 增 `"model_params": {"transformer": {"off_day_weight": 3.0}}`（off_day_weight 取值依据：池 45 天开机/全关=32/13，权重 3.0 使全关日损失质量占比 0.29×3/(0.29×3+0.71)≈55%，定向对消虚报；若开机日幅值/F1 回归明显则降 2.0 重跑）
+- 回收判读点（对照 ⑮ v3）：①全关日 4 天 fp（139→?，理想≈0）②整体 infer P 0.804→?/F1 0.891→? ③开机日 23 天 F1/幅值回归（R² 0.885/MAE 49.5 不应明显劣化）④train/val 段指标与早停位置变化
+- 结果 / 结论：待实录回收
+- 是否进入 REPORT.md（稳定结论）：治理生效则增注记入第 8 条（day_gate 已知代价与治理）
+- 遗留问题：①推理侧规则抑制（备选）未实现，加权不足再启用；②off_day_thr_w 与 on_thr_w 联动（现独立配置，默认同 10W）；③其他户是否启用待 2844 结论
