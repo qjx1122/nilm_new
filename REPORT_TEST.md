@@ -750,4 +750,13 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 4. **全关日分解**：按 timestamp 前 10 位分日；某日 target_state 全 0=全关天（7 月=07-01~04），其上的 FP 计入全关日 fp（⑯ 治理指标）。
 5. **实现**：PowerShell 逐行计数（先 Where target_state 非空，再四象限 Count；ChainConfusion=逐日版本）；pandas 同构；`audit_user_run.py` I7+I8=断言化版本（期望值 1036,77,21,1495 / off 18）。
 
+**D. metrics_daily.csv 逐日 TP/FP/FN/TN ≠ inference_result.csv 逐日统计——口径对账（指标-口径对应表第三次实例，非错误）**：
+1. **代码级根因（两段生成路径并排）**：
+   - `metrics_daily.csv`（user_task.py:701-708）：`evaluate_daily(have, pred_on_have, …, on_thr_w=10)`——分类列由 **raw pred ≥ on_thr_w=10 二值化**计算（base_t5.yaml:58 metrics 列表含 f1/tp/fp/fn/tn），**无游程后处理、decision_thr_w 契约上不进此产物**；`state_thr_w` 列=10 自描述（:706 注释「同训练日级：on_thr_w 口径，非判决链口径」）；
+   - `inference_result.csv` 的 `pred_state`（:713-715）：`postprocess_state(pred, decision_thr_w=400, min_on=1, fill_off=3)`——**交付判态口径**。
+   - 行集一致（同 `have`/valid 点集，7 月均 2629/28 天），**差异纯来自口径（阈值 10 vs 400 + 游程后处理有无）**。
+2. **thr400 run 的预期差异**：metrics_daily 逐日 fp/fn 与 ⑮ v3 **逐位相同**（raw pred 不随 dec_thr 变：07-01~04 fp=25/43/28/43、07-27=41、全月 258/fn 1；**thr30b 与 thr400 两 run 的 metrics_daily.csv 应完全一致**=可验证判据）；数 pred_state 则全关日 fp 合计 18/fn 21/F1 0.9548。例：07-02 metrics_daily fp=43 vs chain@400 fp≈个位数。
+3. **对账方法**：①两产物口径自描述列（state_thr_w=10 vs decision_thr_w=400）②`threshold_sweep --csv <thr400 文件> --thresholds 10` 的 @10 行=metrics_daily 日级加总（fp 258/off 140）——同一文件上两口径共存 ③PowerShell 双口径计数：`[double]$_.pred -ge 10`（=metrics_daily 口径）vs `$_.pred_state -eq '1'`（=交付口径）。
+4. **使用指南**：模型能力诊断/选型/跨版本可比 → metrics_daily+offline_metrics；交付判态质量 → 数 pred_state（audit_user_run I7）；**两者之差=判决链净效应**（⑯ 治理目标本身：全关日 fp 140→18）。
+
 
