@@ -759,4 +759,12 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 3. **对账方法**：①两产物口径自描述列（state_thr_w=10 vs decision_thr_w=400）②`threshold_sweep --csv <thr400 文件> --thresholds 10` 的 @10 行=metrics_daily 日级加总（fp 258/off 140）——同一文件上两口径共存 ③PowerShell 双口径计数：`[double]$_.pred -ge 10`（=metrics_daily 口径）vs `$_.pred_state -eq '1'`（=交付口径）。
 4. **使用指南**：模型能力诊断/选型/跨版本可比 → metrics_daily+offline_metrics；交付判态质量 → 数 pred_state（audit_user_run I7）；**两者之差=判决链净效应**（⑯ 治理目标本身：全关日 fp 140→18）。
 
+**E. offline_metrics.json 释义（infer 端模型能力口径汇总载体；metrics.py 全实现核对）**：
+1. **定位**：`infer/<ts>/offline_metrics.json`，user_task.py:678-684 生成——分路真值仅用于离线评估（§3.1，生产无分路表）；点集=`have`（target 非空 + 无效天剔除后，7 月=2629）；指标清单来自 base_t5.yaml `metrics:`（12 项）。
+2. **JSON 结构**：`{指标名: {"per_branch": [各分路值], "macro": 汇总}}`；2844 单分路 p2 → per_branch 恒 1 元素。**比率类 macro=跨分路均值；计数类（tp/fp/fn/tn）macro=跨分路总数**（metrics.py `_register_count_metric`；单分路时两者同值）；计数以浮点落盘（1056.0）。
+3. **幅值四件套**（回归，功率 W 量纲）：`mae`=平均绝对误差（幅值基准健康度）；`rmse`=均方根（放大大误差敏感度，⑮ 119.01 vs mae 49.45=长尾误差存在）；`r2`=决定系数（方差近零记 0）；`sae`=|Σpred−Σtrue|/|Σtrue| **整段聚合**（NILM 惯例能耗相对误差；日级除零伪值=D-7 已知项）。
+4. **状态四件套**（分类，**raw 口径**）：`_confusion(t, p, thr)` 把**真值与预测按同一 on_thr_w=10 双侧二值化**（t≥10 且 p≥10）→ f1/accuracy/precision/recall 全部是「raw pred@10 的模型能力」，**decision_thr_w 契约上不进本文件**（与 metrics_daily 同口径；交付判态看 inference_result.pred_state）。空真约定：无开态预测且无漏报 P=1；标签无开态 R=1。
+5. **计数四件套**：tp/fp/fn/tn 原始计数（诊断输出，compare.COUNT_METRICS 不参与排序）；macro=跨分路总数。
+6. **口径地位与复现判据**：offline=模型能力口径的 **infer 汇总版**（日级版=metrics_daily）；同模型跨 thr 运行应**逐键一致**（⑮=thr30b=thr400；audit_user_run I9 的 baseline 对照即此校验）。thr400 预期 12 键：mae 49.45/rmse 119.01/r2 0.8845/sae 0.0897/f1 0.8908/accuracy **0.9015**（=(1056+1314)/2629，由计数导出）/precision 0.8037/recall 0.9991/tp 1056/fp 258/fn 1/tn 1314。
+
 
