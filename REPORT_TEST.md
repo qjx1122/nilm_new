@@ -775,4 +775,30 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 5. **thr400 实数对照（同 pred 两读法）**：能力口径 tp 1056/fp 258/fn 1/F1 0.8908（fn 1=回归强，fp 258=关断段 258 个 ≥10W 输出、其中 ≥200W 137 个=幅值结构问题）；判决链口径 tp 1036/fp 77/fn 21/F1 0.9548（判开提到 400W+游程后虚报 -70%、代价 21 个低幅开机点漏报）。**两口径之差=判决链净效应=⑯ 治理的量化战场**（全关日 fp 140→18）。
 6. **快速判别**：fp 258/fn 1 → 能力口径；fp 77/fn 21 或 pred_state → 判决链；产物自描述列 state_thr_w=10 vs decision_thr_w=400；对账锚点 **TP+FN=1057 两口径恒等**（真值侧相同）、Σ=2629。**读任何指标前先对「指标-口径对应表」选观测面**（v5 判读失误教训=把它当前置检查）。
 
+**G. 两口径对训练评估指标的影响（训练侧全镜像；F 的训练版展开）**：
+1. **训练优化目标 ≠ 训练评估指标 ≠ 交付指标**（三层分离）：
+   - 优化目标（梯度直接改权重的）：seq 模型=**加权 MSE** `mean(w·(pred−true)²)`（w 均值归一，off_day_weight 仅调 w 分布；早停监控 `val_loss` 同此口径，**不加权、不涉阈值、不涉游程**）；树模型=同族回归损失。训练从未直接优化 F1/TP 任何分类数——分类指标=训练后把回归输出二值化的**事后度量**。
+   - 训练评估（train/val/test 产物）：两口径**并行产出、职责分离**，见下表。
+2. **训练产物-口径映射（落点与公式逐位核对 user_task.py:369-499）**：
+| 产物 | 口径 | 计算 | 随 decision_thr_w 变？ | 含义 | 选型是否参与 |
+|---|---|---|---|---|---|
+| `metrics_by_split.csv`（model×split×12 指标） | **能力** | `evaluate_all(y_true, y_hat, on_thr_w=10)` raw 双侧二值化，无游程；`state_thr_w=10` 自描述 | **否**（:412-413 传 on_thr=:370，与 dec_thr=:371 无关） | 三段回归+状态基准健康度（train/val/test 全镜像 offline 逻辑） | **是**：`comparison.csv`/`summarize` 的 `overall_best` 仅由此表算（`COUNT_METRICS={tp,fp,fn,tn}` 计数不参与排序；`LOWER_IS_BETTER` 决定方向） |
+| `metrics_daily.csv`（train，model×split×date） | **能力** | `evaluate_daily(..., on_thr_w=10)` 逐日能力口径（:415-421） | **否** | 日级能力趋势；单日 96 点 r2/sae 波动大仅作诊断 | 否 |
+| `predictions/train_predictions.csv` | **双口径同文件** | `target_state=(target≥on_thr)` 真值侧；`pred_<m>` raw 回归；`pred_state_<m>=postprocess_state(pred, dec_thr, min_on=1, fill_off=3)` **判决链**（:426-430，与 infer 同函数同参） | 真值列+pred 列 **否**；pred_state 列 **是** | 同一文件上两口径共存；audit T3 必须**按 split 分块重放**（分块计算语义），与 infer 同链 |
+| `state_strategy_metrics.csv`（test 段） | **双口径对照表** | 4 行=2 策略×2 作用域：`raw_on_thr`(thr=on_thr, 0,0)=**能力口径对照行**（与 metrics_by_split test 行逐位一致，第三次复现实例）/`decision+runs`(thr=dec_thr,1,3)=**判决链口径**（:478-498，tp/fp/fn 手算，空真约定与 metrics.py 一致） | raw 行 **否**；decision 行 **是** | 阈值+游程的净效应量化表；跨月护栏（6 月 vs 7 月）观测面即此表 decision 行 | 否（诊断表） |
+   - 早停 `val_loss` 不进任何状态指标表——它是回归损失，与两口径状态指标**正交**（val R²≈0 而 F1 0.609 的反差即例）。
+3. **影响一：模型选型/排序不受阈值绑架（可比性保障）**：
+   - `overall_best = max(wins)` 统计「各指标优胜次数」，计数类排除、方向按 `LOWER_IS_BETTER`（mae/rmse/sae 小优，f1/r2/acc/prec/rec 大优）。因输入表=能力口径，**改 decision_thr_w 不重训则 best 不变**——离线扫阈值（threshold_sweep）不污染选型。
+   - 反例：若错把 decision 行当选型依据，同一模型在 thr10/30/400 会得到三个不同 F1（0.6841/0.6883/0.5088），选型结论随业务阈值抖动——F 节 E③ 修正的本质。
+4. **影响二：同一阈值链的两段测试窗口可比性断裂（跨域外推风险）**：
+   - 能力口径（raw@10）test F1 0.6841 与 infer F1 0.8908 窗口不同只反映数据分布差（train 池≤06-30 vs 7 月推断）；判决链口径会**放大**分布差——例 thr400 6 月 decision 行 R 0.4307 vs 7 月 pred_state R 0.9801，同阈值、两月开机功率带 43%→98% 漂移导致「7 月最优=6 月最差」。结论：**能力口径看模型泛化底色，判决链口径看阈值-数据匹配度**，后者必须月度重校准。
+5. **影响三：训练侧阈值/加权干预的观测面选择**：
+   - `off_day_weight`（训练损失加权）→ 观测面=**能力口径**（mae/r2/sae 与 fp 258→299 变化）：v4 实录 train mae 46.3→40.4 改善但 val fp 179→232 恶化即在此面暴露（跨段泛化失败）。
+   - `decision_thr_w`（判决链）→ 观测面=**判决链口径**（state_strategy decision 行+infer pred_state 数）：v5→thr30b→thr400 三步 F1 0.6816→0.6883→0.5088（test）与 0.8908→0.8951→0.9548（7 月）即两面各一。
+   - 混淆观测面会得相反结论：v5 期把 offline F1（能力）当判决链判据→「无效」；v4 期若只看链 F1 会漏掉幅值 MAE +16% 的能力侧劣化。
+6. **影响四：诊断与对账路径**：
+   - 对账锚：①`state_strategy raw_on_thr` 行 must == `metrics_by_split` test 行（跨产物自洽，T2）②两能力载体（metrics_by_split/test + metrics_daily 按段聚合 + offline 不随 thr 变）三者一致 ③TP+FN 恒=真值开点数（train 202、val 148、test 202、infer 1057），与阈值/游程无关。
+   - 阈值扫在训练侧无需重训：`python scripts/threshold_sweep.py --csv <train_predictions.csv> --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,250,300,400,500 --min-on 1 --fill-off 3` 即得 test 链曲线，与 state_strategy 两行互证。
+7. **一句话操作指南（训练评估读数前）**：先问「我在调什么？」——调回归/损失/特征/数据→看 **能力口径**（metrics_by_split/metrics_daily/train 段 fp 150/fn 19）；调判开阈值/游程→看 **判决链口径**（state_strategy decision 行/数 pred_state，thr400 期望 77/21）。两表之差=「回归准，但阈值没对齐」或「阈值对了，但回归泛化弱」的分解——⑯ 的 6 月护栏未过即第二类。
+
 
