@@ -589,7 +589,7 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 
 #### A. 工程链确认与「跨运行逐位复现」金标准 ✓
 - 模型**逐位复现 ⑮ v2/v3**：早停 ep40 val_loss 0.349628、train mae 46.269、infer fp 258/fn 1、日级 fp（25/43/28/43…）全部与 ⑮ 一致——**同种子+同数据+同环境 GPU 训练确定性成立**（方法论金标准：后续任何单变量对照实验的偏差都可归因于变量本身）
-- thr=30 已生效于**判决链**（代码路径 user_task.py:713-714 确认+配置预检通过）：inference_result.csv 的 pred_state=thr30+去短开(1)+填短关(3)、decision_thr_w 列=30、pred_prob 中心右移
+- thr=30 已生效于**判决链**（代码路径 user_task.py:713-714 确认+配置预检通过）：inference_result.csv 的 pred_state=thr30+去短开(1)+填短关(3)、decision_thr_w 列=30、pred_prob 中心右移（⚠️ **2026-09-15 更正**：本条为仓库侧推断——state_strategy 回收证明用户运行时配置未含该键，v5 实际整跑 @10，见 D 节）
 
 #### B. offline 状态指标不变的根因：契约口径设计（非故障）——v5 判读点设计失误登记
 - **F1/fp/fn（offline_metrics/metrics_daily，train 各段与 infer 同）=「模型能力口径」：raw pred 二值化 @on_thr_w**（user_task.py:420 注释明确「非 pred_state 的判决链口径」；metrics_daily state_thr_w 列=on_thr 自描述）——decision_thr_w **契约上就不进这些产物**
@@ -601,3 +601,24 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 2. **完整回收（7 月交付口径）**：PowerShell 逐日混淆矩阵，⑮ v3（thr10 链）vs ⑯ v5（thr30 链）两份 inference_result.csv 对照
 - **填短关语义注记**：判决链含 fill_short_off=3（<45min 关断填回开机）——开机日减 fn 与停产日回吐 fp 的双向效应并存，以实测为准
 - 判定标准不变：交付口径 fp 大降+fn 增量小 → 方案 A 成立；F1（链口径）净降 → 回调 20W/回退
+
+#### D. state_strategy_metrics 回收判读（2026-09-15 用户粘贴 4 行小表）——dec_thr=10.0：v5 运行时未注入 thr30，整跑 @10；v5 转正为 chain@10 基线运行
+
+**回收物（verbatim，outputs_t5_2844_thr30\...\train\20260915_105008\state_strategy_metrics.csv）**：
+
+| strategy | scope | decision_thr_w | post_min_on | post_fill_short_off | f1 | precision | recall | tp | fp | fn |
+|---|---|---|---|---|---|---|---|---|---|---|
+| raw_on_thr | all_days | 10.0 | 0 | 0 | 0.6841 | 0.5495 | 0.9059 | 183 | 150 | 19 |
+| raw_on_thr | on_days_only | 10.0 | 0 | 0 | 0.8551 | 0.8097 | 0.9059 | 183 | 43 | 19 |
+| decision+runs | all_days | 10.0 | 1 | 3 | 0.6816 | 0.5463 | 0.9059 | 183 | 152 | 19 |
+| decision+runs | on_days_only | 10.0 | 1 | 3 | 0.8551 | 0.8097 | 0.9059 | 183 | 43 | 19 |
+
+- **契约判定（代码核对）**：train 侧 `user_task.py:371` 与 infer 侧 `:713` 同源解析 `dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)`；state_strategy 的 decision+runs 行 `decision_thr_w` 列（`:494` 写 `thr_`）即运行时 dec_thr 自描述——**该列=10.0 ⟺ 运行时 2844 配置块不含 decision_thr_w（缺省回落 on_thr=10）**。train/infer 同包同配置（目录时间戳衔接 13 秒），infer 预期同为 @10，待 inference_result.csv 首行 `decision_thr_w` 列确认。仓库配置目标态（7bef902）本身无误；**A 节第 2 条「thr=30 已生效」为仓库侧推断，据此更正**——「仓库预检通过 ≠ 用户运行时生效」，模式 B 判读必须以产物自描述列为准。
+- **chain@10 test 基线判读（判决链口径首次实测）**：
+  1. 跨产物对账 ✓：raw_on_thr all_days 行（f1 0.6841/fp 150/fn 19）与 ⑮ v3 metrics_by_split test 行逐位一致——第三次逐位复现实例 + state_strategy 的对账设计生效；
+  2. **游程后处理 @thr10 零收益**：all_days fp 150→152（+2，全部来自全关日 107→109）、fn 19→19、tp 183 不变；on_days_only 两策略完全相同；
+  3. 机理（postprocess/state.py 契约）：`enforce_min_on(1)` 删「长度<1」开段=**恒空操作**；`fill_short_off(3)` 仅回填 ≤3 窗且两侧皆开的关断——+2 fp 即全关日两窗短关断被回填；开机日 19 个 fn 无一可回填（漏报段均 >3 窗或贴边）；
+  4. **结论：全关日虚报=成串持续性开机判决（非短窗抖动），游程后处理不可治，唯一杠杆=判决阈值——方案 A（thr30）前提获机理佐证**。
+- **v5 转正为 chain@10 基线（对照设计修正）**：v5@10 = 模型逐位 ⑮ v3 + test 段链表 + 7 月 infer pred_state@10 的完备落盘——**⑮ v3 产物定位与 thr10rebase fallback 均不再需要**（上轮 v3 目录缺失问题就此消解）；方案 A 对照改为 **v5@10 vs thr30b@30**（同模型逐位、单变量 dec_thr 10→30），观察面=state_strategy（test 段）+ ChainConfusion 双表（7 月交付口径，chain-vs-chain）。
+- **流程教训（本任务第二笔，如实登记）**：B 节「判读点口径错配」之后，本笔=**执行包缺「用户侧配置预检门」**——仓库侧预检不能替代用户侧运行时验证；后续模式 B 执行包凡含配置变更，必须内置一条运行前预检命令（期望值明示）作为门禁。
+- **回收执行包 v2（已交付用户，PowerShell 原生）**：①诊断：infer 首行 decision_thr_w 列（`(Import-Csv $f10 | Select-Object -First 1).decision_thr_w`）+ 配置键检查（python -c 读 2844 块 + Select-String 全文定位防错块）；②基线：`Rename-Item outputs_t5_2844_thr30 outputs_t5_2844_thr10chain` + 递归解析 $f10 + ChainConfusion（7 月 chain@10 逐日）；③处置：缺键→2844 块内加 `"decision_thr_w": 30.0,`（与 quality/train/infer 同级）→ 预检命令期望 `decision_thr_w = 30.0 | model_params = None` → 重跑 `--output-root outputs_t5_2844_thr30b`（确定性门：早停 val_loss 必须仍=0.349628）；④回收 state_strategy@30 + ChainConfusion@30 双表。判定标准不变：链口径 fp 大降（尤其全关日）+fn 增量小 → 方案 A 成立；链口径 F1 净降 → 回调 20W/回退。
