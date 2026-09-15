@@ -580,6 +580,7 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 - **拍板**：方案 A（v5=推理侧 decision_thr_w 上调）；B（⑮ v3 收官）与 C（停产日历特征，长期）不排除后补
 - **实现**：零代码变更——`configs/time_filters.json` 2844 增 `"decision_thr_w": 30.0`（字段已在 CONFIG_RULES 契约：仅作用于 pred_state 判决链与状态策略评估；真值判态恒用 on_thr_w=10；训练/门禁/幅值指标不受影响=严格单变量）
 - **对照纯净性**：2844 已回退 w=1.0，本跑模型与 ⑮ v3 同配置同种子（GPU 非确定性噪声除外）——fp 变化≈纯判决阈值效应
+- **佐证**：2842 用户级历史配置已有 `decision_thr_w: 50.0`（先行实践）——判决阈值上调与既有生产实践同向；2844 用 30W 相对保守（p2 通道 on_thr=10W，2842 p1 on_thr=50W）
 - **回收判读点（vs ⑮ v3）**：①infer fp 258→?（全关日 139→?）②P 0.804→?/F1 0.891→?（成功判据：fp 大降且 fn 增量小→净升）③R/fn（0.9991/1→?，**跌破 0.95 或 F1 净降→回调 20W/回退**）④MAE/R²/SAE 应基本不变（幅值不随判态阈值变，作对照锚）⑤inference_result.csv decision_thr_w 列=30（口径自描述）
 - 📦 **执行包 v5**（新输出目录，免 --force）：`python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_t5.yaml --data-root data --output-root outputs_t5_2844_thr30 --user-key 800080252844_4206894986488`
 - 结果 / 结论：待实录回收
