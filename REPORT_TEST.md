@@ -575,3 +575,11 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 - **⑯ v1（训练侧日型加权）证伪，不予采用**；time_filters 2844 已回退（移除 model_params=w1.0=⑮ v3 口径）；**⑮ v3 产物维持生产基线**
 - off_day_weight 机制保留（默认 1.0 零影响、203 测试在位）——机制无缺陷、策略无效；负结果登记防同方向重试
 - **⑯ 转向（待拍板）**：①v5=推理侧 `decision_thr_w` 上调（单变量 30W：R 0.9991/fn=1 余量巨大、虚报为低幅正值、判决链零训练变更，预计大幅压 fp、代价为开机爬坡段少量 fn）②备选=接受 ⑮ v3 收官（虚报集中假期停产日，业务侧可解释）③长期=停产日历/特征工程（数据侧）
+
+### ⑯ 转向拍板与 v5 交付（2026-09-15，用户拍板=方案 A）
+- **拍板**：方案 A（v5=推理侧 decision_thr_w 上调）；B（⑮ v3 收官）与 C（停产日历特征，长期）不排除后补
+- **实现**：零代码变更——`configs/time_filters.json` 2844 增 `"decision_thr_w": 30.0`（字段已在 CONFIG_RULES 契约：仅作用于 pred_state 判决链与状态策略评估；真值判态恒用 on_thr_w=10；训练/门禁/幅值指标不受影响=严格单变量）
+- **对照纯净性**：2844 已回退 w=1.0，本跑模型与 ⑮ v3 同配置同种子（GPU 非确定性噪声除外）——fp 变化≈纯判决阈值效应
+- **回收判读点（vs ⑮ v3）**：①infer fp 258→?（全关日 139→?）②P 0.804→?/F1 0.891→?（成功判据：fp 大降且 fn 增量小→净升）③R/fn（0.9991/1→?，**跌破 0.95 或 F1 净降→回调 20W/回退**）④MAE/R²/SAE 应基本不变（幅值不随判态阈值变，作对照锚）⑤inference_result.csv decision_thr_w 列=30（口径自描述）
+- 📦 **执行包 v5**（新输出目录，免 --force）：`python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_t5.yaml --data-root data --output-root outputs_t5_2844_thr30 --user-key 800080252844_4206894986488`
+- 结果 / 结论：待实录回收
