@@ -767,4 +767,12 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 5. **计数四件套**：tp/fp/fn/tn 原始计数（诊断输出，compare.COUNT_METRICS 不参与排序）；macro=跨分路总数。
 6. **口径地位与复现判据**：offline=模型能力口径的 **infer 汇总版**（日级版=metrics_daily）；同模型跨 thr 运行应**逐键一致**（⑮=thr30b=thr400；audit_user_run I9 的 baseline 对照即此校验）。thr400 预期 12 键：mae 49.45/rmse 119.01/r2 0.8845/sae 0.0897/f1 0.8908/accuracy **0.9015**（=(1056+1314)/2629，由计数导出）/precision 0.8037/recall 0.9991/tp 1056/fp 258/fn 1/tn 1314。
 
+**F. 「模型能力口径 vs 判决链口径」总对照（I.C/D/E 的统一框架；三次口径事件的方法论沉淀）**：
+1. **一句话**：能力口径量「**模型本身回归输出 raw pred** 的水平」（固定参考阈 on_thr=10 双侧二值化）；判决链口径量「**交付给用户的判态 pred_state** 的质量」（pred 经 decision_thr_w+去短开+填短关）。真值侧恒用 on_thr_w（target_state）——**两口径共享真值，只差预测侧的处理深度**。
+2. **数据流**：总线特征→模型→pred（W）→ ①≥10 二值化→能力口径指标；②≥dec_thr→enforce_min_on→fill_short_off→pred_state→判决链口径指标。
+3. **七维对照**：回答问题（回归准不准 vs 判态交付质量）/状态来源（raw@on_thr vs 链@dec_thr）/阈值角色（on_thr=真值判态+参考线，固定 vs decision_thr=预测判态，业务可调旋钮——2842=50、2844 历经 10→30→400）/载体（offline_metrics·metrics_daily·metrics_by_split vs inference_result.pred_state·pred_prob·state_strategy）/是否随 dec_thr 变（**否=契约保证** vs 是=调优对象）/用途（选型·调参·跨版本可比·逐位复现校验 vs 交付质量·阈值调优·上线效果）/游程后处理（无 vs 有）。
+4. **设计动机**：①模型迭代可比性——改 thr 不重训，指标不混入 thr 效应才能归因模型变化（GPU 逐位复现校验用能力口径）；②业务可调性——判态阈值随回路功率量级走，不该绑架模型评估；③游程整形是工程层非模型能力。
+5. **thr400 实数对照（同 pred 两读法）**：能力口径 tp 1056/fp 258/fn 1/F1 0.8908（fn 1=回归强，fp 258=关断段 258 个 ≥10W 输出、其中 ≥200W 137 个=幅值结构问题）；判决链口径 tp 1036/fp 77/fn 21/F1 0.9548（判开提到 400W+游程后虚报 -70%、代价 21 个低幅开机点漏报）。**两口径之差=判决链净效应=⑯ 治理的量化战场**（全关日 fp 140→18）。
+6. **快速判别**：fp 258/fn 1 → 能力口径；fp 77/fn 21 或 pred_state → 判决链；产物自描述列 state_thr_w=10 vs decision_thr_w=400；对账锚点 **TP+FN=1057 两口径恒等**（真值侧相同）、Σ=2629。**读任何指标前先对「指标-口径对应表」选观测面**（v5 判读失误教训=把它当前置检查）。
+
 
