@@ -160,3 +160,11 @@
 - 环境事件：第 15 次回退（旧签名+索引重置全 untracked），reset 8d0692e 零损失；venv/torch 重建
 - 未决问题：执行包 v4 实录回收判读；789/778/800 归属复核；D-7/A 补数；W-1 回推；OQ-14
 - 相关文件/分支：REPORT.md（新建）、REPORT_TEST.md（⑯ 专题）、NILM_DATA_DICT.md、nilm/models/seq_models.py、nilm/{common/contracts,pipeline/user_config,pipeline/user_task}.py、configs/time_filters.json、tests/test_off_day_weight.py｜本回合全量推送
+
+## [2026-09-15] 会话纪要（Session 14 续：⑯ v4 实录判读——治理 v1 证伪与回退）
+- 目标：回收执行包 v4 实录（2844 off_day_weight=3.0）并判读
+- 本会话角色：资深电力算法专家（默认）
+- 完成项：⑯ v4 判读落盘 REPORT_TEST（机制生效确认/单变量对照/池内外分离/机理四条）；证伪结论=fp 258→299、F1 0.891→0.876、全关日虚报 139→168；配置回退（2844 model_params 移除）；REPORT.md v1.1 第 8 条负结果注记；STATUS 转向方案待拍板
+- 关键教训：损失加权≠新信息——训练池少数类 3 天（11%）时加权+均值归一伤多数类+早停交互=全线劣化；池内改善/池外恶化=证伪关键证据
+- 未决问题：⑯ 转向拍板（decision_thr_w 30W / ⑮ v3 收官 / 停产日历特征）
+- 相关文件/分支：REPORT_TEST.md、REPORT.md v1.1、configs/time_filters.json、STATUS.md｜本回合全量推送
