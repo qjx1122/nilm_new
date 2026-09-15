@@ -583,4 +583,21 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 - **佐证**：2842 用户级历史配置已有 `decision_thr_w: 50.0`（先行实践）——判决阈值上调与既有生产实践同向；2844 用 30W 相对保守（p2 通道 on_thr=10W，2842 p1 on_thr=50W）
 - **回收判读点（vs ⑮ v3）**：①infer fp 258→?（全关日 139→?）②P 0.804→?/F1 0.891→?（成功判据：fp 大降且 fn 增量小→净升）③R/fn（0.9991/1→?，**跌破 0.95 或 F1 净降→回调 20W/回退**）④MAE/R²/SAE 应基本不变（幅值不随判态阈值变，作对照锚）⑤inference_result.csv decision_thr_w 列=30（口径自描述）
 - 📦 **执行包 v5**（新输出目录，免 --force）：`python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_t5.yaml --data-root data --output-root outputs_t5_2844_thr30 --user-key 800080252844_4206894986488`
-- 结果 / 结论：待实录回收
+- 结果 / 结论：**v5 实录已回收（2026-09-15 10:50，用户提供 console+train/infer 产物）——判读见下节；判决链口径效应待两件补充回收**
+
+### ⑯ 执行包 v5 实录判读（outputs_t5_2844_thr30；2026-09-15 10:50 用户提供）——offline 指标不变=契约口径，判决链效应待回收
+
+#### A. 工程链确认与「跨运行逐位复现」金标准 ✓
+- 模型**逐位复现 ⑮ v2/v3**：早停 ep40 val_loss 0.349628、train mae 46.269、infer fp 258/fn 1、日级 fp（25/43/28/43…）全部与 ⑮ 一致——**同种子+同数据+同环境 GPU 训练确定性成立**（方法论金标准：后续任何单变量对照实验的偏差都可归因于变量本身）
+- thr=30 已生效于**判决链**（代码路径 user_task.py:713-714 确认+配置预检通过）：inference_result.csv 的 pred_state=thr30+去短开(1)+填短关(3)、decision_thr_w 列=30、pred_prob 中心右移
+
+#### B. offline 状态指标不变的根因：契约口径设计（非故障）——v5 判读点设计失误登记
+- **F1/fp/fn（offline_metrics/metrics_daily，train 各段与 infer 同）=「模型能力口径」：raw pred 二值化 @on_thr_w**（user_task.py:420 注释明确「非 pred_state 的判决链口径」；metrics_daily state_thr_w 列=on_thr 自描述）——decision_thr_w **契约上就不进这些产物**
+- 判决链口径的指标载体：train 端 `state_strategy_metrics.csv`（test 段：raw_on_thr 对照行 + decision+runs 行 × all_days/on_days_only）；infer 端仅逐点明细 inference_result.csv（**无 chain 级汇总产物**——观察项：infer 端 chain 汇总可作后续增强）
+- **判读失误如实登记**：v5 判读点把「模型能力口径 F1」当成了判决链效应的观测面——两个口径自 ⑬ 起并行存在，此教训=**设计对照实验前先核对指标-口径对应表**
+
+#### C. 判决链效应（方案 A 实效）——待两件回收物判定
+1. **最小回收**：`outputs_t5_2844_thr30\800080252844_4206894986488\train\20260915_105008\state_strategy_metrics.csv`（4 行小表）——test 段（6 月留出，含 3 个全关天 fp 42/25/40）decision+runs@30 vs raw@10：fp 150→?、fn 19→?
+2. **完整回收（7 月交付口径）**：PowerShell 逐日混淆矩阵，⑮ v3（thr10 链）vs ⑯ v5（thr30 链）两份 inference_result.csv 对照
+- **填短关语义注记**：判决链含 fill_short_off=3（<45min 关断填回开机）——开机日减 fn 与停产日回吐 fp 的双向效应并存，以实测为准
+- 判定标准不变：交付口径 fp 大降+fn 增量小 → 方案 A 成立；F1（链口径）净降 → 回调 20W/回退
