@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from scripts.threshold_sweep import (
-    chain_replay_check, fp_amplitude, main, sweep,
+    chain_replay_check, fp_amplitude, load_result, main, sweep,
 )
 
 # —— 合成数据：2 天 × 12 点 ——
@@ -99,3 +99,34 @@ def test_main_end_to_end(tmp_path, capsys):
     assert "全关天 1：2026-01-01" in out
     assert "0.8889" in out and "0.9333" in out      # 扫描表 F1
     assert "[30, 50)" in out and " 2 " in out        # 幅值分布表
+
+
+def test_train_predictions_split(tmp_path, capsys):
+    """train_predictions.csv 适配：--pred-col/--state-col/--split（跨段护栏曲线）。
+
+    test 段=day2（开机日单日）：@10 链 tp=8 fp=2 fn=0（F1 0.8889）、@30 链
+    tp=8 fp=0 fn=0（F1 1.0）；复现校验在改列名+段过滤后仍须逐位一致。
+    """
+    df = _synthetic_result()
+    df["split"] = ["train"] * 12 + ["test"] * 12
+    df = df.rename(columns={"pred": "pred_transformer",
+                            "pred_state": "pred_state_transformer"})
+    csv = tmp_path / "train_predictions.csv"
+    df.to_csv(csv, index=False)
+
+    # 函数级：列名适配 + 段过滤后的扫描值
+    df2 = load_result(csv, pred_col="pred_transformer")
+    df2 = df2[df2["split"] == "test"].reset_index(drop=True)
+    s = sweep(df2, [10, 30], 1, 3, pred_col="pred_transformer")
+    assert list(zip(s.tp, s.fp, s.fn)) == [(8, 2, 0), (8, 0, 0)]
+
+    # CLI 级：split 过滤行 + 复现校验 ✓ + 单日（无全关天）
+    rc = main(["--csv", str(csv), "--pred-col", "pred_transformer",
+               "--state-col", "pred_state_transformer",
+               "--split", "test", "--thresholds", "10,30"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "split 过滤: test（24 → 12 行）" in out
+    assert "pred_state 逐位一致 ✓" in out
+    assert "全关天 0" in out
+    assert "0.8889" in out
