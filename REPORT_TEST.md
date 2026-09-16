@@ -844,7 +844,7 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 3. **全链改 400 的三重代价（量化）**：
    - **① 指标虚高、问题被掩盖**：P_val 0.444@10 → 若 GT 改 400，10-400W 真开点（约 50-100 点）转 TN，FP 分母不变但 TP 重定义，P 将“被动”升至 ~0.6-0.7（与链口径同），**val/test 的低 P 病灶从报表消失**，但关断段 200W 幻觉（137 点）与 val R²≈0 的幅值高估仍在——报表好看，模型未变。
    - **② 跨用户/跨期不可比**：2842 on_thr 50、789 60、2844 若 400，则 `comparison.csv` 的 `overall_best` 在不同真值定义下排序，历史 5 户横比与 ⑬-⑮ 基线全部失效；月度 sweep 校准 SOP 也失去统一参考线。
-   - **③ 物理口径风险**：p2 开机功率带 [500,1000) 但过渡带 10-500W 含开机爬坡/低功耗模式（G 节 [400,500) 真开 20 点、<400 真开 21 点）。**GT 改 400 会把这 41 点真开直接判负**，FN 定义被人为缩小——漏检从“预测漏”转为“定义漏”，业务侧对“低功率开机是否算开”的追溯丢失。2842 先行实践保持 on_thr 50/decision 50 解耦（同 50 仅因该回路功率齐平），未推至 400 即此顾虑。
+   - **③ 物理口径风险（2026-09-16 更正：原记“41 点”有误，用户指正成立）**：p2 稳态带 [500,1000)，但过渡带 10-500W 含爬坡/低风档（G 节“真值开机 pred 分布”：[400,500) 20 点为 **pred 400-500 的 TP@400**（在 400 报开、在 500 才漏），<400 21 点为 **FN@400**（pred<400）；二者是 **pred 分布**而非 target 分布）。**GT 改 400 的真影响=把 `target∈[10,400)` 的真开点重定义为关**——按 target 直方图约 **21 点量级**（与 FN@400 同量级，非 20+21=41；20 点的 target 大多仍≥400，GT 400 后仍为真开且仍 TP@400）。原 41 点系把 pred 带 [400,500) 误作 target 带计入，已更正。结论不变：少量低功率真开的定义漏会把“预测漏”洗成“定义漏”，追溯丢失；2842 `50/50` 仅因该回路功率齐平未推至 400 即此顾虑。
 4. **保持 10/400 解耦的收益（与 I.F/G 设计动机一致）**：
    - **模型选型可比**：改 decision_thr 不重训，`metrics_by_split@10` 不变→ `best` 不变；离线扫阈值不污染选型（G 节影响一）。
    - **两级诊断**：能力口径看回归底色（MAE/R²/SAE + P@10 低→关断洁净度问题），链口径看部署成效（P@400 高→阈值可救）。H 节正是据此判定“能力未崩、阈值可救”；统一后只能看到后者。
@@ -856,3 +856,16 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
    - **维持现状**：`on_thr_w=10`（真值定义不动）+ `decision_thr_w=400`（部署判开位）+ 月度 `threshold_sweep` 校准决策阈；报表同时保留能力口径（10）与链口径（400），I.F/G/H 的全部对账与阈值曲线均在 10 锚上成立。
    - **不做**：训练→推理全链阈值 10→400 的批量替换（会破对照、破审计、破横比，且不改模型权重，纯报表重定义）。
    - **可选**：若业务确认 p2 无 10-100W 合法开机，可将 on_thr 10→50 或 100 做**小步物理校准**（配置单键变更，指标需重算但模型免重训），400 仍仅作 decision_thr。
+
+**J. 是否应在训练/推理输出中增加 `decision_thr_w` 对应的日级评估汇总（类 metrics_daily 的链口径版）——是，建议新增（非替换），推理侧优先、训练侧随之；方案已设计可直接立项**：
+1. **现状缺口**：`metrics_daily.csv`（含 train / infer）=能力口径 @on_thr（:415,702）；`state_strategy_metrics.csv`=仅 test 段、两策略×两作用域的**汇总**（:472-498，无逐日）；`inference_result.csv`=逐点链明细（:726-737，无日级汇总）。结果：**推理侧无“链口径逐日 F1/P/R/TP/FP/FN”**（⑯ 治理 140→18 全靠 sweep 事后扫或手数 pred_state，H 节 chain@400 总表仍依赖 sweep 预演），训练侧亦无 val/test 的链口径逐日分解（H 节 val P 0.444 的 179 FP 日分解需手算）。
+2. **建议产物（新增，不改旧口径）**：
+   - `infer/<ts>/metrics_daily_chain.csv`（推理侧首选）：列=`date,n_points,mae,rmse,r2,sae,f1,accuracy,precision,recall,tp,fp,fn,tn,state_thr_w,decision_thr_w,post_min_on,post_fill_short_off`，其中 **tp/fp/fn/tn/f1/acc/prec/rec 按 `target_state(@on_thr)` vs `pred_state(@decision_thr+游程)` 逐日**（与 I.C 逐行判定一致），回归四件套仍用 pred vs target（同 capability 口径，阈值不进回归）；`decision_thr_w` 列自描述=400。
+   - `train/<ts>/metrics_daily_chain.csv`（训练侧）：同 schema，增加 `split` 列（train/val/test 逐日），便于 val 7 全关天 179 FP 的日级定位；与 `metrics_daily.csv` 双文件并存（旧表不动保可比）。
+   - 兼容：保留现有 `metrics_daily.csv`（@10）；新增表与 `audit_user_run.py` I7（总表）互为汇总/明细对账（日级 Σ=总表，TP+FN 恒 1057）。
+3. **实现要点（改动面小，解耦守卫内）**：
+   - 复用 `postprocess_state`（已在 :426,713）得 `pred_state`，再调现有 `evaluate_daily`（仅把 `pred` 换 `pred_state` 对应的 0/1 功率代理或直接用 `_confusion` 逐日；回归列复用原 y_hat/pred）；`state_thr_w` 仍记 on_thr，新增 `decision_thr_w/post_*` 三列。
+   - 产出位置：`user_task.py` 训练段 :416-422 后新增 chain 分支；推理段 :702-708 后新增 chain 分支；`INFER_RESULT_COLUMNS` 不变。
+   - 测试与审计：新增 2 用例（train/infer 日级链表 Σ==总表、TP+FN 恒等）；`audit_user_run.py` 新增 J1（日级链 Σ==I7）。
+4. **收益与成本**：收益=交付口径逐日可直接读（全关日 18、07-27 40 等无需 sweep）、阈值月度校准与跨月护栏有日级证据、val/test 低 P 日级根因一表定位；成本=每 run 多 1-2 个小 CSV（28 行 + 9-28 行），CPU 可忽略；风险=无（旧表不动，新增表缺省可不消费）。
+5. **落地建议**：推理侧 `metrics_daily_chain.csv` 作为 ⑯ 收尾后首个小立项（1 文件+2 测试），训练侧同表随之；`threshold_sweep` 仍作跨阈曲线工具，与日级链表互补（曲线看阈值、链表看日期）。
