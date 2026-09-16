@@ -869,3 +869,13 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
    - 测试与审计：新增 2 用例（train/infer 日级链表 Σ==总表、TP+FN 恒等）；`audit_user_run.py` 新增 J1（日级链 Σ==I7）。
 4. **收益与成本**：收益=交付口径逐日可直接读（全关日 18、07-27 40 等无需 sweep）、阈值月度校准与跨月护栏有日级证据、val/test 低 P 日级根因一表定位；成本=每 run 多 1-2 个小 CSV（28 行 + 9-28 行），CPU 可忽略；风险=无（旧表不动，新增表缺省可不消费）。
 5. **落地建议**：推理侧 `metrics_daily_chain.csv` 作为 ⑯ 收尾后首个小立项（1 文件+2 测试），训练侧同表随之；`threshold_sweep` 仍作跨阈曲线工具，与日级链表互补（曲线看阈值、链表看日期）。
+
+**K. I.J 落地实录（2026-09-16 开工，commit 037d613）——`metrics_daily_chain.csv` 已实现并验证**：
+1. **实现（解耦守卫内，零侵入旧口径）**：
+   - 新增 `nilm/evaluation/metrics.py::evaluate_daily_chain`（回归指标复用 `METRIC_REGISTRY` 功率口径、分类指标按 `target_state(@on_thr)` vs `pred_state(@decision_thr+游程)` 逐日；`_confusion_state` 布尔直算，计数类 macro=跨分路总数、比率类 macro=均值，与 `metrics.py` 既有语义一致）+ `__init__.py` 导出；
+   - `nilm/pipeline/user_task.py` 训练段（:405-423）新增 `daily_chain_rows` 分支：同 y_hat 复用 `postprocess_state` 得 `pred_state` 后调用 `evaluate_daily_chain`（`on_thr` 真值阈、回归同 `y_true/y_pred`），插入 `model/split` 与阈值列 `state_thr_w/decision_thr_w/post_min_on/post_fill_short_off`，落盘 `train/<ts>/metrics_daily_chain.csv`（`model,split,date,n_points,mae,rmse,r2,sae,f1,accuracy,precision,recall,tp,fp,fn,tn,state_thr_w,decision_thr_w,post_min_on,post_fill_short_off`）；推理段（:713-737 后）同源新增 `infer/<ts>/metrics_daily_chain.csv`（无 `split` 列，`model,date` 粒度），有分路真值时产出、无真值时跳过（不阻断推理）；
+   - `INFER_RESULT_COLUMNS` 不变，旧 `metrics_daily.csv`（@10 能力口径）保留，双表并存；
+2. **审计**：`scripts/audit_user_run.py` 新增 **T4**（train 链口径日级）与 **I10/J1**（infer 链口径日级，Σ==I7 总数/逐日==明细/TP+FN 恒等/阈值自描述/n_points 与能力口径对齐），有真值时必在、无真值时可选；异常捕获不阻断主流程；
+3. **测试**：`tests/test_audit_user_run.py` 同步合成 `metrics_daily*` 双表（能力+链口径，按 `target_state` vs `pred_state` 逐日分组生成，`n_points` 对齐、链 Σ==`train_predictions`/`inference_result` 总数），`tests/test_chain_daily.py` 4 用例（回归一致、分类用 `pred_state`、分组求和、端到端阈值列与 `n_points` 对齐）；全量 212 过（190+4 链口径+3 审计+15 分类；torch 依赖缺失的 25 项按既有口径跳过）；
+4. **验证**：本地合成端到端（`default.yaml` ridge/history_profile，`decision_thr=30`）——`train/infer` 链日级 Σ 分别等于 `train_predictions`/`inference_result` 总混淆（tp/fp/fn/tn 逐位一致）、`TP+FN` 恒 1057、`n_points` 与能力口径逐日对齐、阈值列 `decision_thr_w=30` 自描述；`threshold_sweep` 仍作跨阈曲线，链日级作逐日明细，两者互补已就位；
+5. **使用**：交付口径逐日直出（`07-01~04` 全关日 `fp`、`07-27` `40` 等无需手扫）、阈值月度校准与跨月护栏有日级证据、val `P 0.444` 的 `179 FP` 可按 `metrics_daily_chain.csv` 的 `split=val` 逐日定位；`metrics_daily.csv` 仍为能力口径对照（两表之差=判决链净效应）。
