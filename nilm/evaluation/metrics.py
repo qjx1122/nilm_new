@@ -192,3 +192,102 @@ def evaluate_daily(y_true: np.ndarray, y_pred: np.ndarray, index,
         rows.append({"date": day.strftime("%Y-%m-%d"), "n_points": int(m.sum()),
                      **{name: res[name]["macro"] for name in metric_names}})
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------- 链口径日级评估
+_REGRESSION_METRICS = {"mae", "rmse", "r2", "sae", "mape"}
+
+
+def _confusion_state(t_on: np.ndarray, p_on: np.ndarray) -> tuple[int, int, int, int]:
+    """布尔状态直接计算混淆矩阵（与 _confusion 语义一致，无阈值二值化）。"""
+    t_on = np.asarray(t_on, dtype=bool)
+    p_on = np.asarray(p_on, dtype=bool)
+    tp = int((p_on & t_on).sum())
+    fp = int((p_on & ~t_on).sum())
+    fn = int((~p_on & t_on).sum())
+    tn = int((~p_on & ~t_on).sum())
+    return tp, fp, fn, tn
+
+
+def evaluate_daily_chain(y_true: np.ndarray, y_pred: np.ndarray,
+                         pred_state: np.ndarray, index,
+                         metric_names: list[str],
+                         on_thr_w: float = DEFAULT_ON_THR_W) -> "pd.DataFrame":
+    """链口径日级评估：回归指标用 y_true/y_pred，分类指标用 target_state vs pred_state。
+
+    - y_true / y_pred : (n, n_branches) 功率矩阵（回归口径）；
+    - pred_state      : (n, n_branches) 或 (n,) 布尔/0-1 状态（已含 decision_thr_w+游程）；
+    - on_thr_w        : 真值判态阈值（target_state = y_true ≥ on_thr_w）；
+    - 返回列：date / n_points / 各指标 macro（回归与链口径分类混排）。
+    """
+    import pandas as pd
+
+    # 统一为 2D
+    y_true_a = np.asarray(y_true)
+    y_pred_a = np.asarray(y_pred)
+    ps_a = np.asarray(pred_state)
+    if y_true_a.ndim == 1:
+        y_true_a = y_true_a[:, None]
+    if y_pred_a.ndim == 1:
+        y_pred_a = y_pred_a[:, None]
+    if ps_a.ndim == 1:
+        ps_a = ps_a[:, None]
+    # 布尔化 pred_state（0/1 或 bool 均可）
+    ps_a = np.asarray(ps_a, dtype=bool)
+    if y_true_a.shape != y_pred_a.shape:
+        raise ValueError(f"形状不一致: {y_true_a.shape} vs {y_pred_a.shape}")
+    if y_true_a.shape[0] != ps_a.shape[0] or y_true_a.shape[1] != ps_a.shape[1]:
+        # 允许 pred_state 单分路广播至多分路？此处严格要求一致
+        if ps_a.shape[1] == 1 and y_true_a.shape[1] > 1:
+            ps_a = np.repeat(ps_a, y_true_a.shape[1], axis=1)
+        else:
+            raise ValueError(f"y_true {y_true_a.shape} vs pred_state {ps_a.shape} 分路不一致")
+    idx = pd.DatetimeIndex(index)
+    if len(idx) != y_true_a.shape[0]:
+        raise ValueError(f"index 长度 {len(idx)} 与样本数 {y_true_a.shape[0]} 不一致")
+
+    rows = []
+    dates = idx.normalize()
+    for day in dates.unique().sort_values():
+        m = (dates == day).to_numpy() if hasattr(dates == day, "to_numpy") else (dates == day)
+        yt = y_true_a[m]
+        yp = y_pred_a[m]
+        ps = ps_a[m]
+        ts = yt >= float(on_thr_w)
+        n_branch = yt.shape[1]
+        res: dict[str, float] = {}
+        for name in metric_names:
+            if name in _REGRESSION_METRICS:
+                # 回归：直接复用注册表（功率口径，不涉阈值）
+                res[name] = float(METRIC_REGISTRY.get(name)(yt, yp)["macro"])
+            elif name in ("tp", "fp", "fn", "tn"):
+                idx_map = {"tp": 0, "fp": 1, "fn": 2, "tn": 3}[name]
+                per = []
+                for k in range(n_branch):
+                    tp, fp, fn, tn = _confusion_state(ts[:, k], ps[:, k])
+                    per.append([tp, fp, fn, tn][idx_map])
+                res[name] = float(sum(per))
+            elif name in ("f1", "accuracy", "precision", "recall"):
+                per = []
+                for k in range(n_branch):
+                    tp, fp, fn, tn = _confusion_state(ts[:, k], ps[:, k])
+                    if name == "accuracy":
+                        n = tp + fp + fn + tn
+                        per.append((tp + tn) / n if n else 0.0)
+                    elif name == "precision":
+                        per.append(_precision_of(tp, fp, fn))
+                    elif name == "recall":
+                        per.append(_recall_of(tp, fn))
+                    elif name == "f1":
+                        prec = _precision_of(tp, fp, fn)
+                        rec = _recall_of(tp, fn)
+                        per.append(_f1_of(prec, rec))
+                res[name] = float(np.mean(per)) if per else 0.0
+            else:
+                # 未知指标：回退到 evaluate_all 的阈值口径（兼容扩展）
+                try:
+                    res[name] = float(METRIC_REGISTRY.get(name)(yt, yp, on_thr_w=on_thr_w)["macro"])
+                except Exception:
+                    res[name] = float("nan")
+        rows.append({"date": day.strftime("%Y-%m-%d"), "n_points": int(m.sum()), **res})
+    return pd.DataFrame(rows)

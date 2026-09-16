@@ -30,7 +30,7 @@ from nilm.data_io.validator import (QualityError, assert_quality,
                                     split_coverage_advice, write_quality_html,
                                     write_schema_report)
 from nilm.evaluation import (build_comparison_table, evaluate_all,
-                             evaluate_daily, summarize)
+                             evaluate_daily, evaluate_daily_chain, summarize)
 from nilm.models import MODEL_REGISTRY
 from nilm.models.base import BaseModel
 from nilm.models.constraints import apply_constraints
@@ -369,10 +369,13 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
         on_thr = float(user_cfg["on_thr_w"])
         dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
+        post_min_on = int(user_cfg["post_min_on"])
+        post_fill_off = int(user_cfg["post_fill_short_off"])
         pbus_col = names.index("pbus")
         results: dict[str, dict] = {}          # {model: test 指标}（选型口径不变）
         results_by_split: dict[str, dict] = {}  # {model: {split: 指标}} 三阶段全量
-        daily_rows: list[pd.DataFrame] = []     # 每模型×每阶段×每天 指标
+        daily_rows: list[pd.DataFrame] = []     # 每模型×每阶段×每天 指标（能力口径）
+        daily_chain_rows: list[pd.DataFrame] = []  # 每模型×每阶段×每天 指标（链口径）
         test_preds: dict[str, np.ndarray] = {}  # {model: test 段预测}（状态策略评估用）
         collapsed_models: list[dict] = []       # 预测坍缩模型（带宽<on_thr_w，勿用于推理）
         pred_frames: dict[str, pd.DataFrame] = {  # 训练预测结果落盘（真实值+各模型预测）
@@ -412,6 +415,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 metrics = evaluate_all(scaled[split][1], y_hat, metric_names,
                                        on_thr_w=on_thr)
                 results_by_split[name][split] = metrics
+                # 链口径：先得 pred_state（判决链），再算两套日级
+                pred_state_arr = postprocess_state(
+                    y_hat[:, 0], dec_thr, post_min_on, post_fill_off).astype(int)
                 daily = evaluate_daily(scaled[split][1], y_hat, splits[split][2],
                                        metric_names, on_thr_w=on_thr)
                 daily.insert(0, "split", split)
@@ -420,14 +426,23 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 # on_thr_w 判态（模型能力口径，非 pred_state 的判决链口径）
                 daily["state_thr_w"] = on_thr
                 daily_rows.append(daily)
+                # 链口径日级（回归同能力口径、分类按 target_state vs pred_state）
+                daily_chain = evaluate_daily_chain(
+                    scaled[split][1], y_hat, pred_state_arr, splits[split][2],
+                    metric_names, on_thr_w=on_thr)
+                daily_chain.insert(0, "split", split)
+                daily_chain.insert(0, "model", name)
+                daily_chain["state_thr_w"] = on_thr
+                daily_chain["decision_thr_w"] = dec_thr
+                daily_chain["post_min_on"] = post_min_on
+                daily_chain["post_fill_short_off"] = post_fill_off
+                daily_chain_rows.append(daily_chain)
                 log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
                          {m: round(v["macro"], 4) for m, v in metrics.items()})
                 pred_frames[split][f"pred_{name}"] = y_hat[:, 0]
                 # 预测状态：生产判决链口径（decision_thr_w + 游程后处理），
                 # 与推理 pred_state / state_strategy 的 decision+runs 行一致
-                pred_frames[split][f"pred_state_{name}"] = postprocess_state(
-                    y_hat[:, 0], dec_thr, int(user_cfg["post_min_on"]),
-                    int(user_cfg["post_fill_short_off"])).astype(int)
+                pred_frames[split][f"pred_state_{name}"] = pred_state_arr
                 if split == "test":
                     test_preds[name] = y_hat[:, 0]
                     # —— 坍缩模型检测（0800 transformer 均值坍缩教训，2026-09-02）：
@@ -452,9 +467,12 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                       for s, mm in by.items()]
         pd.DataFrame(split_rows).to_csv(out / "metrics_by_split.csv",
                                         index=False, encoding="utf-8")
-        # 日级指标 CSV：model × split × date 行 × 指标列
+        # 日级指标 CSV：model × split × date 行 × 指标列（能力口径 @on_thr，无游程）
         pd.concat(daily_rows, ignore_index=True).to_csv(
             out / "metrics_daily.csv", index=False, encoding="utf-8")
+        # 日级链口径 CSV：同上，分类指标按 target_state(@on_thr) vs pred_state(@decision_thr+游程) 逐日
+        pd.concat(daily_chain_rows, ignore_index=True).to_csv(
+            out / "metrics_daily_chain.csv", index=False, encoding="utf-8")
 
         # 训练阶段预测结果 CSV：timestamp/split/target(真实值) + 各模型预测列
         # （§2.3 同域产物：predictions/train_predictions.csv，按时间排序便于画图比对）
@@ -711,9 +729,9 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         on_thr = float(user_cfg["on_thr_w"])
         # 决策阈值（§12.3 扩展）：仅作用于预测→状态判决；缺省沿用 on_thr_w
         dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
-        pred_state = postprocess_state(pred, dec_thr,
-                                       int(user_cfg["post_min_on"]),
-                                       int(user_cfg["post_fill_short_off"]))
+        post_min_on = int(user_cfg["post_min_on"])
+        post_fill_off = int(user_cfg["post_fill_short_off"])
+        pred_state = postprocess_state(pred, dec_thr, post_min_on, post_fill_off)
         pred_prob = state_probability(pred, dec_thr)
         # 状态真值：分路真值按同一 on_thr_w 二值化；无真值处为空（NaN）
         target_np = target_vals.to_numpy(dtype=np.float64)
@@ -735,6 +753,36 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "pred_prob": np.round(pred_prob, 6),
         })
         df_result[INFER_RESULT_COLUMNS].to_csv(result_csv, index=False)
+
+        # 链口径日级评估（推理，I.J 新增）：回归同 pred vs target，分类按 target_state(@on_thr) vs pred_state 逐日
+        if branch_c is not None:
+            try:
+                # have 为剔除无效天后的有效评估点（与 offline_metrics/metrics_daily 同口径）
+                if "have" in locals() and have is not None and len(have) > 0:
+                    metric_names_chain = base_cfg.get("metrics",
+                                                      ["mae", "rmse", "r2", "sae",
+                                                       "f1", "accuracy", "precision",
+                                                       "recall", "tp", "fp", "fn", "tn"])
+                    pred_state_on_have = pd.Series(
+                        pred_state, index=valid.index).loc[have.index].to_numpy(dtype=int)
+                    pred_on_have_chain = pd.Series(
+                        pred, index=valid.index).loc[have.index].to_numpy(dtype=float)
+                    daily_chain = evaluate_daily_chain(
+                        have.to_numpy(dtype=float)[:, None],
+                        pred_on_have_chain[:, None],
+                        pred_state_on_have,
+                        have.index,
+                        metric_names_chain,
+                        on_thr_w=on_thr)
+                    daily_chain.insert(0, "model", model_name)
+                    daily_chain["state_thr_w"] = on_thr
+                    daily_chain["decision_thr_w"] = dec_thr
+                    daily_chain["post_min_on"] = post_min_on
+                    daily_chain["post_fill_short_off"] = post_fill_off
+                    daily_chain.to_csv(out / "metrics_daily_chain.csv",
+                                       index=False, encoding="utf-8")
+            except Exception as e:  # noqa: BLE001 —— 链表为新增诊断产物，失败不阻断推理
+                log.warning("[%s] metrics_daily_chain 生成跳过: %s", user_key, e)
 
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "model": model_name,

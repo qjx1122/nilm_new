@@ -9,6 +9,8 @@ TRAIN（<run>/<user>/train/<ts>/）
       raw_on_thr/all_days 行 == metrics_by_split 的 test 行（跨产物对账）
   T3 train_predictions.csv  行数=三段之和；pred_state_<model> 按文件自描述
       decision_thr_w 重放逐位一致（判决链复现校验）
+  T4 metrics_daily_chain.csv 链口径日级（I.J 新增）：回归同能力口径、分类按
+      target_state vs pred_state 逐日；Σ==train_predictions 总数；阈值列自描述
 
 INFER（<run>/<user>/infer/<ts>/）
   I1 行数 == meta.json n_points          I2 列 == 契约 INFER_RESULT_COLUMNS（逐列）
@@ -20,6 +22,7 @@ INFER（<run>/<user>/infer/<ts>/）
   I8 期望值断言：--expect-n / --expect-confusion tp,fp,fn,tn / --expect-off-day-fp
   I9 offline_metrics.json 打印宏指标；--baseline-run 给另一 run 时逐键对照
       （模型能力口径应逐位一致 = 跨运行模型复现校验）
+  I10 metrics_daily_chain.csv 链口径日级（I.J 审计 J1）：Σ==I7 总数；逐日==细明细行
 
 用法（仓库根目录）：
     python scripts/audit_user_run.py --run-root outputs_t5_2844_thr400 \
@@ -116,6 +119,45 @@ def audit_train(tdir: Path | None, min_on: int, fill_off: int) -> None:
             _ok(ok_all, f"train_predictions pred_state_{model} 判决链重放"
                         f"（按段，thr={d:g}）逐位一致")
 
+    # T4 metrics_daily_chain.csv（链口径日级，I.J 新增）
+    chain = tdir / "metrics_daily_chain.csv"
+    _ok(chain.exists(), "metrics_daily_chain.csv 在位（链口径日级）")
+    if chain.exists() and len(dec) == 1:
+        try:
+            cdf = pd.read_csv(chain)
+            has_cols = all(c in cdf.columns for c in ("model", "split", "date", "n_points", "tp", "fp", "fn", "tn", "state_thr_w", "decision_thr_w", "post_min_on", "post_fill_short_off"))
+            _ok(has_cols, "metrics_daily_chain 列完备（model/split/date/n_points/tp⋯/state_thr/decision_thr/post_*）")
+            on_thr_pred = float(preds["on_thr_w"].iloc[0]) if "on_thr_w" in preds.columns else None
+            _ok((cdf["decision_thr_w"] == float(dec[0])).all() and (on_thr_pred is None or (cdf["state_thr_w"] == on_thr_pred).all()) and (cdf["post_min_on"] == min_on).all() and (cdf["post_fill_short_off"] == fill_off).all(),
+                f"metrics_daily_chain 阈值列自描述（state/dec/post）与文件一致（dec={float(dec[0]):g} min_on={min_on} fill={fill_off}）")
+            for col in [c for c in preds.columns if c.startswith("pred_state_")]:
+                model = col[len("pred_state_"):]
+                g = cdf[cdf["model"] == model]
+                if g.empty:
+                    _ok(False, f"metrics_daily_chain 缺模型 {model}")
+                    continue
+                s_tp, s_fp, s_fn, s_tn = int(g["tp"].sum()), int(g["fp"].sum()), int(g["fn"].sum()), int(g["tn"].sum())
+                t_on = preds["target_state"].to_numpy(dtype=int)
+                p_on = preds[col].to_numpy(dtype=int)
+                tp2 = int(((t_on == 1) & (p_on == 1)).sum())
+                fp2 = int(((t_on == 0) & (p_on == 1)).sum())
+                fn2 = int(((t_on == 1) & (p_on == 0)).sum())
+                tn2 = int(((t_on == 0) & (p_on == 0)).sum())
+                _ok([s_tp, s_fp, s_fn, s_tn] == [tp2, fp2, fn2, tn2],
+                    f"metrics_daily_chain[{model}] Σ tp/fp/fn/tn {s_tp}/{s_fp}/{s_fn}/{s_tn} == train_predictions 总数")
+                _ok(int(g["tp"].sum() + g["fn"].sum()) == int((preds["target_state"] == 1).sum()),
+                    f"metrics_daily_chain[{model}] tp+fn 恒等 = {int((preds['target_state']==1).sum())}")
+            mday = tdir / "metrics_daily.csv"
+            if mday.exists():
+                mdf_daily = pd.read_csv(mday)
+                for _, r in cdf.iterrows():
+                    match = mdf_daily[(mdf_daily["model"] == r["model"]) & (mdf_daily["split"] == r["split"]) & (mdf_daily["date"] == r["date"])]
+                    if not match.empty:
+                        _ok(int(match.iloc[0]["n_points"]) == int(r["n_points"]),
+                            f"metrics_daily_chain[{r['model']}/{r['split']}/{r['date']}] n_points {int(r['n_points'])} == metrics_daily")
+        except Exception as e:  # noqa: BLE001
+            _ok(False, f"metrics_daily_chain 校验异常: {e}")
+
 
 def audit_infer(idir: Path | None, min_on: int, fill_off: int, args) -> None:
     print("== INFER ==")
@@ -187,6 +229,50 @@ def audit_infer(idir: Path | None, min_on: int, fill_off: int, args) -> None:
         gfp = int(((g.target_state == 0) & (g.pred_state == 1)).sum())
         gfn = int(((g.target_state == 1) & (g.pred_state == 0)).sum())
         print(f"    {d} tp={gtp} fp={gfp} fn={gfn}")
+
+    # I10 metrics_daily_chain.csv（链口径日级，I.J 审计 J1；有真值时必在）
+    chain = idir / "metrics_daily_chain.csv"
+    has_target = int(m.sum()) > 0
+    if has_target:
+        _ok(chain.exists(), "metrics_daily_chain.csv 在位（链口径日级）")
+    else:
+        # 无真值时链口径日级无定义，文件可选
+        if not chain.exists():
+            print("  · 无真值，metrics_daily_chain.csv 可选（未生成）")
+    if chain.exists():
+        try:
+            cdf = pd.read_csv(chain)
+            has_c = all(c in cdf.columns for c in ("model", "date", "n_points", "tp", "fp", "fn", "tn", "state_thr_w", "decision_thr_w", "post_min_on", "post_fill_short_off"))
+            _ok(has_c, "metrics_daily_chain 列完备（model/date/n_points/tp⋯/state_thr/decision_thr/post_*）")
+            _ok((cdf["decision_thr_w"] == dec).all() and (cdf["state_thr_w"] == on_thr).all() and (cdf["post_min_on"] == min_on).all() and (cdf["post_fill_short_off"] == fill_off).all(),
+                f"metrics_daily_chain 阈值列自描述 decision={dec:g} state={on_thr:g} post {min_on}/{fill_off}")
+            _ok(int(cdf["tp"].sum()) == tp and int(cdf["fp"].sum()) == fp and int(cdf["fn"].sum()) == fn and int(cdf["tn"].sum()) == tn,
+                f"metrics_daily_chain Σ tp/fp/fn/tn {int(cdf['tp'].sum())}/{int(cdf['fp'].sum())}/{int(cdf['fn'].sum())}/{int(cdf['tn'].sum())} == inference_result 总数")
+            _ok(int((cdf["tp"] + cdf["fn"]).sum()) == int((df.loc[m, "target_state"] == 1).sum()),
+                f"metrics_daily_chain tp+fn 恒等 = {int((df.loc[m, 'target_state']==1).sum())}")
+            # 逐日对照（链口径）
+            for _, r in cdf.iterrows():
+                d = r["date"]
+                # df 此时仍含 _day 列（未 drop）
+                g = df[df["_day"] == d] if "_day" in df.columns else df[pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d") == d]
+                gm = g[g["target_state"].notna()]
+                if len(gm) == 0:
+                    continue
+                gtp = int(((gm["target_state"] == 1) & (gm["pred_state"] == 1)).sum())
+                gfp = int(((gm["target_state"] == 0) & (gm["pred_state"] == 1)).sum())
+                gfn = int(((gm["target_state"] == 1) & (gm["pred_state"] == 0)).sum())
+                _ok(int(r["tp"]) == gtp and int(r["fp"]) == gfp and int(r["fn"]) == gfn,
+                    f"metrics_daily_chain[{d}] tp/fp/fn {int(r['tp'])}/{int(r['fp'])}/{int(r['fn'])} == 明细逐日")
+            mday = idir / "metrics_daily.csv"
+            if mday.exists():
+                mdf_daily = pd.read_csv(mday)
+                for _, r in cdf.iterrows():
+                    match = mdf_daily[mdf_daily["date"] == r["date"]]
+                    if not match.empty:
+                        _ok(int(match.iloc[0]["n_points"]) == int(r["n_points"]),
+                            f"metrics_daily_chain[{r['date']}] n_points {int(r['n_points'])} == metrics_daily")
+        except Exception as e:  # noqa: BLE001
+            _ok(False, f"metrics_daily_chain 校验异常: {e}")
     df.drop(columns=["_day"], inplace=True)
 
     om = idir / "offline_metrics.json"

@@ -65,8 +65,8 @@ def _make_run(root: Path, infer_df: pd.DataFrame | None = None) -> Path:
 
     tr = _train_frames()
     (tdir / "predictions").mkdir(parents=True, exist_ok=True)
-    pd.concat(tr.values(), ignore_index=True).to_csv(
-        tdir / "predictions" / "train_predictions.csv", index=False)
+    preds_df = pd.concat(tr.values(), ignore_index=True)
+    preds_df.to_csv(tdir / "predictions" / "train_predictions.csv", index=False)
     # metrics_by_split：test 行 = (8,6,0,10)（与 infer 混淆/state_strategy raw 一致）
     pd.DataFrame([
         {"model": "transformer", "split": "train", "mae": 1.0, "f1": 0.9, "tp": 5, "fp": 1, "fn": 0, "tn": 6},
@@ -81,6 +81,24 @@ def _make_run(root: Path, infer_df: pd.DataFrame | None = None) -> Path:
          "decision_thr_w": 10.0, "post_min_on": 1, "post_fill_short_off": 3,
          "f1": 0.7273, "precision": 0.5714, "recall": 1.0, "tp": 8, "fp": 6, "fn": 0},
     ]).to_csv(tdir / "state_strategy_metrics.csv", index=False)
+    # metrics_daily.csv + metrics_daily_chain.csv（I.J 链口径日级）
+    preds_df["date"] = pd.to_datetime(preds_df["timestamp"]).dt.strftime("%Y-%m-%d")
+    daily_rows, chain_rows = [], []
+    for (split, date), g in preds_df.groupby(["split", "date"]):
+        t = g["target_state"].to_numpy(dtype=int)
+        p_raw = (g["pred_transformer"].to_numpy(float) >= 10.0).astype(int)
+        p_chain = g["pred_state_transformer"].to_numpy(dtype=int)
+        mae = float(np.mean(np.abs(g["target"].to_numpy(float) - g["pred_transformer"].to_numpy(float))))
+        def _f1(tp, fp, fn):
+            prec = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if fn == 0 else 0.0)
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 1.0
+            return 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        tp_r, fp_r, fn_r, tn_r = int(((t == 1) & (p_raw == 1)).sum()), int(((t == 0) & (p_raw == 1)).sum()), int(((t == 1) & (p_raw == 0)).sum()), int(((t == 0) & (p_raw == 0)).sum())
+        tp_c, fp_c, fn_c, tn_c = int(((t == 1) & (p_chain == 1)).sum()), int(((t == 0) & (p_chain == 1)).sum()), int(((t == 1) & (p_chain == 0)).sum()), int(((t == 0) & (p_chain == 0)).sum())
+        daily_rows.append({"model": "transformer", "split": split, "date": date, "n_points": len(g), "mae": mae, "f1": _f1(tp_r, fp_r, fn_r), "tp": tp_r, "fp": fp_r, "fn": fn_r, "tn": tn_r, "state_thr_w": 10.0})
+        chain_rows.append({"model": "transformer", "split": split, "date": date, "n_points": len(g), "mae": mae, "f1": _f1(tp_c, fp_c, fn_c), "tp": tp_c, "fp": fp_c, "fn": fn_c, "tn": tn_c, "state_thr_w": 10.0, "decision_thr_w": 10.0, "post_min_on": 1, "post_fill_short_off": 3})
+    pd.DataFrame(daily_rows).to_csv(tdir / "metrics_daily.csv", index=False)
+    pd.DataFrame(chain_rows).to_csv(tdir / "metrics_daily_chain.csv", index=False)
 
     df = infer_df if infer_df is not None else _infer_frame()
     (idir / "predictions").mkdir(parents=True, exist_ok=True)
@@ -88,6 +106,25 @@ def _make_run(root: Path, infer_df: pd.DataFrame | None = None) -> Path:
     (idir / "meta.json").write_text(json.dumps({"n_points": len(df)}), encoding="utf-8")
     (idir / "offline_metrics.json").write_text(
         json.dumps({"f1": {"macro": 0.7273}, "mae": {"macro": 3.0}}), encoding="utf-8")
+    # infer 侧日级（能力 + 链口径，I.J）
+    df["_date"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d")
+    i_daily, i_chain = [], []
+    for d, g in df.groupby("_date"):
+        t = g["target_state"].to_numpy(dtype=int)
+        p_raw = (g["pred"].to_numpy(float) >= 10.0).astype(int)
+        p_c = g["pred_state"].to_numpy(dtype=int)
+        mae = float(np.mean(np.abs(g["target"].to_numpy(float) - g["pred"].to_numpy(float))))
+        def _f1i(tp, fp, fn):
+            prec = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if fn == 0 else 0.0)
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 1.0
+            return 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        tp_r, fp_r, fn_r, tn_r = int(((t == 1) & (p_raw == 1)).sum()), int(((t == 0) & (p_raw == 1)).sum()), int(((t == 1) & (p_raw == 0)).sum()), int(((t == 0) & (p_raw == 0)).sum())
+        tp_c, fp_c, fn_c, tn_c = int(((t == 1) & (p_c == 1)).sum()), int(((t == 0) & (p_c == 1)).sum()), int(((t == 1) & (p_c == 0)).sum()), int(((t == 0) & (p_c == 0)).sum())
+        i_daily.append({"model": "transformer", "date": d, "n_points": len(g), "mae": mae, "f1": _f1i(tp_r, fp_r, fn_r), "tp": tp_r, "fp": fp_r, "fn": fn_r, "tn": tn_r, "state_thr_w": 10.0})
+        i_chain.append({"model": "transformer", "date": d, "n_points": len(g), "mae": mae, "f1": _f1i(tp_c, fp_c, fn_c), "tp": tp_c, "fp": fp_c, "fn": fn_c, "tn": tn_c, "state_thr_w": 10.0, "decision_thr_w": 10.0, "post_min_on": 1, "post_fill_short_off": 3})
+    pd.DataFrame(i_daily).to_csv(idir / "metrics_daily.csv", index=False)
+    pd.DataFrame(i_chain).to_csv(idir / "metrics_daily_chain.csv", index=False)
+    df.drop(columns=["_date"], inplace=True)
     return udir
 
 
