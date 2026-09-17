@@ -329,7 +329,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                                 f"有效样本 {len(f)} < 2×L({window})")
 
         masks = build_split_masks(f.index, user_cfg["split_ratios"],
-                                  user_cfg["split_strategy"], user_cfg.get("splits"))
+                                  user_cfg["split_strategy"], user_cfg.get("splits"),
+                                  target=target, on_thr_w=float(user_cfg["on_thr_w"]))
         names = [str(c) for c in f.columns]
         X_all = f.to_numpy(np.float64)
         y_all = y.to_numpy(np.float64)[:, None]  # 统一 (n, 1) 多输出矩阵接口

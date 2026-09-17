@@ -24,6 +24,31 @@ def test_all_strategies_valid():
     for strategy in ("time", "stratified_day", "stratified", "global_stratified"):
         masks = initial_split(IDX, RATIOS, strategy)
         _check(masks)
+    # stratified_by_state 需 target，按日开/关分层后各组内按比例均摊
+    import numpy as np
+    # 构造合成 target：前 30 天关（max<on_thr），后 30 天开
+    target = pd.Series(np.nan, index=IDX)
+    cutoff = IDX[0] + pd.Timedelta(days=30)
+    target.loc[IDX < cutoff] = 5.0
+    target.loc[IDX >= cutoff] = 500.0
+    masks = initial_split(IDX, RATIOS, "stratified_by_state",
+                          target=target, on_thr_w=50)
+    _check(masks)
+    # 验证均衡：池均 50% 关，各 split 关占比≈50%（极差<15%）
+    def _off_ratio(m):
+        days = sorted(pd.Series(m.index[m].normalize()).unique())
+        # 统计落在关期的天数
+        off = sum(1 for d in days if d < cutoff.normalize())
+        return off / len(days) if days else 0
+    ratios = {k: _off_ratio(v) for k, v in masks.items()}
+    assert max(ratios.values()) - min(ratios.values()) < 0.15
+    # 缺 target 时退化为 time 而非抛错
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        masks_fb = initial_split(IDX, RATIOS, "stratified_by_state")
+        _check(masks_fb)
+        assert any("退化为 time" in str(x.message) for x in w)
 
 
 def test_time_strategy_chronological():
@@ -53,3 +78,20 @@ def test_invalid_ratios():
         initial_split(IDX, [0.5, 0.5, 0.5], "time")
     with pytest.raises(ValueError):
         initial_split(IDX, RATIOS, "unknown_strategy")
+
+
+def test_stratified_by_state_build_with_target():
+    import numpy as np
+    target = pd.Series(np.nan, index=IDX)
+    cutoff = IDX[0] + pd.Timedelta(days=30)
+    target.loc[IDX < cutoff] = 5.0
+    target.loc[IDX >= cutoff] = 500.0
+    masks = build_split_masks(IDX, RATIOS, "stratified_by_state",
+                              target=target, on_thr_w=50)
+    _check(masks)
+    def _off_ratio(m):
+        days = sorted(pd.Series(m.index[m].normalize()).unique())
+        off = sum(1 for d in days if d < cutoff.normalize())
+        return off / len(days) if days else 0
+    ratios = {k: _off_ratio(v) for k, v in masks.items()}
+    assert max(ratios.values()) - min(ratios.values()) < 0.15

@@ -130,7 +130,8 @@ class Status:
 
 
 # ---------------------------------------------------------------- 用户 JSON 配置契约（§12.3）
-SPLIT_STRATEGIES = ("stratified_day", "stratified", "time", "global_stratified")
+SPLIT_STRATEGIES = ("stratified_day", "stratified", "time", "global_stratified",
+                    "stratified_by_state")
 
 CONFIG_RULES: dict[str, dict] = {
     # field: default, validator 说明（具体校验见 pipeline/user_config.py）

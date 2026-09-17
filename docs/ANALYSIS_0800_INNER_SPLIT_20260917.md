@@ -1,5 +1,7 @@
 # 0800 B1 池内划分失衡诊断 — train 15/23 65%关 vs val 1/8 12% vs test 0/7 0%（2026-09-17）
 
+> **2026-09-17 更新（自动化已实现）**：新增 `split_strategy=stratified_by_state`（`contracts.py/splits.py/user_task.py` + `tests/test_splits.py` 6/6 绿，B1 池 38天实证 `43%/37%/42%` 极差<6pct），配置 `configs/time_filters_0800_B1b.json`（`split_strategy=stratified_by_state`）已生成待双路验证，判据 `infer F1+0.02`，详见 `STATUS.md` 进行中。
+
 > **用户现况**：池级 训练 38天16关（42.1%关）/ 推理 19天5关26.3% 池级差已收至 15.8pct；**池内 `train 15/23 65.2%关 / val 1/8 12.5% / test 0/7 0%`**  
 > **对照**：B 原池 40天17开23关 42.5%开时 手锚 `train 10/14 41.6%开 / val 3/5 37.5% / test 4/4 50%` 三者 8pct 内一致；B1 切为 **自动 `stratified_day`（按星期）** 后失衡  
 > **审计**：`outputs_0800_B1_* audit` 全绿但 `test F1 0.93` 虚高（0关）、`val F1 0.84` 乐观、`train 65%关` 过关
