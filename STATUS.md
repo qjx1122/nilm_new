@@ -72,6 +72,7 @@
 5. trains/infers 各余 1 非法目录（非 2844，全量批量前需处理）
 
 ## 决策记录 / 踩坑
+- [2026-09-17] **OQ-16 0800二次修正（上位事实）**：`800080270800` 分路数据不在 `p1/p2/p3`（用户核实 2026-09-17），原 `p1 40天hand-anchor/decision30/lag5/OFF8` 全量历史结论（`ANALYSIS_0800_* 12篇` `F1 0.77-0.78 R²0.36-0.49` 等）**降级为错误目标参考**（同 OQ-13），`time_filters.json:0800` 加 `_OQ16_PAUSED`，**暂时不对0800做分析**；5户最优批改4户（`base_optimal` 4模型择优对 `2842/2844/778/789` 仍有效，`lag5` 零风险已合入），已落盘 `NILM_DATA_DICT v0.2.10` `REPORT.md#4` `docs/CORRECTION_0800_TARGET_20260917.md`。
 - [2026-09-17] **stratified_by_state 自动化（池内失衡根治）**：`stratified_day` 按星期分层不感知开/关，B1 池内 `65% vs 0%` 极差65pct 且 `test 0关` 致 `F1 0.93` 虚高不可信。新策略 `stratified_by_state` 按日开/关（`max>=on_thr_w`）分层后各组内按 `split_ratios` 均摊，B1 38天池 `22开16关` 自动得 `train 10/23 43%/val 3/8 37%/test 3/7 42%` 极差<6pct，零手锚维护，缺 `target` 时退化为 `time` 并告警。已实现 `contracts/splits/user_task` 三件套+单测 6/6，配置 `B1b` 待验，判据 `infer F1+0.02`。
 - [2026-09-17] **0800 B1b 回收（stratified_by_state 池内治但池外未治）**：38天池 `43%/37%/42%` 极差<6pct，`test 0.93→0.65` 可信化达成，但 `infer ridge 0.676 / transformer 0.691` 均 < `B_default 0.773`（`fp 253/318` 全关虚开未降，thr30 0/ -0.13），**池内均衡≠池外泛化**，瓶颈 `lag75`+`ub/ib/pfb`。
 - [2026-09-17] **0800 池内失衡诊断（B1 15/23 65% vs 0/7 0%）**：`stratified_day` 按星期分层致 `train 65%关 / val 12% / test 0%` 极差65pct，`test 0关` 使 `test F1 0.93` 虚高不可信（与推理26%错位26pct），`val 12%` 使早停乐观，`train 65%` 关先验过重。理想 42%均摊（train 9-10/23 43% / val 3/8 37% / test 3/7 42%），手锚均衡（复用 B 原池 10/14 3/5 4/4 模板）或新增 `stratified_by_state` 可治；B1b 待验。

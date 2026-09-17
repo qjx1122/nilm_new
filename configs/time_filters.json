@@ -291,7 +291,10 @@
       ]
     },
     "decision_thr_w": 30.0,
-    "_note_0800_thr30_20260917": "2026-09-17 0800重分析：test峰30(F1 0.614 vs 50的0.605) infer峰10/30(F1 0.787/0.783 vs 50的0.554) 生产50踩谷底；decision 30为test/infer折中（R 0.988/0.821 vs 50的0.883/0.418），多模型回退(A1)并行验证"
+    "_note_0800_thr30_20260917": "2026-09-17 0800重分析：test峰30(F1 0.614 vs 50的0.605) infer峰10/30(F1 0.787/0.783 vs 50的0.554) 生产50踩谷底；decision 30为test/infer折中（R 0.988/0.821 vs 50的0.883/0.418），多模型回退(A1)并行验证",
+    "_OQ16_PAUSED": "2026-09-17 用户核实：该户分路数据不在p1/p2/p3，原target p1(40天hand-anchor/decision30/lag5/OFF8)全量历史结论降级为错误目标参考（同OQ-13），target待重定（如p4待查），暂时不对0800做分析",
+    "_OQ16_action": "PAUSED: batch 5户全量改4户（2842/2844/778/789），执行包见 EXECUTION_PACKAGE_4USERS_OPTIMAL_20260917.md；历史 ANALYSIS_0800_* 12篇保留但不作为现行基线",
+    "_status": "PAUSED_OQ16"
   },
   "_default": {
     "train": {
