@@ -879,3 +879,153 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 3. **测试**：`tests/test_audit_user_run.py` 同步合成 `metrics_daily*` 双表（能力+链口径，按 `target_state` vs `pred_state` 逐日分组生成，`n_points` 对齐、链 Σ==`train_predictions`/`inference_result` 总数），`tests/test_chain_daily.py` 4 用例（回归一致、分类用 `pred_state`、分组求和、端到端阈值列与 `n_points` 对齐）；全量 212 过（190+4 链口径+3 审计+15 分类；torch 依赖缺失的 25 项按既有口径跳过）；
 4. **验证**：本地合成端到端（`default.yaml` ridge/history_profile，`decision_thr=30`）——`train/infer` 链日级 Σ 分别等于 `train_predictions`/`inference_result` 总混淆（tp/fp/fn/tn 逐位一致）、`TP+FN` 恒 1057、`n_points` 与能力口径逐日对齐、阈值列 `decision_thr_w=30` 自描述；`threshold_sweep` 仍作跨阈曲线，链日级作逐日明细，两者互补已就位；
 5. **使用**：交付口径逐日直出（`07-01~04` 全关日 `fp`、`07-27` `40` 等无需手扫）、阈值月度校准与跨月护栏有日级证据、val `P 0.444` 的 `179 FP` 可按 `metrics_daily_chain.csv` 的 `split=val` 逐日定位；`metrics_daily.csv` 仍为能力口径对照（两表之差=判决链净效应）。
+## [2026-09-17] 专题：0800 整体低指标重分析与根因定量（REEVAL/UPDATE/ROOTCAUSE/FINAL 四件套回填）
+- 类型：验证专题（用户指令驱动重分析 + 实录闭环 + 双路对照终判）
+- 目标与假设：
+  - 用户观察：0800“整体低”是否由数据/配置/模型导致；W-1 修复后为何仍低
+  - 假设：SPLIT/阈值/时滞/有效天数中存在主导瓶颈，需六维重审（配置/splits/窗口/评估口径/模型族/跨用户横比）
+  - 基线：W-1 对照 + `outputs_all_chain` 5户全量（2026-09-16 batch）+ `threshold_sweep` 双表
+- 方法 / 数据 / 参数：
+  - 数据：`800080270800_4200904302272` p1 `on_thr 50` `decision30` `min_on1 fill3` `window96` `B 40天 hand-anchor 10/14-3/5-4/4` + `B1 38天15/23` + `B1b 38天 stratified_by_state 43/37/42%`
+  - 工具：`audit_user_run` 双路审计；`threshold_sweep` test/infer 曲线；`meta/identifiability/day_gate/metrics_daily_chain` 四件套
+  - 对照：`outputs_0800_B_default(default.yaml history/proportional/ridge)` vs `outputs_0800_B_t5(base_t5 transformer)` 同数据同切分同阈值唯模型族不同，回归抽窗 1088→SPLIT 7天验证
+- 用户执行命令（含实录路径；本节无用户命令则注明）：
+  - 双路批量：`python scripts/run_batch_users.py --time-filter-config configs/time_filters_0800_B1.json --base-config configs/default.yaml --data-root data --output-root outputs_0800_B_default --user-key 800080270800_4200904302272` + `--base-config configs/base_t5.yaml --output-root outputs_0800_B_t5`（PowerShell, RTX3080 test_gpu, 模式B）
+  - sweep：`python scripts/threshold_sweep.py --csv outputs_0800_B_t5/.../train_predictions.csv --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150`
+  - 审计：`python scripts/audit_user_run.py --run-root outputs_0800_B_t5 --expect-n 2822`（双路全绿）
+- 结果 / 结论：
+  - **量化画像（B_default 40天 / B1b 38天 实录）**：`train R² <0.35 / F1 <0.6` 欠拟合；`test F1 0.60(B) 0.93(B1虚高0关) 0.65(B1b 42%可信)`；`infer链@30 0.773(B_default proportional 0.773 / 0.783) 0.693(B1) 0.676(B1b)`；`pearson 0.37 / R² -1.02(ridge) / lag5 75min` 天花板
+  - **根因排序（P0>通道>阈值>重划分）**：`lag75` 零成本首试（0.37→0.43）> `ub/ib/pfb置0` 通道 > `decision30`（已交付+0.23）> 重划分消融（50/50丢6天 40→34天，预期+0.01~0.05）；`stratified_day` 按星期分层不保开/关均衡（B1 65%/12%/0% 极差65pct）
+  - **治理路径收敛**：`lag75` 为 P0-1（`lags[5,1,2,3,4]`）已合入 `default.yaml/base_t5.yaml`；`decision30` 生产保留；重划分仅作30s消融（F1+0.02且SAE不恶化再合入）
+  - **双路终判（FINAL）**：`proportional infer 0.773` 优于 `transformer 0.691`（`transformer train R² 0.22→0.79` 欠拟合缓解但时序外推弱，`infer 5关 60-77% fp`）；生产维持 `B_default proportional decision30`
+- 是否进入 REPORT.md（稳定结论）：否（治理进行中，待 lag5/OFF8 实录后统一落版）；OQ-16 后 p1 全量历史结论已按 `CORRECTION_0800_TARGET_20260917.md` 降级为错误目标参考
+- 遗留问题：lag5 叠加/通道修复待实录；B相0为设计（`CORRECTION_B_PHASE_AND_OFFFILTER` 已更正）；OFF筛选待验；原 `docs/ANALYSIS_0800_REEVAL*.md / ROOTCAUSE*.md / FINAL*.md` 归档删除
+- 原落盘文件（已回填归档）：`docs/ANALYSIS_0800_REEVAL_20260917.md / REEVAL_UPDATE.md / ROOTCAUSE_20260917.md / FINAL_20260917.md`（协议回归，已合入本节）
+
+## [2026-09-17] 专题：0800 训练集划分与池级错位治理（SPLIT_REBALANCE + TRAIN_INFER_REDISTRIBUTION + INNER_SPLIT）
+- 类型：分析专题（用户续问：训练全关过多是否重划分 / train/infer 时段重切）
+- 目标与假设：
+  - 续问一：训练集全关 23/40=57% 是否失衡，是否应50/50重划分
+  - 续问二：train 05-21~06-29 57%关 vs infer 07-01~08-02 推理端 6关22% 池级差35pct（更正：原0关→6关22%）是否错位，是否重划train/infer时段
+  - 假设：hand-anchor后层内均衡可治池内，手锚比例即总体如实投影
+- 方法 / 数据 / 参数：
+  - 审计：`B 40天 17开23关 42.5%开 hand-anchor train 10/14 58.3%关 / val 3/5 / test 4/4` + `B1b 38天42%` 池 + `infer 19天5关26%`
+  - 方案三档：A仅剔11关29% / B1剔11关+延10天至07-10 34天29%对齐22%推荐 / B2仅延 / C滑窗；零泄漏门（07-10<07-11）+ `stratified_by_state` 自动化已实现（`contracts/splits/user_task` + 6/6测试）
+- 用户执行命令：`python scripts/make_B1_config.py` 生成 `configs/time_filters_0800_B1.json`（12关清单）；`python scripts/run_batch_users.py --time-filter-config configs/time_filters_0800_B1.json --base-config configs/default.yaml --user-key 800080270800_4200904302272`（模式B，双路审计全绿）
+- 结果 / 结论：
+  - **现状非失衡**：40天池42.5%开下手锚 58.3%是如实投影，test 4关F1=0拉垮均值86%天不达标是评估口径非事故；调50/50需丢6天（1088→~850窗）换7.5pct，ROI低
+  - **池级差35pct > 层内8pct**：根因=5-6月停产/周末关 vs 7月满产（业务时移）；`test 4关50%` 高配于推理22%失真
+  - **推荐**：`B1剔11关+延10天=34天29%关`最优（池级57→29对齐22%差7pct+时效近，窗1088→925）；`A仅剔29%`次之，`B2仅延46%`治标不治本；保留29%关作反例底座（2844全关虚报告诫）；P0可与lag75叠加，判据F1≥+0.02且SAE不恶化
+  - **池内失衡诊断**：B1 `stratified_day 65%/12%/0% 极差65pct` → `stratified_by_state 43%/37%/42% 极差<6pct`，`test0关虚高26pct`实证关占比主导评测（详见下一专题）
+- 是否进入 REPORT.md：否（中间分析，待B1b验证后统一落版）
+- 遗留问题：50/50仅作30s消融（OQ-16后已PAUSED）；`P0 lag75`首试已接棒
+- 原落盘文件：`docs/ANALYSIS_0800_SPLIT_REBALANCE_20260917.md / TRAIN_INFER_REDISTRIBUTION_20260917.md / INNER_SPLIT_20260917.md`（已回填归档）
+
+## [2026-09-17] 专题：0800 B1/B1b 池内分层重切与自动化验证（模式B 双路审计）
+- 类型：验证专题（池内失衡治理：手锚均衡 vs stratified_by_state 自动化）
+- 目标与假设：
+  - B1池内 `train 15/23 65%关 / val 1/8 12% / test 0/7 0% 极差65pct` 致 `test F1 0.93虚高` `val 12%早停乐观`
+  - 假设：按开/关分层后均摊可治；自动化 `stratified_by_state`（按日`max>=on_thr_w`开/关分层后各组内_ratio_assign）零手锚达成42%均摊
+- 方法 / 数据 / 参数：
+  - 实现：`contracts.py SPLIT_STRATEGIES` + `splits.py _daily_on_off+initial_split(target/on_thr_w)` + `user_task透传`；`tests/test_splits.py` 2用例6/6绿
+  - 对照池：B1 38天22开16关42.1%关（train 05-21~07-10 剔12关）；`B_default 40天` vs `B1/B1b` 同池不同分层
+  - 执行：`configs/time_filters_0800_B1.json`(B1手锚) / `time_filters_0800_B1b.json`(B1b自动) × `default.yaml(proportional)` + `base_t5.yaml(transformer)` 四跑，审计全绿
+- 用户执行命令：
+  - `python scripts/run_batch_users.py --time-filter-config configs/time_filters_0800_B1.json --base-config configs/default.yaml --data-root data --output-root outputs_0800_B1_default --user-key 800080270800_4200904302272`（B1双路）
+  - `python scripts/run_batch_users.py --time-filter-config configs/time_filters_0800_B1b.json --base-config configs/default.yaml --data-root data --output-root outputs_0800_B1b_default --user-key 800080270800_4200904302272`（B1b双路，stratified_by_state生效标识）
+- 结果 / 结论：
+  - **池内均衡达成**：B1b `43%/37%/42%` 贴池均42%（vs 原65%/12%/0%），缺target退化time+告警；B1手锚亦达成 `58%/60%/50%` 形态
+  - **可信化但未增益**：`test F1 0.93→0.65` 虚高消除（可信化达成），但 `infer链@30 proportional 0.773→0.739 / transformer 0.783→0.693 FP201→325 P0.51→0.48` 推理未赢；`proportional B1b ridge链0.676 / transformer 0.691 <0.773` 未达+0.02判据不合入
+  - **机理**：池内均衡≠池外泛化；07-01~10全开段入训练使test同分布红利，infer全开段未平移（L1时滞75min未治、rib特征弱），`infer 5关 fp253/318 43-58%` 全关虚开未降，thr30 0/-0.13
+  - **生产维持**：`B_default hand-anchor proportional 0.773`；B1作反例存档；治理转 `lag75`+`ub/ib/pfb`
+- 是否进入 REPORT.md：否（未达F1+0.02合入线，作反例；自动化能力已验证）
+- 遗留问题：`lag75` P0首试；阈值扫描峰 `100@0.689` 仍未赢；OQ-16后已PAUSED
+- 原落盘文件：`docs/ANALYSIS_0800_B1_RESULTS_20260917.md / B1b_RESULTS_20260917.md / INNER_SPLIT_20260917.md` + `docs/EXECUTION_PACKAGE_0800_B1_20260917.md`（已回填归档）
+
+## [2026-09-17] 专题：0800 P0 时滞校正与通道修复（lag75 + ub/ib/pfb，两阶段）
+- 类型：实验专题（P0优化首试：lag5 时滞校正 + 通道修复；含执行包）
+- 目标与假设：
+  - 瓶颈：`pearson 0.37 / R² -1.02 / lag5 75min` 天花板；`MISSING_COLUMN ub(45)/ib(37)/pfb(44)置0` 致imb特征失真
+  - 假设：P0-1 lag5 [5,1,2,3,4]零成本首试预期 `0.37→0.43`；P0-2 `ub→ua / ib→ia / pfb→pfa` 单相复用再叠`+0.05`
+- 方法 / 数据 / 参数：
+  - P0-1：`configs/default.yaml + base_t5.yaml` 全局合入 `lags: [5,1,2,3,4]`（B相0为设计，无需映射，先行 `CORRECTION_B_PHASE_AND_OFFFILTER` 废弃单相复用方向）
+  - P0-2：总线列清单49-51缺45/37/44实证置0；原复用方案 `ub(45)→ua(9)/ib(37)→ia(1)/pfb(44)→pfa(8)` 已作废，仅保留反例
+  - 池：B1b 38天42% `stratified_by_state` 均摊 `1721/574/576` 窗
+- 用户执行命令：
+  - `python scripts/run_batch_users.py --time-filter-config configs/time_filters_0800_B1b.json --base-config configs/default.yaml --data-root data --output-root outputs_0800_B1b_lag5 --user-key 800080270800_4200904302272`（P0-1 lag5，双路审计全绿）
+  - （P0-2已废弃，不再验证；`configs/time_filters_0800_P0_UBFIX.json` 保留反例不推）
+- 结果 / 结论：
+  - **P0-1显著达标（transformer）**：`train R² 0.744→0.931 / test 0.60→0.70 F1 +0.10 / infer链@30 F1 0.691→0.750 (+0.059) R² 0.391→0.496 (+0.105) SAE 0.220→0.032 on_day_fp -56%`（`ridge`持平）；`threshold_sweep test 100峰0.689` 仍未赢但时滞主导证毕
+  - **P0-2废弃**：用户更正“B相0为人为删除”→置0为预期，`CORRECTION_B_PHASE`已登记，优化回归池内删关（详见OFF8专题）
+  - **全局合入**：`lags[5,1,2,3,4]` 已合入 `default.yaml/base_t5.yaml/base_optimal.yaml` 全局，回归对4户零污染（见回归包）
+- 是否进入 REPORT.md：是（候选）——“lag5 75min时滞校正为0800 P0首试最优（transformer F1+0.06 R²+0.10），全局零风险已合入”
+- 遗留问题：OFF筛选对transformer负效（见下）；OQ-16后p1全量结论已降级
+- 原落盘文件：`docs/ANALYSIS_0800_LAG5_RESULTS_20260917.md / docs/PLAN_0800_OPTIMIZATION_20260917.md / docs/EXECUTION_PACKAGE_0800_P0_20260917.md / EXECUTION_PACKAGE_0800_P0_UBFIX_20260917.md / docs/CORRECTION_B_PHASE_AND_OFFFILTER_20260917.md`（已回填归档，P0-2保留反例引用）
+
+## [2026-09-17] 专题：0800 OFF8 删关与T5从头分析（池内删关对不同模型的异构效应）
+- 类型：验证专题（池内删全关天 `OFF8/4/12` vs T5从头四档全关占比影响评估）
+- 目标与假设：
+  - 优化主线更正后：唯一主线=池内删全关（B1b 38天42%→OFF8 30天60%开）预期退火
+  - 假设：删关对`history/proportional`可能增益，对`transformer`边界学习可能负效；T5单模型从头 `B(50%)→B1(0%)→B1b(42%)→OFF8(50%)` F1`0.60→0.93→0.65→0.73` 震荡由关占比主导
+- 方法 / 数据 / 参数：
+  - OFF8：B1b最旧8关（05-24,25,06-01,12,13,14,15,16）剔除→30天18开12关60%开；`lag5`已合入；`stratified_by_state` 均摊1721/574/576；`threshold_sweep`复现校验
+  - T5从头：同lag5同stratified_by_state，T5单模型 `epochs150/patience20` 四档同infer 19天5关26.3%锚点，`audit`全绿
+- 用户执行命令：
+  - `python scripts/make_OFFFILTER_config.py --drop-off-n 8 --base-config configs/time_filters_0800_B1b.json --output configs/time_filters_0800_OFF8.json` + `python scripts/run_batch_users.py --time-filter-config configs/time_filters_0800_OFF8.json --base-config configs/base_t5.yaml --data-root data --output-root outputs_0800_OFF8 --user-key 800080270800_4200904302272`
+  - T5四档：`--base-config configs/base_t5.yaml --output-root outputs_0800_T5_{B,B1,B1b,OFF8}` + `python scripts/threshold_sweep.py --csv .../train_predictions.csv --thresholds 10,30,50,100`
+- 结果 / 结论：
+  - **OFF8异构效应**：`history链@30 0.704→0.783(+0.079)赢`，`proportional 0.773→0.720跌`，`ridge 0.676→0.69持平`，`transformer 0.750→0.678(-0.072)跌`；`test 0.60→0.73升但infer跌`→删关伤序列模型边界学习，不合入全局
+  - **T5四档结论**：`test F1 0.60→0.93虚高(0关)→0.65可信(42%)→0.73`；`test关+10pct≈F1-0.07`；`val 12%→37% F10.93→0.73`；`infer 57%(B)→42%(B1b) 0.77→0.69`非单调，`LAG5 42%+lag→0.75`覆盖关占比；`test0关R²0.79虚高 vs B1b0.42回落`证R²与关占比解耦，`SAE 0关0.03假低`（除零伪值）
+  - **T5推荐**：维持`B1b 38天+lag5[5,1,2,3,4]+stratified_by_state`，`test 0.70 R²0.28`新可信基线，`infer 0.75`天花板；OFF8仅history有效
+- 是否进入 REPORT.md：否（OFF8未达全模型增益；T5四档作可信度校准参考）
+- 遗留问题：OQ-16后p1结论已降级；800分析暂PAUSED待p4重定
+- 原落盘文件：`docs/ANALYSIS_0800_OFF8_RESULTS_20260917.md / T5_FROM_SCRATCH_20260917.md / docs/EXECUTION_PACKAGE_0800_OFFFILTER_20260917.md`（已回填归档）
+
+## [2026-09-17] 专题：5户→4户最优配置梳理与OQ-16二次修正（全量最优快照 + 执行包）
+- 类型：用户专题（**重大输入修正**：OQ-16 0800目标不在p1/p2/p3；5户最优→4户最优）
+- 目标与假设：
+  - 收敛5户（2842 p1/50, 2844 p2/10, 778 p2, 789 p1+p2/60, 800 p1/50）`target/on_thr/decision/train/splits/quality/base/lags` 最优版本定全量回归基准
+  - 上位事实：2026-09-17用户核实 `800080270800` 分路不在p1/p2/p3（继OQ-13后二次修正），原p1 40天hand-anchor/decision30/lag5/OFF8 12篇历史结论降级为错误目标参考，800 PAUSED待p4
+  - 假设：`base_optimal.yaml lags[5,1,2,3,4] 4模型自动择优 + day_gate true` 对4户零风险
+- 方法 / 数据 / 参数：
+  - 全局最优：`default.yaml lag5[5,1,2,3,4] + day_gate true + W-1分段构窗` 已合入；800 `time_filters.json:0800`加`_OQ16_PAUSED`
+  - 分户最优快照（4户）：`2842 ridge(p1/50) / 2844 transformer(p2/10/400) / 778 history(p2) / 789 transformer(p1+p2/60)`；`samples`与门禁互证
+  - 字典：`NILM_DATA_DICT v0.2.10`登记OQ-16；`REPORT.md#4`更正声明
+- 用户执行命令（模式B，PowerShell）：
+  - 预检：`python -c "import json,pathlib;cfg=json.loads(pathlib.Path('configs/time_filters.json').read_text());print(list(cfg['_default']['features']['lags']));print(cfg['800080270800_4200904302272'].get('_OQ16_PAUSED'))"`（期望`[5,1,2,3,4]` / `true MISSING_COLUMN ub/ib/pfb置0`）
+  - 全量5户（归档）：`python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs_5users_optimal --user-key 2842,2844,778,789,800`（含800 PAUSED，注意batch_status 4×OK+1×PAUSED）
+  - 全量4户（新基准）：`python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs_4users_optimal --user-key 2842,2844,778,789`（本专题回归包主体，详见下专题）
+  - 回归验证：`python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs_5users_regression --user-key 2842,2844,778,789`（5户回归执行包，判据 `audit全绿 + F1Δ<0.02 / R²Δ<0.05`）
+- 结果 / 结论：
+  - **OQ-16处置**：800 12篇 `ANALYSIS_0800_*` 降级，`CORRECTION_0800_TARGET_20260917.md`已落盘；5户最优批改4户（`ANALYSIS_5USERS_OPTIMAL_CONFIG`→`ANALYSIS_4USERS_OPTIMAL_CONFIG`）
+  - **最优快照有效**：`lag5`对4户验证零污染（回归包）；`B相0`为设计（`CORRECTION_B_PHASE`更正，P0-2废弃）
+- 是否进入 REPORT.md：是（`REPORT.md#4 OQ-16 + NILM_DATA_DICT v0.2.10`已登记）
+- 遗留问题：800 p4确认后另立项；4户最优重跑详见下专题
+- 原落盘文件：`docs/ANALYSIS_5USERS_OPTIMAL_CONFIG_20260917.md / ANALYSIS_4USERS_OPTIMAL_CONFIG_20260917.md / docs/CORRECTION_0800_TARGET_20260917.md / CORRECTION_B_PHASE_AND_OFFFILTER_20260917.md / docs/EXECUTION_PACKAGE_5USERS_OPTIMAL_20260917.md / EXECUTION_PACKAGE_4USERS_OPTIMAL_20260917.md / EXECUTION_PACKAGE_5USERS_REGRESSION_20260917.md`（已回填归档，执行包命令保留于本节）
+
+## [2026-09-17] 专题：4户最优全量重跑回收判读（base_optimal lag5 4模型，OQ-16 800 PAUSED）
+- 类型：验证专题（模式B，全量最优配置的4户终验）
+- 目标与假设：
+  - 验证 `base_optimal lag5[5,1,2,3,4] 4模型自动择优` 在2842/2844/778/789上的`test/infer/audit/batch_status`一致性与`lag5`全局零污染
+  - 假设：`lag5`对4户无负效或可被4模型择优兜底；`day_gate true`全局默认稳态
+- 方法 / 数据 / 参数：
+  - 配置：`time_filters.json HEAD(_OQ16_PAUSED)` + `base_optimal.yaml(4模型)` + `day_gate true`；`train ≤06-30`零泄漏；`800 PAUSED`不参跑
+  - 产出：`outputs_4users_optimal/{2842,2844,778,789}/{train,infer}/<ts>/` 4×`_DONE` + `batch_status.csv` + `audit_user_run` + `comparison.md`
+- 用户执行命令：
+  - `python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs_4users_optimal --user-key 800080252842_4206894986488 --user-key 800080252844_4206894986488`（逐户4次，PowerShell，RTX3080 test_gpu）
+  - `python scripts/audit_user_run.py --run-root outputs_4users_optimal/800080252842_4206894986488 --expect-n 2325`（2842）/ `2628`(2844) / `1858`(778) / `2629`(789)（期望4×审计绿）
+  - `python scripts/threshold_sweep.py --csv outputs_4users_optimal/.../train_predictions.csv --thresholds 10,30,50,100`（复现校验）
+- 结果 / 结论：
+  - **总览（`base_optimal lag5`）**：
+    | 户 | `train/val/test` | `best` | `test F1/R²` | `audit` | `infer链 F1` | `infer 6✗说明` |
+    |---|---|---|---|---|---|---|
+    | 2842 p1 | 6097/2092/2013 (107天84%开 13段) | ridge | 0.869 / 0.614 | 6✗ | **0.984** (1183/32/5) | 多`pred_state_*`重放透传缺陷（审计工具待修），非数据/模型缺陷，不阻断 |
+    | 2844 p2 | 2587/959/768 (45天71%开) | transformer | 0.678 / 0.147 | ✅ | **0.887** (1054/265/3) | 复现0.891→0.887，4全关fp150 |
+    | 778 p2 | 1337/574/670 (27天100%开) | history | **0.985** / 0.792 | ✅ | **0.968** (903/23/36) | history稳胜ridge崩0.575 |
+    | 789 p1+p2 | 759/576/96 (15天100%开) | transformer | **0.962** / 0.868 | ✅ | **0.984** (1426/17/29) | history0.981但R²-5.3幅值弱，择优正确 |
+  - **lag5户级影响定量**：`lag5`全局对2844/778/789零负效；对2842 `transformer 0.983→0.818 -0.165`负效但`ridge 0.869`自动择优救场，`infer 0.984`仍达标（追峰0.989可单户白名单`lags[1,2,3,4]`）
+  - **batch/audit**：`batch_status 4×2 OK`（2842 ridge/2325 2844 transformer/2628 778 history/1858 789 transformer/2629），`audit 2844/778/789 全绿✅ 2842 6✗`，`comparison`已贴
+- 是否进入 REPORT.md：是（候选）——“4户最优基线（2026-09-17 lag5 4模型）：2842 ridge 0.869/0.984 2844 0.678/0.887 778 0.985/0.968 789 0.962/0.984；lag5零污染（2842 transformer负效由择优兜底）”
+- 遗留问题：①2842单户回退`lags[1,2,3,4]`追0.989峰值是否白名单；②`audit_user_run`多模型阈值自描述修复；③800 PAUSED待p4重定
+- 原落盘文件：`docs/ANALYSIS_4USERS_OPTIMAL_RESULTS_20260917.md`（已回填归档，本节为权威载体）
+

@@ -168,3 +168,36 @@
 - 关键教训：损失加权≠新信息——训练池少数类 3 天（11%）时加权+均值归一伤多数类+早停交互=全线劣化；池内改善/池外恶化=证伪关键证据
 - 未决问题：⑯ 转向拍板（decision_thr_w 30W / ⑮ v3 收官 / 停产日历特征）
 - 相关文件/分支：REPORT_TEST.md、REPORT.md v1.1、configs/time_filters.json、STATUS.md｜本回合全量推送
+## [2026-09-17] 会话纪要（Session 15：0800 整体低指标重分析与治理路径收敛）
+- 目标：用户指令“0800 整体低”重分析；池内/池级错位双问；P0优化与800 PAUSED处置；4户最优回填
+- 本会话角色：资深电力算法专家（默认）
+- 完成项：
+  - 重分析四件套：REEVAL/UPDATE/ROOTCAUSE/FINAL（6维重审，量化train R²<0.35/test0.60/infer0.77天花板，治理排序lag75>通道>阈值>重划分）
+  - 划分与错位：SPLIT_REBALANCE（40天42.5%非失衡，50/50丢6天ROI低）+ TRAIN_INFER_REDISTRIBUTION（57% vs 22%池级差35pct，B1 34天29%最优）+ INNER_SPLIT诊断（65%/12%/0%极差）
+  - B1/B1b验证：B1 38天57.9%开 vs 19天26%（池级差16pct，transformer test0.60→0.93欠拟合缓解但infer未赢）；B1b stratified_by_state 43/37/42%极差<6pct（0.93→0.65可信化但infer 0.676/0.691未赢，不合入）
+  - P0与OFF：lag5 75min P0-1 transformer F1 0.691→0.750 R²+0.105显著达标并全局合入；OFF8 删8关 history 0.783赢但transformer 0.678跌（删关异构，不合入）；T5从头四档证关占比主导test（0%→42% -0.27）但lag可覆盖
+  - 二次修正：OQ-16 800不在p1/p2/p3（12篇降级PAUSED），B相0为设计（P0-2单相复用废弃），5户最优→4户最优梳理与执行包，回回归/全量包交付
+  - 4户最优全量重跑：base_optimal lag5 4模型 4×2 OK，2842 ridge0.869/0.984( t5 -0.165择优救场, audit6✗待修) 2844 0.678/0.887 778 0.985/0.968 789 0.962/0.984，3×✅
+  - **协议违背**：本批专题以 `docs/ANALYSIS_* / EXECUTION_* / PLAN_* / CORRECTION_*` 27新建文件落盘，违背BOOTSTRAP.md“专题报告只追加REPORT_TEST.md只追加不新建”台账，本次按“严格回归”回填
+- 关键决策：
+  - 800 PAUSED前所有p1历史结论按OQ-16降级（同OQ-13）；重划分仅作30s消融，P0 lag5首试+OFF8作反例
+  - B相置0为设计，优化唯一主线=池内删关（B1b→OFF8），P0-2反例归档
+  - lag5全局合入（零污染已验），B1/B1b/OFF8均不合入生产（判据F1+0.02）
+  - 协议回归：27新建文件内容按7专题追加回REPORT_TEST.md（本回填），后续冻结docs新建，离场自检恢复REPORT_TEST单源
+- 未决问题：
+  - 800 p4待重定后另立项；2842单户lags白名单追0.989；audit多pred_state修复；D-7/W-2/W-3仍待
+- 相关文件/分支：`REPORT_TEST.md`（本回填7专题）/`session/NILM_AC_session_complete.md`/`STATUS.md`/`NILM_DATA_DICT v0.2.10`/`REPORT.md#4`｜分支 `arena/01a0896c-nilm-new` a5508a3起
+
+## [2026-09-17] 会话纪要（Session 16：协议回归——专题落盘违规回填）
+- 目标：用户质疑“专题都是新建文件落盘违背BOOTSTRAP.md”→ 按“严格回归”整改
+- 本会话角色：资深电力算法专家（默认）
+- 完成项：
+  - 核验BOOTSTRAP.md台账：`REPORT_TEST.md`“只追加按专题分节不新建文件”+核心约束“会话纪要专题报告一律只写入指定文件只追加不新建”+收尾§3“不新建文件所有专题统一沉淀在REPORT_TEST.md”——2026-09-17起27文件（ANALYSIS 12篇+EXECUTION 7篇+PLAN+CORRECTION等）违背属实
+  - 回填：27文件内容按7专题（整体低/划分/B1B1b/P0/OFF+T5/5→4户/4户重跑）追加至REPORT_TEST.md（本session前序7节），保留CONFIG_GUIDE/TECH_DESIGN/PDF等非专题文档，删除违背的ANALYSIS/EXECUTION/PLAN等新建文件
+  - 更新：`session/NILM_AC_session_complete.md`补Session15+本Session16；`STATUS.md`决策记录新增“协议回归”条；`git rm`违背文件并推送
+- 关键决策：
+  - 严格回归=冻结docs新建；违背文件删除归档以REPORT_TEST为权威载体；后续专题一律走REPORT_TEST模板（类型/目标/方法/用户执行命令/结果/是否进REPORT/遗留），执行包命令并入“用户执行命令”字段
+  - 不修订BOOTSTRAP台账（维持只追加），以自检清单“专题已追加进REPORT_TEST”作门禁
+- 未决问题：无（协议恢复）；后续即按此执行
+- 相关文件/分支：`REPORT_TEST.md`/`BOOTSTRAP.md`/`session/NILM_AC_session_complete.md`/`STATUS.md`｜分支 `arena/01a0896c-nilm-new`
+
