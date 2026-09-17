@@ -138,6 +138,15 @@ def resolve_user_config(user_key: str, cfg: dict) -> dict:
             merged[section] = sec
             provenance[section] = (cfg.get(user_key) or {}).get(section) is not None and user_key or "_default"
 
+    # bus_field_map / features 等 base 配置的 per-user 覆盖（P0-2 通道修复 / P0-1 lag 透传）
+    for section in ("bus_field_map", "features"):
+        sec = (cfg.get(user_key) or {}).get(section) or (cfg.get("_default") or {}).get(section)
+        if sec is not None:
+            if not isinstance(sec, dict):
+                raise UserConfigError(f"{user_key}.{section} 必须为对象")
+            merged[section] = sec
+            provenance[section] = (cfg.get(user_key) or {}).get(section) is not None and user_key or "_default"
+
     merged["_provenance"] = provenance
     merged["user_key"] = user_key
     return merged

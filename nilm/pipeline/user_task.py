@@ -125,7 +125,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         qcfg = base_cfg.get("quality", {})
 
         # —— §3/§4 数据接入与字段映射（物理含义必须由配置确认）
-        field_map = base_cfg.get("bus_field_map") or user_cfg.get("bus_field_map")
+        field_map = user_cfg.get("bus_field_map") or base_cfg.get("bus_field_map")
         if not field_map:
             raise UserTaskError(Status.SCHEMA_UNCONFIRMED,
                                 "未配置 bus_field_map，Ch 字段物理含义未确认（§3.2/§4）")
@@ -319,7 +319,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             log.warning("[%s] %s: %s", user_key, Status.IDENTIFIABILITY_LOW, ident.get("risk"))
 
         # —— §8 特征 + §10/§11 样本与切分
-        fc = base_cfg.get("features", {})
+        # 允许 time_filters per-user 覆盖 features（P0 lag5 等），user 优先于 base
+        fc = {**base_cfg.get("features", {}), **(user_cfg.get("features") or {})}
         feat = build_features(bus_al, lags=tuple(fc.get("lags", [1, 2, 3, 4])),
                               rolling_windows=tuple(fc.get("rolling_windows", ["1h", "6h", "24h"])))
         f, y = drop_invalid_rows(feat, target)
@@ -636,7 +637,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if len(bus15) == 0:
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, "infer 时间过滤后无数据")
 
-        fc = base_cfg.get("features", {})
+        fc = {**base_cfg.get("features", {}), **(user_cfg.get("features") or {})}
         feat = build_features(bus15, lags=tuple(fc.get("lags", [1, 2, 3, 4])),
                               rolling_windows=tuple(fc.get("rolling_windows", ["1h", "6h", "24h"])))
         names = meta["feature_names"]
