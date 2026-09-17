@@ -64,7 +64,7 @@
 
 ## 下一步（TODO）
 0. **⑰ B1b 已验（2026-09-17 实录回收）**：双路 `B1b_default ridge链0.676 / B1b_t5 transformer 0.691` 均未赢 `B_default 0.773/0.783`，`test 0.93虚高→0.65可信化` 已达成但 `infer 5关 fp253/318 43-58%` 未降，**不合入**；阈值扫描 `100@0.689` 峰仍未赢，详见 `docs/ANALYSIS_0800_B1b_RESULTS_20260917.md` 附表
-1. **0800 优化方案（2026-09-17）**：`P0 lag5 75min（R 0.37→0.43）+ ub/ib/pfb三通道修复（置0消除）+ 月度阈值校准` 零成本首试（预期 `F1 0.67→0.78, R² 0.36→0.50`），`P1 特征/模型增量`，`P2 架构`，已落盘 `docs/PLAN_0800_OPTIMIZATION_20260917.md` 待拍板
+1. **0800 P0 执行包（2026-09-17 模式B）**：`lag5 75min` 已交付 `configs/base_lag5.yaml`/`base_t5_lag5.yaml`（`lags [5,1,2,3,4]`，`B1b` 池 `stratified_by_state` 叠加），双路待验 `outputs_0800_LAG5_default/t5`，`ub/ib/pfb` 通道诊断命令随包（需回传列清单再定映射）；`P0` 预期 `R² 0.36→0.50` `F1 0.67→0.78`，详见 `docs/EXECUTION_PACKAGE_0800_P0_20260917.md`
 1. **⑯ thr400 产物直接审计 → 终判拍板与收尾**：①用户一键审计（工作区先同步）`python scripts/audit_user_run.py --run-root outputs_t5_2844_thr400 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs_t5_2844_thr30b`（期望：全部 ✓，含 offline 与 thr30b 逐键一致=模型逐位复现）→ ②三选一拍板——**A 维持 400 交付 7 月（推荐）**：登记适用边界+月度 threshold_sweep 校准 SOP+幅值漂移立项升级；**B 折中阈值**：先跑 6 月侧曲线（`python scripts/threshold_sweep.py --csv <thr400 的 train_predictions.csv> --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,250,300,400,500`）再定量；**C 回调 30** → ③拍板后 ⑯ 收尾仪式（REPORT.md 注记：decision_thr 治理结论+幅值线立项/STATUS 完结/Session 纪要/commit+push）
 2. 用户复核 789/778/800 的 target_col 归属；800/778 模式 B 重训拍板（可顺带 day_gate+off_day_weight，待 ⑯ 结论）
 3. D-7 修复立项（日级 SAE 除零伪值）；2844 A 补数立项（幅值达标根本路径：val mae 105.8/test 144.2）
