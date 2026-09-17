@@ -30,7 +30,7 @@ preprocess:
   agg_strategy: {u: mean, i: mean, p: mean, pf: recompute}
 
 features:
-  lags: [1, 2, 3, 4]
+  lags: [5, 1, 2, 3, 4]  # P0 lag5 75min（2026-09-17实录 transformer R2 0.39->0.49 F1 0.69->0.75）
   rolling_windows: ["1h", "6h", "24h"]
 
 dataset:
