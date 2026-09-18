@@ -144,9 +144,13 @@ python -c "import pandas,glob;f=sorted(glob.glob('outputs/900080270900_420000000
 
 ```powershell
 # test 链（train_predictions.csv，按 split 分块重放，防段边界跨块回填假错）
-python scripts/threshold_sweep.py --csv outputs/900080270900_4200000000001/train/*/predictions/train_predictions.csv --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,300,400,500 --min-on 1 --fill-off 3
+# * 通配由脚本内部自动展开（v2026-09-19已兼容 PowerShell/bash；建议加引号防止 bash 提前展开）
+python scripts/threshold_sweep.py --csv "outputs/900080270900_4200000000001/train/*/predictions/train_predictions.csv" --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,300,400,500 --min-on 1 --fill-off 3
 # infer 链（inference_result.csv）
-python scripts/threshold_sweep.py --csv outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500
+python scripts/threshold_sweep.py --csv "outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv" --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500
+# 若仍报 OSError: Invalid argument: '.../*/predictions/...'：PowerShell 未展开通配，请升级 scripts/threshold_sweep.py（已支持 *?[] 通配取最新）
+# 或用显式路径：
+# $csv=(Get-ChildItem outputs/800080270733_4206673297219/train/*/predictions/train_predictions.csv | Sort-Object | Select-Object -Last 1).FullName; python scripts/threshold_sweep.py --csv $csv --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,300,400,500 --min-on 1 --fill-off 3
 ```
 
 **怎么选（以 2844 p2 为例，人话）：**
@@ -294,7 +298,7 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 ---
 
-## 10. 常见问题 14 问
+## 10. 常见问题 15 问
 
 **Q1: 我只有 7 天数据能上线吗？** 能跑但不建议当生产。`history/proportional` 可先当影子，`transformer` 等 30 天再切。  
 **Q2: `on_thr` 和 `decision` 能否统一成 400？** 别。会把 10-400W 真开点重定义为关，报表好看但漏报被洗掉（`target [10,400)` 约 21 点）。  
@@ -309,7 +313,8 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 **Q11: `batch` 扫到 `INVALID_FILENAME` 目录？** 1 个错文件致整目录 FAIL，`infers/trains` 各余 1 非法目录全量前需删或重命名。  
 **Q12: 怎么证明 GPU 和 CPU 结果一致？** 同种子 `2844` `val_loss 0.349628` 第5次逐位复现即金标准，`audit I9` 与 `baseline` 逐键一致为放行门。  
 **Q13: 审计报“期望唯一用户目录 实际:['infer','train']”怎么办？** 这是 `--run-root` 指向歧义：`outputs/<user>` 本身已含 `train/infer`，旧版脚本误判为父目录。v2026-09-18 已兼容——`--run-root outputs/<user>`（形式 A）与 `--run-root outputs --user-key <user>`（形式 B）均可；旧版请升级 `scripts/audit_user_run.py` 或改用形式 B。你的 `800080270856_4206810972139` 即此例：`python scripts/audit_user_run.py --run-root outputs/800080270856_4206810972139 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs/800080270856_4206810972139` 已可直接过。  
-**Q14: Step 6 审计2项 `总混淆/全关日fp` 没过，要改文档还是删掉？** **不删，留作可选回归门禁（I8），文档加注即可。** `I8` 的 `1036,77,21,1495/18` 是 `2844` 快照，`800080270856` 实测 `580,19,9,2021/0`（0全关天）必然 `✗`——这是抄模板所致，不是缺陷。正确用法见 Step 6 黄框：新用户第1次不带 `--expect-*` 看真实值，第2次再固化；也可一直省略 `I8`，`T1-T7/I1-I7/I9-I10` 已保核心正确性。本次 `2✗` 已判 `800080270856` 生产可放行（`F1 0.976`），改实测期望即全绿。
+**Q14: Step 6 审计2项 `总混淆/全关日fp` 没过，要改文档还是删掉？** **不删，留作可选回归门禁（I8），文档加注即可。** `I8` 的 `1036,77,21,1495/18` 是 `2844` 快照，`800080270856` 实测 `580,19,9,2021/0`（0全关天）必然 `✗`——这是抄模板所致，不是缺陷。正确用法见 Step 6 黄框：新用户第1次不带 `--expect-*` 看真实值，第2次再固化；也可一直省略 `I8`，`T1-T7/I1-I7/I9-I10` 已保核心正确性。本次 `2✗` 已判 `800080270856` 生产可放行（`F1 0.976`），改实测期望即全绿。  
+**Q15: Step 4 选阈值报 `OSError: Invalid argument: '.../train/*/predictions/train_predictions.csv'` 怎么办？** 这是 **Windows PowerShell 未展开 `*` 通配**（bash 会展开，PowerShell 不会），`pd.read_csv('.../*/...')` 直接当文件名打开必然 `Errno 22`。已在 `scripts/threshold_sweep.py v2026-09-19` 修复：脚本内部 `glob` 自动展开 `*?[]`，排序取最新时间戳目录，PowerShell/bash 均可（建议 `--csv ".../*/..."` 加引号防 bash 提前展开）。你的 `800080270733_4206673297219` 即此例：`python scripts/threshold_sweep.py --csv "outputs/800080270733_4206673297219/train/*/predictions/train_predictions.csv" --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,300,400,500 --min-on 1 --fill-off 3` 升级后即过；旧版请手动替换 `*` 为真实时间戳如 `train/20260103_000000/predictions/train_predictions.csv` 或用 `$csv=(Get-ChildItem ... | Sort | Select -Last 1).FullName` 取最新。
 
 ---
 
@@ -342,8 +347,8 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 ```powershell
 # 单户训练+推理
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs --user-key 900080270900_4200000000001
-# 阈值扫
-python scripts/threshold_sweep.py --csv outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500
+# 阈值扫（* 通配已兼容 PowerShell，v2026-09-19）
+python scripts/threshold_sweep.py --csv "outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv" --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500
 # 审计（形式 A 用户目录；批量多用户用 --run-root outputs --user-key <user>）
 # 新用户第1次不带期望：
 python scripts/audit_user_run.py --run-root outputs/900080270900_4200000000001

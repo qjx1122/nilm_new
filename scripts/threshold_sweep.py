@@ -30,6 +30,7 @@ post_min_on + post_fill_short_off，nilm.postprocess.state.postprocess_state）
 from __future__ import annotations
 
 import argparse
+import glob
 import sys
 from pathlib import Path
 
@@ -43,12 +44,32 @@ from nilm.postprocess.state import postprocess_state  # noqa: E402
 AMPLITUDE_BANDS = [(10, 20), (20, 30), (30, 50), (50, 100), (100, 200), (200, None)]
 
 
+def _resolve_csv_arg(csv_arg: str | Path) -> Path:
+    """解析 --csv 参数，兼容 shell 通配（* ? []）跨平台（Windows PowerShell 无自动展开）。
+
+    - 含通配：glob 展开，排序后取最新（时间戳目录 YYYYMMDD_HHMMSS 末位即最新）；
+    - 无通配：原样返回（pandas 再校验存在性）。
+    """
+    s = str(csv_arg)
+    if any(ch in s for ch in ("*", "?", "[")):
+        matches = sorted(glob.glob(s))
+        if not matches:
+            raise SystemExit(f"[threshold_sweep] 未找到匹配 --csv 通配 {s}（检查 outputs/<user>/train|infer/<timestamp>/predictions/*.csv 是否存在）")
+        chosen = matches[-1]
+        if len(matches) > 1:
+            preview = ", ".join(matches[:3]) + (" ..." if len(matches) > 3 else "")
+            print(f"通配展开 {len(matches)} 个，取最新: {chosen}（{preview}）")
+        return Path(chosen)
+    return Path(s)
+
+
 def load_result(csv_path: str | Path, pred_col: str = "pred") -> pd.DataFrame:
     """读入预测 CSV 并校验必需列（timestamp/target_state/<pred_col>）。
 
     默认按 inference_result.csv 契约；train_predictions.csv（列名
     pred_<model>）经 --pred-col 适配。
     """
+    csv_path = _resolve_csv_arg(csv_path)
     df = pd.read_csv(csv_path)
     missing = [c for c in ("timestamp", "target_state", pred_col) if c not in df.columns]
     if missing:
@@ -130,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="inference_result.csv 判决链阈值扫描（离线，零重跑）")
     ap.add_argument("--csv", required=True,
-                    help="inference_result.csv 或 train_predictions.csv 路径")
+                    help="inference_result.csv 或 train_predictions.csv 路径（支持 * 通配，如 train/*/predictions/train_predictions.csv，Windows PowerShell 亦可）")
     ap.add_argument("--thresholds", default="10,20,30,40,50,60,80,100,150",
                     help="逗号分隔的判决阈值列表（W）")
     ap.add_argument("--min-on", type=int, default=1,
@@ -146,7 +167,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="按 split 列过滤段（train_predictions.csv: train/val/test）")
     args = ap.parse_args(argv)
 
-    df = load_result(args.csv, args.pred_col)
+    resolved = _resolve_csv_arg(args.csv)
+    df = load_result(resolved, args.pred_col)
+    if str(resolved) != str(args.csv):
+        print(f"已解析通配: {args.csv} -> {resolved}")
     if args.split:
         if "split" not in df.columns:
             raise SystemExit("[threshold_sweep] 指定了 --split 但文件无 split 列")

@@ -355,7 +355,7 @@ models:
 # 1 训练（base_optimal 4模型择优，lag5）
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs --user-key 900080270900_4200000000001
 # 2 扫阈（不动模型，R≥0.95 护栏）
-python scripts/threshold_sweep.py --csv outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500
+python scripts/threshold_sweep.py --csv "outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv" --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500  # * 通配 v2026-09-19 已兼容 PowerShell
 # 3 审计（T1-T4/I1-I10；形式 A 用户目录，形式 B 父目录+--user-key 均可，v2026-09-18 兼容）
 # 新用户第1次不带期望看实测：
 python scripts/audit_user_run.py --run-root outputs/900080270900_4200000000001
