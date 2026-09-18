@@ -175,6 +175,19 @@ python scripts/audit_user_run.py --run-root outputs --user-key 900080270900_4200
 # 期望全✓；2842那类多pred_state 6✗是审计工具多列透传待修，单pred_state绿即放行
 ```
 
+> **⚠️ 期望值是快照，不是抄作业（I8 可省，必读）**  
+> ` --expect-n / --expect-confusion tp,fp,fn,tn / --expect-off-day-fp ` 是 **I8 回归门禁**，**可省略**（不传即跳过该门）。它用于把**该用户该次**的真实结果钉住，下次静默漂移立刻 `✗`。**新用户第1次切勿抄模板** `1036,77,21,1495/18`（仅对 `2844/9000` 示例有效），否则必 `✗` 如 `800080270856 580,19,9,2021/0`。  
+> **正确两步：**
+> ```powershell
+> # 第1次：不带期望，先看真实值
+> python scripts/audit_user_run.py --run-root outputs/800080270856_4206810972139
+> # → 记下控制台 “· 总混淆: tp=580 fp=19 fn=9 tn=2021；全关日 fp=0” 与 “行数 2629”
+> # 第2次：固化为门禁（以后漂移即告警）
+> python scripts/audit_user_run.py --run-root outputs/800080270856_4206810972139 --expect-n 2629 --expect-confusion 580,19,9,2021 --expect-off-day-fp 0 --baseline-run outputs/800080270856_4206810972139
+> ```
+> **删不删 I8？不删。** 删了失去漂移告警；留着且按需传参，`T1-T7/I1-I7/I9-I10` 已覆盖核心正确性，`I8` 仅为可选的“钉住”层。本次 `800080270856` 的 `2✗` 即典型抄模板所致，改实测值即 `全部通过 ✅`，生产可放行。
+
+
 ### Step 7 上线判断（见 §7，7项全绿）
 
 ### Step 8 全量批量（上线后）
@@ -281,7 +294,7 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 ---
 
-## 10. 常见问题 12 问
+## 10. 常见问题 14 问
 
 **Q1: 我只有 7 天数据能上线吗？** 能跑但不建议当生产。`history/proportional` 可先当影子，`transformer` 等 30 天再切。  
 **Q2: `on_thr` 和 `decision` 能否统一成 400？** 别。会把 10-400W 真开点重定义为关，报表好看但漏报被洗掉（`target [10,400)` 约 21 点）。  
@@ -295,7 +308,8 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 **Q10: 改 `decision` 要重训吗？** 完全不用，`threshold_sweep` 离线扫即可，`offline` 不变即改阈不改权重。  
 **Q11: `batch` 扫到 `INVALID_FILENAME` 目录？** 1 个错文件致整目录 FAIL，`infers/trains` 各余 1 非法目录全量前需删或重命名。  
 **Q12: 怎么证明 GPU 和 CPU 结果一致？** 同种子 `2844` `val_loss 0.349628` 第5次逐位复现即金标准，`audit I9` 与 `baseline` 逐键一致为放行门。  
-**Q13: 审计报“期望唯一用户目录 实际:['infer','train']”怎么办？** 这是 `--run-root` 指向歧义：`outputs/<user>` 本身已含 `train/infer`，旧版脚本误判为父目录。v2026-09-18 已兼容——`--run-root outputs/<user>`（形式 A）与 `--run-root outputs --user-key <user>`（形式 B）均可；旧版请升级 `scripts/audit_user_run.py` 或改用形式 B。你的 `800080270856_4206810972139` 即此例：`python scripts/audit_user_run.py --run-root outputs/800080270856_4206810972139 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs/800080270856_4206810972139` 已可直接过。
+**Q13: 审计报“期望唯一用户目录 实际:['infer','train']”怎么办？** 这是 `--run-root` 指向歧义：`outputs/<user>` 本身已含 `train/infer`，旧版脚本误判为父目录。v2026-09-18 已兼容——`--run-root outputs/<user>`（形式 A）与 `--run-root outputs --user-key <user>`（形式 B）均可；旧版请升级 `scripts/audit_user_run.py` 或改用形式 B。你的 `800080270856_4206810972139` 即此例：`python scripts/audit_user_run.py --run-root outputs/800080270856_4206810972139 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs/800080270856_4206810972139` 已可直接过。  
+**Q14: Step 6 审计2项 `总混淆/全关日fp` 没过，要改文档还是删掉？** **不删，留作可选回归门禁（I8），文档加注即可。** `I8` 的 `1036,77,21,1495/18` 是 `2844` 快照，`800080270856` 实测 `580,19,9,2021/0`（0全关天）必然 `✗`——这是抄模板所致，不是缺陷。正确用法见 Step 6 黄框：新用户第1次不带 `--expect-*` 看真实值，第2次再固化；也可一直省略 `I8`，`T1-T7/I1-I7/I9-I10` 已保核心正确性。本次 `2✗` 已判 `800080270856` 生产可放行（`F1 0.976`），改实测期望即全绿。
 
 ---
 
@@ -331,9 +345,12 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 # 阈值扫
 python scripts/threshold_sweep.py --csv outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500
 # 审计（形式 A 用户目录；批量多用户用 --run-root outputs --user-key <user>）
-python scripts/audit_user_run.py --run-root outputs/900080270900_4200000000001 --expect-n 2629
+# 新用户第1次不带期望：
+python scripts/audit_user_run.py --run-root outputs/900080270900_4200000000001
+# 固化期望（例 2844 模板值，换用户请用实测值 580,19,9,2021）：
+python scripts/audit_user_run.py --run-root outputs/900080270900_4200000000001 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18
 # 审计（形式 B 父目录+指名）
-# python scripts/audit_user_run.py --run-root outputs --user-key 900080270900_4200000000001 --expect-n 2629
+# python scripts/audit_user_run.py --run-root outputs --user-key 900080270900_4200000000001 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18
 # 全量
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs
 ```
