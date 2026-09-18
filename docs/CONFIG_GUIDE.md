@@ -356,8 +356,10 @@ models:
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs --user-key 900080270900_4200000000001
 # 2 扫阈（不动模型，R≥0.95 护栏）
 python scripts/threshold_sweep.py --csv outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500
-# 3 审计（T1-T4/I1-I10）
+# 3 审计（T1-T4/I1-I10；形式 A 用户目录，形式 B 父目录+--user-key 均可，v2026-09-18 兼容）
 python scripts/audit_user_run.py --run-root outputs/900080270900_4200000000001 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18
+# 审计形式 B（批量 outputs 含多用户）：
+# python scripts/audit_user_run.py --run-root outputs --user-key 900080270900_4200000000001 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18
 # 4 全量批量（失败隔离，_DONE断点）
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs
 ```

@@ -166,7 +166,11 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 ### Step 6 审计（一键门禁，T1-T4 / I1-I10）
 
 ```powershell
+# 形式 A：--run-root 已是用户目录（含 train/infer，单用户最常用；v2026-09-18 已兼容）
 python scripts/audit_user_run.py --run-root outputs/900080270900_4200000000001 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs/900080270900_4200000000001
+# 形式 B：--run-root 为父目录（批量 outputs 含多用户）则需 --user-key 指名
+python scripts/audit_user_run.py --run-root outputs --user-key 900080270900_4200000000001 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs --user-key 900080270900_4200000000001
+# 若报“期望唯一用户目录 实际:['infer','train']”：说明把用户目录当成了父目录传入，已在 v2026-09-18 修复兼容——形式 A/B 均可；旧版请改形式 B 或升级代码
 # 模板：T1计数和==段行数 T2 tp+fn恒等/ raw==metrics_by_split T3按split重放 I1行数==meta I2列契约 I3值域 I4时序15min I5重放 I6 sigmoid I7总混淆+全关fp I8期望断言 I9 offline与baseline逐键一致（模型逐位复现）
 # 期望全✓；2842那类多pred_state 6✗是审计工具多列透传待修，单pred_state绿即放行
 ```
@@ -290,7 +294,8 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 **Q9: 推理无分路真值怎么评？** 正常，`inference_result.csv` 仍产，`metrics_daily_chain` 跳过，无真值不阻断推理。  
 **Q10: 改 `decision` 要重训吗？** 完全不用，`threshold_sweep` 离线扫即可，`offline` 不变即改阈不改权重。  
 **Q11: `batch` 扫到 `INVALID_FILENAME` 目录？** 1 个错文件致整目录 FAIL，`infers/trains` 各余 1 非法目录全量前需删或重命名。  
-**Q12: 怎么证明 GPU 和 CPU 结果一致？** 同种子 `2844` `val_loss 0.349628` 第5次逐位复现即金标准，`audit I9` 与 `baseline` 逐键一致为放行门。
+**Q12: 怎么证明 GPU 和 CPU 结果一致？** 同种子 `2844` `val_loss 0.349628` 第5次逐位复现即金标准，`audit I9` 与 `baseline` 逐键一致为放行门。  
+**Q13: 审计报“期望唯一用户目录 实际:['infer','train']”怎么办？** 这是 `--run-root` 指向歧义：`outputs/<user>` 本身已含 `train/infer`，旧版脚本误判为父目录。v2026-09-18 已兼容——`--run-root outputs/<user>`（形式 A）与 `--run-root outputs --user-key <user>`（形式 B）均可；旧版请升级 `scripts/audit_user_run.py` 或改用形式 B。你的 `800080270856_4206810972139` 即此例：`python scripts/audit_user_run.py --run-root outputs/800080270856_4206810972139 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs/800080270856_4206810972139` 已可直接过。
 
 ---
 
@@ -325,8 +330,10 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs --user-key 900080270900_4200000000001
 # 阈值扫
 python scripts/threshold_sweep.py --csv outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500
-# 审计
+# 审计（形式 A 用户目录；批量多用户用 --run-root outputs --user-key <user>）
 python scripts/audit_user_run.py --run-root outputs/900080270900_4200000000001 --expect-n 2629
+# 审计（形式 B 父目录+指名）
+# python scripts/audit_user_run.py --run-root outputs --user-key 900080270900_4200000000001 --expect-n 2629
 # 全量
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs
 ```

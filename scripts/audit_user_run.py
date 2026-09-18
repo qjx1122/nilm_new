@@ -25,9 +25,14 @@ INFER（<run>/<user>/infer/<ts>/）
   I10 metrics_daily_chain.csv 链口径日级（I.J 审计 J1）：Σ==I7 总数；逐日==细明细行
 
 用法（仓库根目录）：
-    python scripts/audit_user_run.py --run-root outputs_t5_2844_thr400 \
+    # 形式 A：--run-root 已是用户目录（含 train/infer），文档 Step 6 常用
+    python scripts/audit_user_run.py --run-root outputs/800080252844_4206894986488 \
         --expect-n 2629 --expect-confusion 1036,77,21,1495 \
-        --expect-off-day-fp 18 --baseline-run outputs_t5_2844_thr30b
+        --expect-off-day-fp 18 --baseline-run outputs/800080252844_4206894986488
+    # 形式 B：--run-root 为父目录，需 --user-key
+    python scripts/audit_user_run.py --run-root outputs --user-key 800080252844_4206894986488 \
+        --expect-n 2629 --expect-confusion 1036,77,21,1495 \
+        --expect-off-day-fp 18 --baseline-run outputs
 """
 
 from __future__ import annotations
@@ -59,11 +64,16 @@ def _latest(root: Path, stage: str) -> Path | None:
 
 
 def _find_user_dir(run_root: Path, user_key: str | None) -> Path:
+    # 兼容两种调用：① --run-root=outputs/<user>（用户目录本身，含 train/infer） ② --run-root=outputs（父目录）+ --user-key
+    if (run_root / "train").is_dir() or (run_root / "infer").is_dir():
+        if user_key and run_root.name != user_key:
+            raise SystemExit(f"[audit] --run-root {run_root} 与 --user-key {user_key} 不一致（前者已是用户目录 {run_root.name}）")
+        return run_root
     cands = [d for d in run_root.iterdir() if d.is_dir() and d.name != "batch"]
     if user_key:
         cands = [d for d in cands if d.name == user_key]
     if len(cands) != 1:
-        raise SystemExit(f"[audit] 期望唯一用户目录（--user-key 可指定），实际: {[d.name for d in cands]}")
+        raise SystemExit(f"[audit] 期望唯一用户目录（--user-key 可指定），实际: {[d.name for d in cands]}；若 --run-root 已是用户目录（如 outputs/<user>）请直接指向该目录或改用 --run-root outputs --user-key <user>")
     return cands[0]
 
 
@@ -297,16 +307,17 @@ def audit_infer(idir: Path | None, min_on: int, fill_off: int, args) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="单用户 run 产物一键审计")
-    ap.add_argument("--run-root", required=True, help="输出根目录（如 outputs_t5_2844_thr400）")
+    ap.add_argument("--run-root", required=True, help="输出根目录：可为用户目录本身（如 outputs/<user> 含 train/infer）或父目录（如 outputs 需配合 --user-key）")
     ap.add_argument("--user-key", default=None, help="用户目录名（单用户时可省略）")
     ap.add_argument("--min-on", type=int, default=1)
     ap.add_argument("--fill-off", type=int, default=3)
     ap.add_argument("--expect-n", type=int, default=None, help="期望 inference 行数")
     ap.add_argument("--expect-confusion", default=None, help="期望总混淆 tp,fp,fn,tn")
     ap.add_argument("--expect-off-day-fp", type=int, default=None)
-    ap.add_argument("--baseline-run", default=None, help="对照 run 根目录（offline 逐键比对）")
+    ap.add_argument("--baseline-run", default=None, help="对照 run 根目录（offline 逐键比对）；语义同 --run-root，支持用户目录或父目录+--user-key")
     args = ap.parse_args(argv)
 
+    FAILS.clear()
     udir = _find_user_dir(Path(args.run_root), args.user_key)
     print(f"审计: {args.run_root} / {udir.name}")
     audit_train(_latest(udir, "train"), args.min_on, args.fill_off)
