@@ -48,9 +48,11 @@ python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219
 # 或 ./scripts/one_click_733.ps1   （同流程 PowerShell 封装，自动 window_check + infer + threshold 双链）
 # 其他：--target-col p2 --on-thr 10 --decision-thr 30  指定目标与阈值（缺 configs/time_filters.json 条目时自动补 p1/10/30/day_gate）
 #       --stage threshold  仅 Step4 扫阈值（10,30,50,100,150,200,300,400,500），--skip-train/--skip-infer/--force 可配
+#       --skip-infer       仅 train 数据时跳过推理（无 data/infers/<user> 时自动跳过，infer 阈值链同步 WARN 跳过）
 # Linux/通用（.*通配由 threshold_sweep 内部 glob 展开，已兼容 PowerShell OSError，v2026-09-19）
 python3 scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219 --stage all
 python3 scripts/auto_run_steps2to5.py --help   # 查看 --stage/--target-col/--on-thr/--decision-thr/--force/--skip-*
+# 排障：若 Step5 报 DATA_MISSING_BUS（data/infers/<user> 不存在）为正常——该用户仅有训练数据，推理需另备 data/infers 目录
 ```
 
 合并脚本输出：`<output-root>/<数据源名>/<终端号_用户号>/` 复刻原层级（阶段一结果）+

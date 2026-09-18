@@ -48,7 +48,6 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col: str, on_thr: fl
     if user_key in cfg:
         log(f"time_filters.json 已含 {user_key} → 沿用（target={cfg[user_key].get('target_col')} on={cfg[user_key].get('on_thr_w')} dec={cfg[user_key].get('decision_thr_w')})")
         return False
-    # 新用户默认：复用 2844 的稳健 day_gate 模板
     cfg[user_key] = {
         "target_col": target_col,
         "on_thr_w": on_thr,
@@ -72,10 +71,9 @@ def step2_train(user_key, tf, base, data_root, out_root, force):
            "--base-config", str(base),
            "--data-root", str(data_root),
            "--output-root", str(out_root),
-           "--user-key", user_key]
+           "--user-key", user_key, "--stage", "train"]
     if force: cmd.append("--force")
     sh(cmd)
-    # 验证 _DONE
     outs = sorted((out_root / user_key / "train").glob("*/_DONE")) if (out_root/user_key/"train").exists() else []
     if outs:
         log(f"Step2 训练 OK → {outs[-1].parent}  (共 {len(outs)} 个 _DONE)")
@@ -103,13 +101,29 @@ def step5_infer(user_key, tf, base, data_root, out_root, force):
            "--output-root", str(out_root),
            "--user-key", user_key, "--stage", "infer"]
     if force: cmd.append("--force")
-    sh(cmd)
+    try:
+        sh(cmd)
+    except SystemExit as e:
+        # 允许缺 infer 目录的空批次（batch.py v2026-09-18 已改为返回 DATA_MISSING 并写 batch_status.csv）
+        batch_csvs = sorted((out_root / "batch").glob("*/batch_status.csv"), key=lambda p: p.stat().st_mtime)
+        if batch_csvs:
+            try:
+                import pandas as _pd
+                _df = _pd.read_csv(batch_csvs[-1])
+                _has_missing = ((_df["user_key"] == user_key) & (_df["mode"] == "infer") & (_df["status"].str.contains("DATA_MISSING"))).any()
+                if _has_missing:
+                    log(f"Step5 跳过：data/infers/{user_key} 不存在（无推理数据，阈值 infer 链将跳过）— batch_status {batch_csvs[-1]}", "WARN")
+                    return
+            except Exception:
+                pass
+        raise
     outs = sorted((out_root / user_key / "infer").glob("*/_DONE")) if (out_root/user_key/"infer").exists() else []
     if outs:
         log(f"Step5 推理 OK → {outs[-1].parent}")
+    else:
+        log("Step5 未产出 infer/_DONE（可能无 infer 数据或被跳过，查 batch_status.csv）", "WARN")
 
 def step4_threshold(user_key, out_root, pred_col_train="pred_transformer", state_col_train="pred_state_transformer"):
-    # test 链（train_predictions）
     pat_train = str(out_root / user_key / "train" / "*" / "predictions" / "train_predictions.csv")
     files = sorted(glob.glob(pat_train))
     if files:
@@ -123,7 +137,6 @@ def step4_threshold(user_key, out_root, pred_col_train="pred_transformer", state
             "--min-on", "1", "--fill-off", "3"])
     else:
         log(f"Step4 test链跳过：未找到 {pat_train}", "WARN")
-    # infer 链（inference_result）— 需推理后才有
     pat_infer = str(out_root / user_key / "infer" / "*" / "predictions" / "inference_result.csv")
     files2 = sorted(glob.glob(pat_infer))
     if files2:
@@ -160,23 +173,18 @@ def main(argv=None):
 
     log(f"用户 {user_key}  Stage={args.stage}  TF={tf}  Base={base}  Data={data_root}  Out={out_root}")
 
-    # Step1 隐含：补配置（若缺）
     if args.stage in ("all","train"):
         ensure_user_config(user_key, tf, args.target_col, args.on_thr, args.decision_thr)
 
-    # Step2
     if args.stage in ("all","train") and not args.skip_train:
         step2_train(user_key, tf, base, data_root, out_root, args.force)
-    # Step3
     if args.stage in ("all","train"):
         try:
             step3_window_check(user_key, out_root)
         except Exception as e:
             log(f"Step3 异常: {e}", "WARN")
-    # Step5（阈值扫 infer 链依赖推理，先推理）
     if args.stage in ("all","infer") and not args.skip_infer:
         step5_infer(user_key, tf, base, data_root, out_root, args.force)
-    # Step4
     if args.stage in ("all","threshold"):
         step4_threshold(user_key, out_root)
 

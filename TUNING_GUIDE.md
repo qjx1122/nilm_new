@@ -1,7 +1,7 @@
 # TUNING_GUIDE.md — 工商业负荷辨识调参运维人话版（详细版）
 
 > **给谁看**：完全不懂算法的工程师、运维、交付、现场实施同学。只要会 `复制粘贴 PowerShell 命令`、`用 Excel 打开 CSV`、`看懂“开/关”`，就能按本手册把一个从未见过的新设备从 0 接到生产，并判断能不能上线。  
-> **版本**：v1.1 详细版（2026-09-18，对齐 `REPORT.md v1.1 + NILM_DATA_DICT v0.2.10 + REPORT_TEST 18专题 + base_optimal lag5[5,1,2,3,4]`）｜协议：`BOOTSTRAP.md v2.3`｜分支：`arena/01a0896c-nilm-new 7376764` → 本版  
+> **版本**：v1.1 详细版（2026-09-18，对齐 `REPORT.md v1.1 + NILM_DATA_DICT v0.2.10 + REPORT_TEST 18专题 + base_optimal lag5[5,1,2,3,4]`）+ Q16 `DATA_MISSING_BUS` 空批次修复（2026-09-18）｜协议：`BOOTSTRAP.md v2.3`｜分支：`arena/01a0896c-nilm-new`  
 > **一句话定位**：用总线侧 5 分钟电表（电压电流有功功率因数）去猜分路侧 15 分钟电表（某一路 `p1/p2/p3...` 的有功）此刻是“开 1”还是“关 0”、功率是多少瓦。模型只看过去 24 小时（96 点）的功率走势，不看高频谐波。
 
 **怎么用本手册**：按顺序读，`Step 0-7` 是必做流水线；`§4-6` 是解释为什么；`§7-9` 是上线门禁与排障；`附录` 是可直接复制的模板。遇到报错先查 `§9 战史`，再查 `§10 FAQ`。
@@ -19,7 +19,7 @@
 7. [生产 7 项放行（缺一不可，含不合格长什么样）](#7-生产-7-项放行缺一不可含不合格长什么样)
 8. [部署架构与日常运维（批量、断点、月历）](#8-部署架构与日常运维批量断点月历)
 9. [战史：我们犯过的 7 个错（别再踩）](#9-战史我们犯过的-7-个错别再踩)
-10. [常见问题 12 问](#10-常见问题-12-问)
+10. [常见问题 16 问](#10-常见问题-16-问)
 11. [附录：模板与速查卡](#11-附录模板与速查卡)
 
 ---
@@ -299,7 +299,7 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 ---
 
-## 10. 常见问题 15 问
+## 10. 常见问题 16 问
 
 **Q1: 我只有 7 天数据能上线吗？** 能跑但不建议当生产。`history/proportional` 可先当影子，`transformer` 等 30 天再切。  
 **Q2: `on_thr` 和 `decision` 能否统一成 400？** 别。会把 10-400W 真开点重定义为关，报表好看但漏报被洗掉（`target [10,400)` 约 21 点）。  
@@ -315,7 +315,8 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 **Q12: 怎么证明 GPU 和 CPU 结果一致？** 同种子 `2844` `val_loss 0.349628` 第5次逐位复现即金标准，`audit I9` 与 `baseline` 逐键一致为放行门。  
 **Q13: 审计报“期望唯一用户目录 实际:['infer','train']”怎么办？** 这是 `--run-root` 指向歧义：`outputs/<user>` 本身已含 `train/infer`，旧版脚本误判为父目录。v2026-09-18 已兼容——`--run-root outputs/<user>`（形式 A）与 `--run-root outputs --user-key <user>`（形式 B）均可；旧版请升级 `scripts/audit_user_run.py` 或改用形式 B。你的 `800080270856_4206810972139` 即此例：`python scripts/audit_user_run.py --run-root outputs/800080270856_4206810972139 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs/800080270856_4206810972139` 已可直接过。  
 **Q14: Step 6 审计2项 `总混淆/全关日fp` 没过，要改文档还是删掉？** **不删，留作可选回归门禁（I8），文档加注即可。** `I8` 的 `1036,77,21,1495/18` 是 `2844` 快照，`800080270856` 实测 `580,19,9,2021/0`（0全关天）必然 `✗`——这是抄模板所致，不是缺陷。正确用法见 Step 6 黄框：新用户第1次不带 `--expect-*` 看真实值，第2次再固化；也可一直省略 `I8`，`T1-T7/I1-I7/I9-I10` 已保核心正确性。本次 `2✗` 已判 `800080270856` 生产可放行（`F1 0.976`），改实测期望即全绿。  
-**Q15: Step 4 选阈值报 `OSError: Invalid argument: '.../train/*/predictions/train_predictions.csv'` 怎么办？** 这是 **Windows PowerShell 未展开 `*` 通配**（bash 会展开，PowerShell 不会），`pd.read_csv('.../*/...')` 直接当文件名打开必然 `Errno 22`。已在 `scripts/threshold_sweep.py v2026-09-19` 修复：脚本内部 `glob` 自动展开 `*?[]`，排序取最新时间戳目录，PowerShell/bash 均可（建议 `--csv ".../*/..."` 加引号防 bash 提前展开）。你的 `800080270733_4206673297219` 即此例：`python scripts/threshold_sweep.py --csv "outputs/800080270733_4206673297219/train/*/predictions/train_predictions.csv" --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,300,400,500 --min-on 1 --fill-off 3` 升级后即过；旧版请手动替换 `*` 为真实时间戳如 `train/20260103_000000/predictions/train_predictions.csv` 或用 `$csv=(Get-ChildItem ... | Sort | Select -Last 1).FullName` 取最新。
+**Q15: Step 4 选阈值报 `OSError: Invalid argument: '.../train/*/predictions/train_predictions.csv'` 怎么办？** 这是 **Windows PowerShell 未展开 `*` 通配**（bash 会展开，PowerShell 不会），`pd.read_csv('.../*/...')` 直接当文件名打开必然 `Errno 22`。已在 `scripts/threshold_sweep.py v2026-09-19` 修复：脚本内部 `glob` 自动展开 `*?[]`，排序取最新时间戳目录，PowerShell/bash 均可（建议 `--csv ".../*/..."` 加引号防 bash 提前展开）。你的 `800080270733_4206673297219` 即此例：`python scripts/threshold_sweep.py --csv "outputs/800080270733_4206673297219/train/*/predictions/train_predictions.csv" --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,300,400,500 --min-on 1 --fill-off 3` 升级后即过；旧版请手动替换 `*` 为真实时间戳如 `train/20260103_000000/predictions/train_predictions.csv` 或用 `$csv=(Get-ChildItem ... | Sort | Select -Last 1).FullName` 取最新。  
+**Q16: 一键脚本 `Step5 推理` 报 `KeyError: STATUS_COLUMNS / DATA_MISSING_BUS : data/infers/<user> 不存在` 怎么办？** 这是 **该用户无 `data/infers/<user>` 推理数据**（如 `800080270750_4206668913762` `trains 18 / infers 16` 中缺该目录），一键第二段 `--stage infer` 空批次所致。已在 `nilm/pipeline/batch.py v2026-09-18` 修复：空批次不再 `KeyError`，改为写 `batch_status.csv DATA_MISSING_BUS` 并正常结束（`batch_status 1 行 0 OK`）；`scripts/auto_run_steps2to5.py` 已改为 `--stage train` 分段 + 缺 `infer` 自动 `WARN 跳过`（`WARN Step5 跳过：data/infers/<user> 不存在`），`阈值 infer 链` 同步 `WARN 跳过`，`train 链阈值` 仍正常。**无需处理，按提示继续即可；需推理请另备 `data/infers/<user>/e241_...-Ch1-*.csv` 后 `--stage infer` 或 `--skip-infer` 仅训。** 旧版临时绕过：`python scripts/auto_run_steps2to5.py --user-key <key> --stage train` 或 `--skip-infer`。
 
 ---
 

@@ -136,10 +136,22 @@ def run_batch(time_filter_config_path: str | Path,
             log.info("批量[%s] %s -> %s %s", mode, uk, result.status, result.message)
 
     # —— 批量状态表（§0：按接口字段输出 user_id）
-    table = pd.DataFrame([asdict(r) for r in rows])[STATUS_COLUMNS]
+    # v2026-09-18 fix: 单用户 --stage infer 且无 infer 数据时 rows 空致 KeyError，改为兜底空表 + 诊断行
+    if not rows and wanted is not None:
+        for uk in sorted(wanted):
+            for mode in stages:
+                if mode not in scans or uk not in scans[mode]:
+                    status = Status.DATA_MISSING_BUS  # infer 缺目录同样以 BUS 缺失语义报告（无 infer 输入）
+                    msg = f"data/{TRAINS_DIR if mode=='train' else INFERS_DIR}/{uk} 不存在（--stage {mode} 无数据，跳过）"
+                    rows.append(_row(uk, mode, status, msg))
+                    log.warning("批量[%s] %s -> %s %s", mode, uk, status, msg)
+    if rows:
+        table = pd.DataFrame([asdict(r) for r in rows])[STATUS_COLUMNS]
+    else:
+        table = pd.DataFrame(columns=STATUS_COLUMNS)
     status_csv = batch_dir / "batch_status.csv"
     table.to_csv(status_csv, index=False, encoding="utf-8")
-    ok_n = int((table["status"] == Status.OK).sum())
+    ok_n = int((table["status"] == Status.OK).sum()) if not table.empty else 0
     log.info("批量执行完成：%d 行，OK %d，状态表 -> %s", len(table), ok_n, status_csv)
     return {"batch_dir": str(batch_dir), "status_csv": str(status_csv), "rows": rows,
-            "summary": table["status"].value_counts().to_dict()}
+            "summary": table["status"].value_counts().to_dict() if not table.empty else {}}

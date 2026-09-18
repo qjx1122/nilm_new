@@ -42,7 +42,7 @@ $forceFlag = if ($Force) { " --force" } else { "" }
 
 if ($Stage -in @("all","train")) {
   Write-Host "`n--- Step2 训练 ---" -ForegroundColor Yellow
-  Invoke-Step "python scripts/run_batch_users.py --time-filter-config $TimeFilterConfig --base-config $BaseConfig --data-root $DataRoot --output-root $OutputRoot --user-key $UserKey$forceFlag"
+  Invoke-Step "python scripts/run_batch_users.py --time-filter-config $TimeFilterConfig --base-config $BaseConfig --data-root $DataRoot --output-root $OutputRoot --user-key $UserKey --stage train$forceFlag"
 }
 
 if ($Stage -in @("all","train")) {
