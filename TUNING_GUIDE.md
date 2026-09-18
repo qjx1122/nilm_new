@@ -86,6 +86,7 @@ data/
 ## 3. 从 0 到上线的 8 步（粘贴即跑，含输出怎么验）
 
 > 以新用户 `900080270900_4200000000001` 猜 `p2`、`on_thr 10W`、初始 `decision 30W`，用最稳的 `base_optimal.yaml`（`lags[5,1,2,3,4] + 4模型择优`，已合入 `default.yaml` 全局，对 4 户零污染已验）为例。Windows 用 PowerShell，Linux/macOS 把 `Select-String` 换 `grep`。
+> **懒人一键（等价 Step 2→3→5→4，含阈值双链）：** `python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219` 或 `.\scripts\one_click_733.ps1`（缺 `time_filters.json` 条目自动补 `p1/10/30/day_gate`，`--help` 看 `--stage/--force/--skip-*`；`*` 通配已用 `threshold_sweep v2026-09-19 glob` 兼容 PowerShell `OSError`）——单行即走完下述 4 步。
 
 ### Step 0 拉代码与自检（每次开工必做，BOOTSTRAP 开局仪式）
 
@@ -345,7 +346,11 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 ### B. 命令速查（PowerShell / bash 通用）
 
 ```powershell
-# 单户训练+推理
+# 一键 Step 2-5（推荐新用户 800080270733_4206673297219，自动 train→window→infer→双链扫阈，缺配置自动补 p1/10/30/day_gate，* 通配已兼容 PowerShell）
+python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219
+.\scripts\one_click_733.ps1                                   # 等价 PowerShell 封装
+python scripts/auto_run_steps2to5.py --help                  # --stage all|train|infer|threshold / --force / --skip-train|skip-infer
+# 单户训练+推理（分步，同上一键的底层）
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs --user-key 900080270900_4200000000001
 # 阈值扫（* 通配已兼容 PowerShell，v2026-09-19）
 python scripts/threshold_sweep.py --csv "outputs/900080270900_4200000000001/infer/*/predictions/inference_result.csv" --pred-col pred --state-col pred_state --thresholds 10,30,50,100,150,200,300,400,500

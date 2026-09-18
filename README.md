@@ -40,6 +40,17 @@ python3 -m venv .venv
     [--output-root outputs/merged] [--log-dir <日志目录>] [--no-keep-original]
 
 .venv/bin/python -m pytest tests/ -q             # 193 项测试（含解耦守卫/合并逻辑/W-1 时间连续性守卫）
+
+# 一键 Step2-5（新用户 800080270733_4206673297219 推荐，覆盖 TUNING_GUIDE Step2→3→5→4）
+# Windows（PowerShell, test_gpu）
+conda activate test_gpu
+python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219
+# 或 ./scripts/one_click_733.ps1   （同流程 PowerShell 封装，自动 window_check + infer + threshold 双链）
+# 其他：--target-col p2 --on-thr 10 --decision-thr 30  指定目标与阈值（缺 configs/time_filters.json 条目时自动补 p1/10/30/day_gate）
+#       --stage threshold  仅 Step4 扫阈值（10,30,50,100,150,200,300,400,500），--skip-train/--skip-infer/--force 可配
+# Linux/通用（.*通配由 threshold_sweep 内部 glob 展开，已兼容 PowerShell OSError，v2026-09-19）
+python3 scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219 --stage all
+python3 scripts/auto_run_steps2to5.py --help   # 查看 --stage/--target-col/--on-thr/--decision-thr/--force/--skip-*
 ```
 
 合并脚本输出：`<output-root>/<数据源名>/<终端号_用户号>/` 复刻原层级（阶段一结果）+
