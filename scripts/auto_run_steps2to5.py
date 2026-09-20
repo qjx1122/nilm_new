@@ -59,7 +59,18 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col: str, on_thr: fl
         "infer": {"include": [["2026-07-01","2026-07-31"]]}
     }
     bak = tf_path.with_suffix(".bak.auto")
-    tf_path.rename(bak)
+    # Windows 下 rename 若目标已存在会 FileExistsError(183)；此前 800080270815 已产生 .bak.auto，第二新户即撞
+    if bak.exists():
+        from datetime import datetime
+        bak = tf_path.with_suffix(f".bak.auto.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        # 极小概率同秒再撞则直接覆盖
+        if bak.exists():
+            bak.unlink()
+    try:
+        tf_path.rename(bak)
+    except FileExistsError:
+        # 兜底：原子覆盖（Windows 需用 replace）
+        tf_path.replace(bak)
     tf_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"已为新用户 {user_key} 补 time_filters.json（target={target_col} on={on_thr} dec={decision_thr}），原文件备份 {bak.name}", "WARN")
     log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）", "WARN")
