@@ -1,10 +1,10 @@
 # TUNING_GUIDE.md — 工商业负荷辨识调参运维人话版（详细版）
 
 > **给谁看**：完全不懂算法的工程师、运维、交付、现场实施同学。只要会 `复制粘贴 PowerShell 命令`、`用 Excel 打开 CSV`、`看懂“开/关”`，就能按本手册把一个从未见过的新设备从 0 接到生产，并判断能不能上线。  
-> **版本**：v1.1 详细版（2026-09-18，对齐 `REPORT.md v1.1 + NILM_DATA_DICT v0.2.10 + REPORT_TEST 18专题 + base_optimal lag5[5,1,2,3,4]`）+ Q16 `DATA_MISSING_BUS` 空批次修复（2026-09-18）+ Step4 800080270815 双链解读（2026-09-20）｜协议：`BOOTSTRAP.md v2.3`｜分支：`arena/01a0896c-nilm-new`  
+> **版本**：v1.1 详细版（2026-09-18，对齐 `REPORT.md v1.1 + NILM_DATA_DICT v0.2.10 + REPORT_TEST 18专题 + base_optimal lag5[5,1,2,3,4]`）+ Q16 `DATA_MISSING_BUS` 空批次修复（2026-09-18）+ Step4 800080270815 双链解读（2026-09-20）+ Step1a 定阈（2026-09-21）｜协议：`BOOTSTRAP.md v2.3`｜分支：`arena/01a0896c-nilm-new`  
 > **一句话定位**：用总线侧 5 分钟电表（电压电流有功功率因数）去猜分路侧 15 分钟电表（某一路 `p1/p2/p3...` 的有功）此刻是“开 1”还是“关 0”、功率是多少瓦。模型只看过去 24 小时（96 点）的功率走势，不看高频谐波。
 
-**怎么用本手册**：按顺序读，`Step 0-7` 是必做流水线；`§4-6` 是解释为什么；`§7-9` 是上线门禁与排障；`附录` 是可直接复制的模板。遇到报错先查 `§9 战史`，再查 `§10 FAQ`。
+**怎么用本手册**：按顺序读，`Step 0-7` 是必做流水线（`Step1` 拆 `1a探数定阈(5min)+1b写配置`，仍计8步）；`§4-6` 是解释为什么；`§7-9` 是上线门禁与排障；`附录` 是可直接复制的模板。遇到报错先查 `§9 战史`，再查 `§10 FAQ`。
 
 ---
 
@@ -85,7 +85,7 @@ data/
 
 ## 3. 从 0 到上线的 8 步（粘贴即跑，含输出怎么验）
 
-> 以新用户 `900080270900_4200000000001` 猜 `p2`、`on_thr 10W`、初始 `decision 30W`，用最稳的 `base_optimal.yaml`（`lags[5,1,2,3,4] + 4模型择优`，已合入 `default.yaml` 全局，对 4 户零污染已验）为例。Windows 用 PowerShell，Linux/macOS 把 `Select-String` 换 `grep`。
+> 以新用户 `900080270900_4200000000001` 猜 `p2`（`Step1a` 已定 `on_thr 10W`）、初始 `decision 30W`，用最稳的 `base_optimal.yaml`（`lags[5,1,2,3,4] + 4模型择优`，已合入 `default.yaml` 全局，对 4 户零污染已验）为例。Windows 用 PowerShell，Linux/macOS 把 `Select-String` 换 `grep`。
 > **懒人一键（等价 Step 2→3→5→4，含阈值双链）：** `python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219` 或 `.\scripts\one_click_733.ps1`（缺 `time_filters.json` 条目自动补 `p1/10/30/day_gate`，`--help` 看 `--stage/--force/--skip-*`；`*` 通配已用 `threshold_sweep v2026-09-19 glob` 兼容 PowerShell `OSError`）——单行即走完下述 4 步。
 
 ### Step 0 拉代码与自检（每次开工必做，BOOTSTRAP 开局仪式）
@@ -100,7 +100,31 @@ Test-Path configs/base_optimal.yaml; (Select-String -Path configs/base_optimal.y
 # 期望 True，lags: [5,1,2,3,4]
 ```
 
-### Step 1 写配置（唯一可信源 `configs/time_filters.json`，优先级 `user_key > _default`）
+### Step 1a 探数定 `on_thr_w`（5分钟，冻结答案，Step1前必做）
+
+> **为什么单列一步**：`on_thr_w` 是**改答案**（`target→target_state`），改后需重训重审计；而 `decision` 是改判卷可离线扫。`§1②` 已讲三档，新户常默认抄 `10W` 致高功率路 `P 0.44 / SAE 0.37` 返工（`OQ-13`）。本步 `5分钟粘贴即跑` 把 `铭牌+直方图+branch_sessions` 固化为可审计动作，产 `on_thr` 再进 `Step1b`。
+
+```powershell
+# 1) 分路直方图与分位数（看双峰：0附近尖峰 vs 开机峰；5min）
+python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/4200000000001-250710-260630.csv'; s=pd.read_csv(p)['p2'].dropna(); print(s.describe(percentiles=[.5,.9,.95,.99])); print('NaN',s.isna().mean()); print('非零中位',s[s>10].median(),'5%分位',s[s>10].quantile(0.05)); s.hist(bins=80, range=(0,1000))"
+# 2) 已有一次训练后看开机段最小/均值（与直方图互证）
+# outputs/900080270900_4200000000001/train/*/branch_sessions.csv  看 p2 开机段 min/mean 功率
+# 3) 台账铭牌最小档对照
+```
+
+**判据（按 §1② 三档速查）：**
+
+| 场景 | `on_thr` | 何时用 | 本项目锚 |
+|---|---|---|---|
+| 低功率/有无电 | **10W** | 待机 `0-10W`，开机 `≈700W` 双峰清晰 | `2844 p2 / 778 p2 / 800080270815 p1` |
+| 高功率/干不干活 | **50W** | 待机纹波 `20-40W` | `2842 p1` |
+| 复合和 `p1+p2` / `p1+…p6` | **60W / 10×N** | 和的最小档 | `789 p1+p2 60W`；`p1+…p6` 先看和的直方图 |
+
+* **取法**：`待机带上沿+余量` 且 `≤ 最小开机功率×0.3`。例 `非零中位709W / 待机0-8W →10W`；`待机0-35W→50W`。
+* **冻结**：定后即入 `Step1b`，后续 `Step4` 只扫 `decision`，勿为追 `F1` 再动 `on_thr`。
+* **一键快速通道**：`auto_run_steps2to5.py --target-col p1 --on-thr 10` 默认 `10W`，`Step1a` 为其人工复核。
+
+### Step 1b 写配置（唯一可信源 `configs/time_filters.json`，优先级 `user_key > _default`）
 
 ```json
 "900080270900_4200000000001": {
