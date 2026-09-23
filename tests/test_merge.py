@@ -117,21 +117,30 @@ def test_two_level_merge_end_to_end(tmp_path):
     kept_ch2 = out / "srcA" / UK / f"e241_{DEV}_{USR}-Ch2-260101-260105.csv"
     assert kept_ch2.exists()                         # 单文件组直接保留原名
 
-    assert not (out / "srcA" / "8002_9002").exists()  # 重叠组整组跳过，不生成合并文件
+    # 2026-09-23 更新：重叠不再跳过，改为告警+剔除重复时间戳后合并
+    overlapped_intra = out / "srcA" / "8002_9002" / "e241_8002_9002-Ch1-260101-260115.csv"
+    assert overlapped_intra.exists()                  # 原跳过现合并（去重后 8 行，无重复时间戳）
+    assert len(pd.read_csv(overlapped_intra)) == 8
+    g_intra = [g for g in report["phase1_intra_source"]["srcA"] if g.get("user_key") == "8002_9002"][0]
+    assert g_intra["status"] == "OK" and g_intra.get("overlap_handled")
 
-    # —— 阶段二：跨源合并（srcA+srcB 无重叠；srcC 重叠告警跳过）——
+    # —— 阶段二：跨源合并（srcA+srcB 无重叠；srcC 重叠告警后去重合并）——
     assert report["warnings"] >= 2                   # userY 内源重叠 + userX 跨源重叠
     cross_groups = report["phase2_cross_source"][UK]
     statuses = {(g["ch"], g["status"]) for g in cross_groups}
-    assert (1, "SKIPPED_OVERLAP") in statuses        # srcC 触发跨源重叠 → 跳过
+    assert (1, "OK") in statuses                      # srcC 触发跨源重叠 → 告警后去重合并为 OK
     assert (2, "OK") in statuses                     # Ch2 仅 srcA 有，无需跨源
-    assert not (out / "cross_source" / UK).joinpath(
-        f"e241_{DEV}_{USR}-Ch1-260101-260210.csv").exists()  # 重叠组不生成跨源文件
+    cross_merged = out / "cross_source" / UK / f"e241_{DEV}_{USR}-Ch1-260101-260210.csv"
+    assert cross_merged.exists()                      # 重叠已去重合并，生成跨源文件（10+5+5 去重后 20 行）
+    g_cross = [g for g in cross_groups if g["ch"] == 1][0]
+    assert g_cross.get("overlap_handled") and g_cross["status"] == "OK"
+    assert len(pd.read_csv(cross_merged)) == 20
 
     # —— 告警日志：精准记录用户目录/文件名/冲突区间（§6.2）——
     wlog = (out / "logs" / "merge_warnings.log").read_text(encoding="utf-8")
     assert "8002_9002" in wlog and "2026-01-05" in wlog     # 内源重叠记录
     assert "srcC" in wlog or "跨源" in wlog                 # 跨源重叠记录
+    assert "剔除重复" in wlog or "去重" in wlog
     assert (out / "logs" / "merge_run.log").exists()
     assert (out / "logs" / "merge_report.json").exists()
 
@@ -151,13 +160,13 @@ def test_cross_source_merge_when_no_overlap(tmp_path):
 
 def test_branch_files_merge_same_rules(tmp_path):
     """分路格式文件（<用户号>-<起>-<止>.csv）合并规则与总线一致：
-    内源迭代合并、重叠跳过、跨源合并、单源透传。"""
+    内源迭代合并、重叠告警+去重合并、跨源合并、单源透传。"""
     srcA, srcB = tmp_path / "srcA", tmp_path / "srcB"
     # userX 分路：srcA 两段无重叠（内源合并）；srcB 一段（跨源合并）
     _write_branch_csv(srcA / UK, USR, "260101", "260110", _day_rows("2026-01-01", 4))
     _write_branch_csv(srcA / UK, USR, "260111", "260120", _day_rows("2026-01-11", 4))
     _write_branch_csv(srcB / UK, USR, "260201", "260210", _day_rows("2026-02-01", 4))
-    # userY 分路：时间重叠 → 整组告警跳过
+    # userY 分路：时间重叠 → 告警后去重合并（2026-09-23 更新）
     _write_branch_csv(srcA / "8002_9002", "9002", "260101", "260110", _day_rows("2026-01-01", 3))
     _write_branch_csv(srcA / "8002_9002", "9002", "260105", "260115", _day_rows("2026-01-05", 3))
 
@@ -168,8 +177,10 @@ def test_branch_files_merge_same_rules(tmp_path):
     intra_merged = out / "srcA" / UK / f"{USR}-260101-260120.csv"
     assert intra_merged.exists()
     assert len(pd.read_csv(intra_merged)) == 8
-    # userY 重叠组整组跳过
-    assert not (out / "srcA" / "8002_9002").exists()
+    # userY 重叠组告警后去重合并（原跳过现合并 6 行）
+    intra_y = out / "srcA" / "8002_9002" / "9002-260101-260115.csv"
+    assert intra_y.exists()
+    assert len(pd.read_csv(intra_y)) == 6
     # 跨源：srcA 合并结果 + srcB → <用户号>-260101-260210.csv
     cross_merged = out / "cross_source" / UK / f"{USR}-260101-260210.csv"
     assert cross_merged.exists()
@@ -179,6 +190,7 @@ def test_branch_files_merge_same_rules(tmp_path):
     assert g["status"] == "OK" and g["action"] == "merged"
     wlog = (out / "logs" / "merge_warnings.log").read_text(encoding="utf-8")
     assert "8002_9002" in wlog and "branch" in wlog
+    assert "剔除重复" in wlog or "去重" in wlog
     assert report["warnings"] == 1
 
 
@@ -266,3 +278,53 @@ def test_no_keep_original_option(tmp_path):
     # 单文件组（Ch2）不保留；多文件合并结果仍输出
     assert not (out / "srcA" / UK / f"e241_{DEV}_{USR}-Ch2-260101-260105.csv").exists()
     assert (out / "srcA" / UK / f"e241_{DEV}_{USR}-Ch1-260101-260120.csv").exists()
+
+
+def test_overlap_with_duplicate_timestamps_deduped_and_warned(tmp_path):
+    """2026-09-23 新增：重叠区间先告警，再剔除重复时间戳后合并（去重保留先出现者）。"""
+    src = tmp_path / "srcD"
+    uk = src / UK
+    # 两文件时间区间重叠 260101-260110 vs 260105-260115，且内容时间戳 2026-01-05~07 重复 3 行
+    rows_a = _day_rows("2026-01-01", 5) + _day_rows("2026-01-05", 3)  # 01-01~01-04 + 01-05 00-02
+    rows_b = _day_rows("2026-01-05", 3) + _day_rows("2026-01-10", 4)  # 01-05 00-02 重复 + 01-10 00-03
+    _write_bus_csv(uk, 1, "260101", "260110", rows_a)
+    _write_bus_csv(uk, 1, "260105", "260115", rows_b)
+    out = tmp_path / "merged"
+    report = run_merge([src], output_root=out)
+    merged = out / "srcD" / UK / "e241_8001_9001-Ch1-260101-260115.csv"
+    assert merged.exists()
+    df = pd.read_csv(merged)
+    # 5+3 + 3+4 -3重复 =12 行
+    assert len(df) == 12
+    assert df["event_time"].is_monotonic_increasing
+    assert df["event_time"].duplicated().sum() == 0
+    # 报告标记重叠已处理，去重计数 3
+    g = [g for g in report["phase1_intra_source"]["srcD"] if g.get("user_key") == UK][0]
+    assert g.get("overlap_handled") and g.get("duplicates_removed") == 3
+    assert report["warnings"] >= 1
+    wlog = (out / "logs" / "merge_warnings.log").read_text(encoding="utf-8")
+    assert "重叠" in wlog and "剔除重复" in wlog
+    # cross_source 无合并数据时直接拷贝（单源透传）
+    cross = out / "cross_source" / UK / "e241_8001_9001-Ch1-260101-260115.csv"
+    assert cross.exists()
+    assert len(pd.read_csv(cross)) == 12
+
+
+def test_no_merged_data_fallback_copy(tmp_path):
+    """2026-09-23 新增：如无合并数据（单文件组），直接拷贝当前数据到目标文件夹。"""
+    src = tmp_path / "srcE"
+    uk = src / UK
+    # 单文件组，无需合并
+    _write_bus_csv(uk, 1, "260301", "260305", _day_rows("2026-03-01", 2))
+    _write_branch_csv(uk, USR, "260301", "260305", _day_rows("2026-03-01", 2))
+    out = tmp_path / "merged"
+    report = run_merge([src], output_root=out)
+    # 阶段一直接拷贝
+    assert (out / "srcE" / UK / "e241_8001_9001-Ch1-260301-260305.csv").exists()
+    assert (out / "srcE" / UK / "9001-260301-260305.csv").exists()
+    # 阶段二单源透传亦拷贝到 cross_source（无合并数据直接拷贝语义）
+    assert (out / "cross_source" / UK / "e241_8001_9001-Ch1-260301-260305.csv").exists()
+    assert (out / "cross_source" / UK / "9001-260301-260305.csv").exists()
+    # 报告为 OK
+    assert all(g["status"] == "OK" for g in report["phase1_intra_source"]["srcE"])
+    assert all(g["status"] == "OK" for gs in report["phase2_cross_source"].values() for g in gs)
