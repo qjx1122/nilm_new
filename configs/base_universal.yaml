@@ -1,0 +1,79 @@
+# 通用（pooled）负荷辨识 base 配置 —— 新增 pooled 链路专用，不影响单用户链路
+# 用法（训练）：
+#   python scripts/run_pooled.py --time-filter-config configs/time_filters.json \
+#       --base-config configs/base_universal.yaml --target-col p1 --stage train
+# 用法（LOUO 泛化评估）：
+#   python scripts/run_pooled.py --time-filter-config configs/time_filters.json \
+#       --base-config configs/base_universal.yaml --target-col p1 --stage train --loo
+# 用法（新用户零样本推理）：
+#   python scripts/run_pooled.py --time-filter-config configs/time_filters.json \
+#       --base-config configs/base_universal.yaml --target-col p1 --stage infer \
+#       --user-key <device>_<user> --universal-dir outputs/universal/p1/train/<ts>
+#
+# 与 base_optimal.yaml 的差异：
+# - models 只保留可迁移的 ridge + transformer（history_profile/proportional 为用户画像，不可迁移）；
+# - 新增 pooled 节：cap 归一化 + LOUO + 全局 Scaler；
+# - ridge off_weight 默认 1.0（归一化域阈值随 cap 变化，池化加权需另行标定，见 normalize.py）。
+experiment_name: guide_v2_1_universal
+seed: 42
+output_dir: outputs
+
+data:
+  trains_root: data/trains
+  infers_root: data/infers
+  sentinel_values: [-2147483648, 2147483647]
+  derive_phase_from_ptotal: true
+
+quality:
+  max_missing_rate: 0.9
+  min_coverage: 0.15
+  min_score: 70
+  gate_scope: full
+  day_gate: true
+  min_days: 3
+  max_daily_missing_rate: 0.9
+
+preprocess:
+  clip_negative: true
+  allow_negative_power: false
+  max_gap_interp: 2
+  save_cleaned_csv: false
+  min_overlap: 0.3
+  agg_strategy: {u: mean, i: mean, p: mean, pf: recompute}
+
+features:
+  lags: [5, 1, 2, 3, 4]
+  rolling_windows: ["1h", "6h", "24h"]
+
+dataset:
+  window: 96
+  mode: seq2seq
+
+# pooled 通用模型专用（仅 pooled_task 读取，单用户链路忽略）
+pooled:
+  cap_quantile: 0.95          # cap = pbus 分位数（仅由总线估计，新用户可算）
+  val_ratio: 0.2              # train 池内 val 占比
+  split_strategy: stratified_by_state
+  target_col: p1              # 默认目标通道；CLI --target-col 覆盖；按 target_col 分组训练
+
+bus_field_map:
+  ua:    {ch: 1, column: load_iden_data9,  multiplier: 0.001, unit: V}
+  ub:    {ch: 1, column: load_iden_data45, multiplier: 0.001, unit: V}
+  uc:    {ch: 1, column: load_iden_data81, multiplier: 0.001, unit: V}
+  ia:    {ch: 1, column: load_iden_data1,  multiplier: 0.001, unit: A}
+  ib:    {ch: 1, column: load_iden_data37, multiplier: 0.001, unit: A}
+  ic:    {ch: 1, column: load_iden_data73, multiplier: 0.001, unit: A}
+  pa:    {ch: 1, column: load_iden_data7,  multiplier: 0.001, unit: W}
+  pb:    {ch: 1, column: load_iden_data43, multiplier: 0.001, unit: W}
+  pc:    {ch: 1, column: load_iden_data79, multiplier: 0.001, unit: W}
+  pfa:   {ch: 1, column: load_iden_data8,  multiplier: 0.001, unit: ""}
+  pfb:   {ch: 1, column: load_iden_data44, multiplier: 0.001, unit: ""}
+  pfc:   {ch: 1, column: load_iden_data80, multiplier: 0.001, unit: ""}
+
+models:
+  - name: ridge
+    params: {alpha: 1.0, off_weight: 1.0, off_thr_w: 10.0}
+  - name: transformer
+    params: {window: 96, d_model: 64, nhead: 4, num_layers: 2, epochs: 150, patience: 20}
+
+metrics: [mae, rmse, r2, sae, f1, accuracy, precision, recall, tp, fp, fn, tn]
