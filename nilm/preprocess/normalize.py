@@ -105,8 +105,8 @@ def apply_pt_ct(bus: pd.DataFrame, pt_ratio: float = 1.0,
 def apply_branch_scale(branch: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
     """分路一次侧单位换算（与 on_thr_w 同级的用户配置 branch_scale）。
 
-    分路 CSV 单位为 kW 时填 1000.0 转为 W，与总线一次侧 W 对齐；
-    仅缩功率列（pN/pa/pb/pc/ptotal），为 1.0 时原样返回（历史行为不变）。
+    分路 CSV 单位为 kW 时填 1000.0 转为 W，与总线一次侧 W 对齐（配置默认 1000.0）；
+    仅缩功率列（pN/pa/pb/pc/ptotal），为 1.0 时原样返回（W 用户显式填 1.0）。
     """
     s = float(scale)
     if s == 1.0:

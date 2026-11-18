@@ -127,7 +127,7 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     pt_ratio = float(user_cfg.get("pt_ratio", 1.0))
     ct_ratio = float(user_cfg.get("ct_ratio", 1.0))
     # 分路一次侧单位换算（kW->W 填 1000.0，默认 1.0=W 历史不变）
-    branch_scale = float(user_cfg.get("branch_scale", 1.0))
+    branch_scale = float(user_cfg.get("branch_scale", 1000.0))
 
     branch_c = None
     target = None
@@ -414,7 +414,7 @@ def _train_one_fold(pre: dict[str, dict], train_users: list[str], test_users: li
         "on_thr_map": on_thr_map,
         "pt_ct_map": {uk: {"pt_ratio": pre[uk].get("pt_ratio", 1.0),
                            "ct_ratio": pre[uk].get("ct_ratio", 1.0),
-                           "branch_scale": pre[uk].get("branch_scale", 1.0)} for uk in pre},
+                           "branch_scale": pre[uk].get("branch_scale", 1000.0)} for uk in pre},
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     })
     (fold_out / DONE_MARKER).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")

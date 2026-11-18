@@ -58,7 +58,7 @@ pooled:
   # PT/CT 变比（与 on_thr_w 同级，time_filters.json 用户级，默认 1.0）：
   # pt 缩电压、ct 缩电流、有功缩 pt*ct，使总线与分路同量级后再算 cap。
   # 质量打分在校正前（二次侧）执行，校正后（一次侧）供 ident/特征/cap。
-  # branch_scale（同级，默认 1.0）：分路一次侧 kW->W 填 1000.0，与总线一次侧 W 对齐。
+  # branch_scale（同级，默认 1000.0=kW）：分路一次侧 kW->W，与总线一次侧 W 对齐；W 用户显式填 1.0。
 
 bus_field_map:
   ua:    {ch: 1, column: load_iden_data9,  multiplier: 0.001, unit: V}

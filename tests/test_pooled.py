@@ -151,7 +151,7 @@ def test_pooled_task_smoke(tmp_path):
     assert len(scans) == 2
     user_cfgs = {uk: {"target_col": "p1", "on_thr_w": 10.0, "split_ratios": [0.6, 0.2, 0.2],
                       "split_strategy": "stratified_by_state", "post_min_on": 1,
-                      "post_fill_short_off": 3} for uk in scans}
+                      "post_fill_short_off": 3, "branch_scale": 1.0} for uk in scans}
     out_root = tmp_path / "outputs"
     res = run_pooled_train(sorted(scans.keys()), scans, user_cfgs, base_cfg,
                            out_root, target_col="p1", loo=False)
@@ -164,7 +164,7 @@ def test_pooled_task_smoke(tmp_path):
     assert uk_new in infer_scans
     res2 = run_pooled_infer(uk_new, infer_scans[uk_new],
                             {"target_col": "p1", "on_thr_w": 10.0, "post_min_on": 1,
-                             "post_fill_short_off": 3},
+                             "post_fill_short_off": 3, "branch_scale": 1.0},
                             base_cfg, out_root, target_col="p1")
     assert res2.status == "OK", res2.message
     assert (Path(res2.output_dir) / "predictions" / "inference_result.csv").exists()
@@ -209,13 +209,13 @@ def test_apply_branch_scale():
 def test_branch_scale_config_defaults():
     from nilm.common.contracts import CONFIG_RULES
     from nilm.pipeline.user_config import resolve_user_config
-    assert CONFIG_RULES["branch_scale"]["default"] == 1.0
+    assert CONFIG_RULES["branch_scale"]["default"] == 1000.0
     cfg = {"_default": {"on_thr_w": 10.0}, "800080270001_4200000000001": {"target_col": "p1"}}
     merged = resolve_user_config("800080270001_4200000000001", cfg)
-    assert merged["branch_scale"] == 1.0
-    cfg2 = {"800080270001_4200000000001": {"target_col": "p1", "branch_scale": 1000.0}}
+    assert merged["branch_scale"] == 1000.0
+    cfg2 = {"800080270001_4200000000001": {"target_col": "p1", "branch_scale": 1.0}}
     merged2 = resolve_user_config("800080270001_4200000000001", cfg2)
-    assert merged2["branch_scale"] == 1000.0
+    assert merged2["branch_scale"] == 1.0
 
 
 def test_quality_before_ptct():

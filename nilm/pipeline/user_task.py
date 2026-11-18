@@ -157,7 +157,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         pt_ratio = float(user_cfg.get("pt_ratio", 1.0))
         ct_ratio = float(user_cfg.get("ct_ratio", 1.0))
         # 分路一次侧单位换算（kW->W 填 1000.0，默认 1.0=W 历史不变）
-        branch_scale = float(user_cfg.get("branch_scale", 1.0))
+        branch_scale = float(user_cfg.get("branch_scale", 1000.0))
         if branch_scale != 1.0:
             branch_c = apply_branch_scale(branch_c, branch_scale)
             log.info("[%s] 分路单位换算 branch_scale=%.4g（kW->W）", user_key, branch_scale)
@@ -608,7 +608,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         pt_ratio = float(user_cfg.get("pt_ratio", 1.0))
         ct_ratio = float(user_cfg.get("ct_ratio", 1.0))
         # 分路一次侧单位换算（kW->W 填 1000.0，默认 1.0=W 历史不变）
-        branch_scale = float(user_cfg.get("branch_scale", 1.0))
+        branch_scale = float(user_cfg.get("branch_scale", 1000.0))
         save_cleaned = bool(pp.get("save_cleaned_csv", True))
         _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
         bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
