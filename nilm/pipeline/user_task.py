@@ -49,11 +49,11 @@ log = get_logger("pipeline.user_task")
 
 DONE_MARKER = "_DONE"
 NON_SCALED_COLS = {"slot", "hour", "minute", "day_of_week", "is_weekend",
-                   "month", "day_of_year",
-                   # pbus 保持物理量纲（W）不缩放：基线模型（proportional 等）按列名
-                   # 取用其物理值——曾因被 z-score 标准化（中位≈0）+ clip(0) 导致
-                   # proportional 预测恒≈0、F1 全 0（2026-08-18 修复，2842 户实证）
-                   "pbus"}
+                   "month", "day_of_year"}
+# 注：pbus 已改 z-score 缩放（2026-11-18 方向2）：总线功率 W/kW 量纲无关，
+# 恢复 ridge/transformer 对总功率特征的利用（无条件 /1000 后 pbus≈0.4 未缩放
+# 致 ridge 正则淹没、transformer 输入失配，指标劣于 09de9c1）。基线
+# proportional 同步改学（y≈a·pbus_z+b），不再依赖物理 pbus（见 baselines）。
 
 
 class UserTaskError(Exception):

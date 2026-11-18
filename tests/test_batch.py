@@ -501,10 +501,11 @@ def test_train_predictions_artifact(tmp_path, base_cfg_file, time_filter_file):
 
 def test_proportional_predicts_physical_scale(tmp_path, base_cfg_file,
                                               time_filter_file):
-    """回归守卫（2842 F1=0 缺陷）：pbus 不缩放，proportional 预测为物理量级。
+    """回归守卫（2842 F1=0 缺陷，改学版）：pbus z-score，proportional 学线性映射。
 
-    缺陷史：pbus 曾被 z-score 标准化（中位≈0），proportional 的 pred=share×z(pbus)
+    缺陷史：pbus 曾被 z-score 标准化（中位≈0），旧 proportional 的 pred=share×z(pbus)
     经 clip(0) 后恒≈0 → 永不过开机阈值 → TP=0、F1 全 0。
+    现 proportional 在 z-score pbus 上学 y≈a·pbus_z+b，预测回 y 物理量级。
     """
     data_root = tmp_path / "data"
     write_user_dir(data_root, USER_KEY, days=21)
@@ -514,15 +515,15 @@ def test_proportional_predicts_physical_scale(tmp_path, base_cfg_file,
               user_keys=[USER_KEY])
     train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
-    # pbus 不在缩放列
+    # pbus 在缩放列（量纲无关，方向2）
     i = meta["feature_names"].index("pbus")
-    assert i not in meta["scale_cols"], "pbus 不得被 z-score 标准化"
+    assert i in meta["scale_cols"], "pbus 应被 z-score 标准化（量纲无关）"
     df = pd.read_csv(train_dir / "predictions" / "train_predictions.csv")
-    # 合成数据 p1≈0.5×pbus（pbus>100W）：proportional 预测应为物理量级而非 z 值
+    # 合成数据 p1≈0.5×pbus：改学版 proportional 预测应为 y 物理量级而非 z 值
     on = df[df["target"] > 50]
     assert len(on) > 0
     assert on["pred_proportional"].median() > 10, \
-        "proportional 预测应为物理功率量级（W），而非标准化 z 值"
+        "proportional（改学版）预测应为 y 物理量级，而非标准化 z 值"
     # F1 不再恒 0（能预测出开机）
     t_on = df["target"] >= 10
     p_on = df["pred_proportional"] >= 10

@@ -107,19 +107,39 @@ class HistoryProfile(BaseModel):
 
 @MODEL_REGISTRY.register("proportional")
 class ProportionalAllocation(BaseModel):
-    """按训练集功率占比把母线总有功 pbus 分摊到各目标。需要特征列 ``pbus``。"""
+    """单特征线性基线：在标准化 pbus 上学 ``y ≈ a·pbus_z + b``（最小二乘）。
+
+    历史：曾按物理 pbus 分摊（``pred=pbus×share``），依赖 pbus 不缩放；
+    pbus 改 z-score 后物理分摊失效（中位≈0→clip 全 0，2842 F1=0 缺陷）。
+    现改为学斜率/截距，预测回 y 物理量级，量纲无关，保留基线位。
+    pbus 常数（方差≈0）时回退常数预测（均值），避免除零。
+    需要特征列 ``pbus``。
+    """
 
     name = "proportional"
 
     def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
             index=None, val_index=None) -> None:  # index 仅为接口一致（W-1），不使用
         self._p_idx = _col_index(feature_names, "pbus")
-        total = float(y.sum())
-        self._shares = y.sum(axis=0) / total if total > 0 else np.full(y.shape[1], 1.0 / y.shape[1])
+        p = np.asarray(X, dtype=np.float64)[:, self._p_idx]
+        Y = np.asarray(y, dtype=np.float64)
+        if Y.ndim == 1:
+            Y = Y[:, None]
+        self._n_out = Y.shape[1]
+        self._b = Y.mean(axis=0) if len(Y) else np.zeros(self._n_out)
+        self._a = np.zeros(self._n_out)
+        if len(p):
+            pm = float(p.mean())
+            pc = p - pm
+            denom = float(pc @ pc)
+            if denom > 1e-12:
+                self._a = (pc @ (Y - self._b)) / denom
+                self._b = self._b - self._a * pm
 
     def predict(self, X, index=None) -> np.ndarray:  # index 仅为接口一致（W-1），不使用
-        p_bus = X[:, self._p_idx]
-        return np.clip(p_bus[:, None] * self._shares[None, :], 0.0, None)
+        p = np.asarray(X, dtype=np.float64)[:, self._p_idx]
+        out = p[:, None] * self._a[None, :] + self._b[None, :]
+        return np.clip(out, 0.0, None)
 
 
 @MODEL_REGISTRY.register("ridge")
