@@ -80,15 +80,13 @@ def cap_from_bus(bus: pd.DataFrame, quantile: float = 0.95) -> float:
 
 def apply_pt_ct(bus: pd.DataFrame, pt_ratio: float = 1.0,
                 ct_ratio: float = 1.0) -> pd.DataFrame:
-    """按 PT/CT 变比校正总线物理量（与 on_thr_w 同级的用户配置）。
+    """按 PT/CT 变比校正总线物理量到 kW（与 on_thr_w 同级的用户配置）。
 
-    - 电压 ua/ub/uc × pt_ratio；电流 ia/ib/ic × ct_ratio；
-    - 有功 pa/pb/pc/ptotal × (pt_ratio*ct_ratio)（P=U·I 一致）；
-    - pf* 不动（无量纲）；均为 1.0 时原样返回（历史行为不变）。
+    - 电压 ua/ub/uc × pt_ratio（V）；电流 ia/ib/ic × ct_ratio（A）；
+    - 有功 pa/pb/pc/ptotal × (pt_ratio*ct_ratio/1000) 转 kW（P=U·I/1000）；
+    - pf* 不动（无量纲）；pt/ct 均为 1.0 时仅功率 /1000（W->kW）。
     """
     pt, ct = float(pt_ratio), float(ct_ratio)
-    if pt == 1.0 and ct == 1.0:
-        return bus
     out = bus.copy()
     for c in ("ua", "ub", "uc"):
         if c in out.columns:
@@ -98,15 +96,15 @@ def apply_pt_ct(bus: pd.DataFrame, pt_ratio: float = 1.0,
             out[c] = out[c] * ct
     for c in ("pa", "pb", "pc", "ptotal"):
         if c in out.columns:
-            out[c] = out[c] * (pt * ct)
+            out[c] = out[c] * (pt * ct / 1000.0)
     return out
 
 
 def apply_branch_scale(branch: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
-    """分路一次侧单位换算（与 on_thr_w 同级的用户配置 branch_scale）。
+    """分路一次侧单位换算到 kW（与 on_thr_w 同级的用户配置 branch_scale）。
 
-    分路 CSV 单位为 kW 时填 1000.0 转为 W，与总线一次侧 W 对齐（配置默认 1000.0）；
-    仅缩功率列（pN/pa/pb/pc/ptotal），为 1.0 时原样返回（W 用户显式填 1.0）。
+    分路 CSV 为 kW 时 1.0（默认，直通）；为 W 时 0.001（W->kW）。
+    仅缩功率列（pN/pa/pb/pc/ptotal），为 1.0 时原样返回。
     """
     s = float(scale)
     if s == 1.0:

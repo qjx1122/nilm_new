@@ -109,11 +109,12 @@ def test_pooled_task_smoke(tmp_path):
         d.mkdir(parents=True)
         idx5 = pd.date_range("2026-01-01", periods=288 * 10, freq="5min")
         on = (idx5.hour >= 8) & (idx5.hour < 18)
-        pbus = np.where(on, 500.0 * scale, 20.0 * scale) + rng.normal(0, 5, len(idx5))
+        # kW 口径：raw 功率 5e8 -> 二次 5e5W -> 一次 500kW（与分路 400kW 对齐）
+        pbus = np.where(on, 500.0 * scale, 20.0 * scale) * 1e6 + rng.normal(0, 5e6, len(idx5))
         bus = pd.DataFrame({
             "event_time": idx5.strftime("%Y-%m-%d %H:%M:%S"),
-            "load_iden_data9": 220.0, "load_iden_data45": 220.0, "load_iden_data81": 220.0,
-            "load_iden_data1": pbus / 220.0, "load_iden_data37": 0.0, "load_iden_data73": 0.0,
+            "load_iden_data9": 220000.0, "load_iden_data45": 220000.0, "load_iden_data81": 220000.0,
+            "load_iden_data1": pbus / 220000.0, "load_iden_data37": 0.0, "load_iden_data73": 0.0,
             "load_iden_data7": pbus, "load_iden_data43": 0.0, "load_iden_data79": 0.0,
             "load_iden_data8": 0.95, "load_iden_data44": 0.95, "load_iden_data80": 0.95,
         })
@@ -130,11 +131,11 @@ def test_pooled_task_smoke(tmp_path):
     d.mkdir(parents=True)
     idx5 = pd.date_range("2026-01-01", periods=288 * 5, freq="5min")
     on = (idx5.hour >= 8) & (idx5.hour < 18)
-    pbus = np.where(on, 500.0, 20.0) + rng.normal(0, 5, len(idx5))
+    pbus = np.where(on, 500.0, 20.0) * 1e6 + rng.normal(0, 5e6, len(idx5))
     bus = pd.DataFrame({
         "event_time": idx5.strftime("%Y-%m-%d %H:%M:%S"),
-        "load_iden_data9": 220.0, "load_iden_data45": 220.0, "load_iden_data81": 220.0,
-        "load_iden_data1": pbus / 220.0, "load_iden_data37": 0.0, "load_iden_data73": 0.0,
+        "load_iden_data9": 220000.0, "load_iden_data45": 220000.0, "load_iden_data81": 220000.0,
+        "load_iden_data1": pbus / 220000.0, "load_iden_data37": 0.0, "load_iden_data73": 0.0,
         "load_iden_data7": pbus, "load_iden_data43": 0.0, "load_iden_data79": 0.0,
         "load_iden_data8": 0.95, "load_iden_data44": 0.95, "load_iden_data80": 0.95,
     })
@@ -177,10 +178,10 @@ def test_apply_pt_ct():
     out = apply_pt_ct(bus, pt_ratio=2.0, ct_ratio=3.0)
     assert out["ua"].tolist() == [440.0, 440.0]
     assert out["ia"].tolist() == [30.0, 60.0]
-    assert out["pa"].tolist() == [13200.0, 26400.0]  # pt*ct=6
+    assert out["pa"].tolist() == pytest.approx([13.2, 26.4])  # pt*ct/1000=0.006 转 kW
     assert out["pfa"].tolist() == [0.9, 0.9]  # pf 不动
-    # 默认 1.0 不变
-    assert apply_pt_ct(bus)["pa"].tolist() == [2200.0, 4400.0]
+    # 默认 1.0 仅功率 W->kW /1000
+    assert apply_pt_ct(bus)["pa"].tolist() == pytest.approx([2.2, 4.4])
 
 
 def test_pt_ct_config_defaults():
@@ -198,24 +199,24 @@ def test_pt_ct_config_defaults():
 
 def test_apply_branch_scale():
     idx = pd.date_range("2026-01-01", periods=2, freq="15min")
-    br = pd.DataFrame({"p2": [0.5, 1.0], "p1": [0.2, 0.3]}, index=idx)
-    out = apply_branch_scale(br, scale=1000.0)
-    assert out["p2"].tolist() == [500.0, 1000.0]
-    assert out["p1"].tolist() == [200.0, 300.0]
-    # 默认 1.0 不变
-    assert apply_branch_scale(br)["p2"].tolist() == [0.5, 1.0]
+    br = pd.DataFrame({"p2": [500.0, 1000.0], "p1": [200.0, 300.0]}, index=idx)
+    out = apply_branch_scale(br, scale=0.001)
+    assert out["p2"].tolist() == [0.5, 1.0]
+    assert out["p1"].tolist() == [0.2, 0.3]
+    # 默认 1.0 不变（kW 直通）
+    assert apply_branch_scale(br)["p2"].tolist() == [500.0, 1000.0]
 
 
 def test_branch_scale_config_defaults():
     from nilm.common.contracts import CONFIG_RULES
     from nilm.pipeline.user_config import resolve_user_config
-    assert CONFIG_RULES["branch_scale"]["default"] == 1000.0
+    assert CONFIG_RULES["branch_scale"]["default"] == 1.0
     cfg = {"_default": {"on_thr_w": 10.0}, "800080270001_4200000000001": {"target_col": "p1"}}
     merged = resolve_user_config("800080270001_4200000000001", cfg)
-    assert merged["branch_scale"] == 1000.0
-    cfg2 = {"800080270001_4200000000001": {"target_col": "p1", "branch_scale": 1.0}}
+    assert merged["branch_scale"] == 1.0
+    cfg2 = {"800080270001_4200000000001": {"target_col": "p1", "branch_scale": 0.001}}
     merged2 = resolve_user_config("800080270001_4200000000001", cfg2)
-    assert merged2["branch_scale"] == 1.0
+    assert merged2["branch_scale"] == 0.001
 
 
 def test_quality_before_ptct():

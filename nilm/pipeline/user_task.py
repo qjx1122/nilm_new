@@ -153,14 +153,14 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         bus_c, branch_c = cleaner.transform(bus_raw), cleaner.transform(branch_raw)
         # PT/CT 变比（与 on_thr_w 同级，默认 1.0=不校正）：总线二次侧->一次侧。
         # 质量打分（BOUNDS 1000V 二次侧 sanity 上限）必须在校正前（二次侧）执行，
-        # 校正推迟至 day_gate 之后、ident/特征之前（一次侧 W）。
+        # 校正推迟至 day_gate 之后、ident/特征之前（一次侧 kW）。
         pt_ratio = float(user_cfg.get("pt_ratio", 1.0))
         ct_ratio = float(user_cfg.get("ct_ratio", 1.0))
-        # 分路一次侧单位换算（kW->W 填 1000.0，默认 1.0=W 历史不变）
-        branch_scale = float(user_cfg.get("branch_scale", 1000.0))
+        # 分路一次侧单位换算（到 kW 填 1000.0，默认 1.0=W 历史不变）
+        branch_scale = float(user_cfg.get("branch_scale", 1.0))
         if branch_scale != 1.0:
             branch_c = apply_branch_scale(branch_c, branch_scale)
-            log.info("[%s] 分路单位换算 branch_scale=%.4g（kW->W）", user_key, branch_scale)
+            log.info("[%s] 分路单位换算 branch_scale=%.4g（到 kW）", user_key, branch_scale)
         save_cleaned = bool(pp.get("save_cleaned_csv", True))
         _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
 
@@ -323,12 +323,11 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE,
                                 f"有效数据不足 {qcfg.get('min_days', 14)} 天（现有 {len(bus_al)/96:.1f} 天）")
 
-        # PT/CT 校正（二次侧->一次侧）：质量已在二次侧打分，此后才转一次侧 W
-        # 供 ident/特征使用（默认 1.0=不校正，历史行为不变）
-        if pt_ratio != 1.0 or ct_ratio != 1.0:
-            bus_al = apply_pt_ct(bus_al, pt_ratio, ct_ratio)
-            log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g）",
-                     user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
+        # PT/CT 校正（二次侧->一次侧 kW）：质量已在二次侧打分，此后才转一次侧 kW
+        # 供 ident/特征使用（pt/ct=1.0 时仅功率 W->kW /1000）
+        bus_al = apply_pt_ct(bus_al, pt_ratio, ct_ratio)
+        log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g，功率转 kW）",
+                 user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
 
         # —— §9 可辨识性分析（训练前强制执行）
         ident = identifiability_report(bus_al, target, on_thr_w=float(user_cfg["on_thr_w"]))
@@ -604,11 +603,11 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                         max_gap_interp=int(pp.get("max_gap_interp", 2))).transform(bus_raw)
         # PT/CT 变比（与 on_thr_w 同级，默认 1.0=不校正）：总线二次侧->一次侧。
         # 质量打分（BOUNDS 1000V 二次侧 sanity 上限）必须在校正前（二次侧）执行，
-        # 校正推迟至质量之后、特征之前（一次侧 W）。
+        # 校正推迟至质量之后、特征之前（一次侧 kW）。
         pt_ratio = float(user_cfg.get("pt_ratio", 1.0))
         ct_ratio = float(user_cfg.get("ct_ratio", 1.0))
-        # 分路一次侧单位换算（kW->W 填 1000.0，默认 1.0=W 历史不变）
-        branch_scale = float(user_cfg.get("branch_scale", 1000.0))
+        # 分路一次侧单位换算（到 kW 填 1000.0，默认 1.0=W 历史不变）
+        branch_scale = float(user_cfg.get("branch_scale", 1.0))
         save_cleaned = bool(pp.get("save_cleaned_csv", True))
         _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
         bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
@@ -622,7 +621,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             branch_c = Cleaner(clip_negative=not allow_negative).transform(branch_raw)
             if branch_scale != 1.0:
                 branch_c = apply_branch_scale(branch_c, branch_scale)
-                log.info("[%s] 分路单位换算 branch_scale=%.4g（kW->W）", user_key, branch_scale)
+                log.info("[%s] 分路单位换算 branch_scale=%.4g（到 kW）", user_key, branch_scale)
             # 目标通道为唯一有效分路，其余通道（不在当前总线回路）清洗后立即丢弃
             tcols_i = resolve_target_cols(user_cfg.get("target_col"), branch_c)
             invalid_ch = [c for c in branch_c.columns if c not in tcols_i]
@@ -665,12 +664,11 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if len(bus15) == 0:
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, "infer 时间过滤后无数据")
 
-        # PT/CT 校正（二次侧->一次侧）：质量已在二次侧打分，此后才转一次侧 W
-        # 供特征使用（默认 1.0=不校正，历史行为不变）
-        if pt_ratio != 1.0 or ct_ratio != 1.0:
-            bus15 = apply_pt_ct(bus15, pt_ratio, ct_ratio)
-            log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g）",
-                     user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
+        # PT/CT 校正（二次侧->一次侧 kW）：质量已在二次侧打分，此后才转一次侧 kW
+        # 供特征使用（pt/ct=1.0 时仅功率 W->kW /1000）
+        bus15 = apply_pt_ct(bus15, pt_ratio, ct_ratio)
+        log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g，功率转 kW）",
+                 user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
 
         fc = {**base_cfg.get("features", {}), **(user_cfg.get("features") or {})}
         feat = build_features(bus15, lags=tuple(fc.get("lags", [1, 2, 3, 4])),

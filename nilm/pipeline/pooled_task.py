@@ -123,11 +123,11 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     bus_c = cleaner.transform(bus_raw)
     # PT/CT 变比（与 on_thr_w 同级，默认 1.0=不校正）：总线二次侧->一次侧。
     # 质量打分（BOUNDS 1000V 二次侧 sanity 上限）必须在校正前（二次侧）执行，
-    # 校正推迟至 day_gate 之后、ident/特征/cap 之前（一次侧 W）。
+    # 校正推迟至 day_gate 之后、ident/特征/cap 之前（一次侧 kW）。
     pt_ratio = float(user_cfg.get("pt_ratio", 1.0))
     ct_ratio = float(user_cfg.get("ct_ratio", 1.0))
-    # 分路一次侧单位换算（kW->W 填 1000.0，默认 1.0=W 历史不变）
-    branch_scale = float(user_cfg.get("branch_scale", 1000.0))
+    # 分路一次侧单位换算（到 kW 填 1000.0，默认 1.0=W 历史不变）
+    branch_scale = float(user_cfg.get("branch_scale", 1.0))
 
     branch_c = None
     target = None
@@ -143,7 +143,7 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         branch_c = cleaner.transform(branch_raw)
         if branch_scale != 1.0:
             branch_c = apply_branch_scale(branch_c, branch_scale)
-            log.info("[%s] 分路单位换算 branch_scale=%.4g（kW->W）", user_key, branch_scale)
+            log.info("[%s] 分路单位换算 branch_scale=%.4g（到 kW）", user_key, branch_scale)
         tc = target_col_override or user_cfg.get("target_col")
         target_cols = resolve_target_cols(tc, branch_c)
         invalid_ch = [c for c in branch_c.columns if c not in target_cols]
@@ -158,7 +158,7 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             branch_c = cleaner.transform(branch_raw)
             if branch_scale != 1.0:
                 branch_c = apply_branch_scale(branch_c, branch_scale)
-                log.info("[%s] 分路单位换算 branch_scale=%.4g（kW->W）", user_key, branch_scale)
+                log.info("[%s] 分路单位换算 branch_scale=%.4g（到 kW）", user_key, branch_scale)
             tc = target_col_override or user_cfg.get("target_col")
             try:
                 target_cols = resolve_target_cols(tc, branch_c)
@@ -220,12 +220,11 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         raise PooledTaskError(Status.INSUFFICIENT_TIME_RANGE,
                               f"[{user_key}] 有效数据不足（{len(bus_al)/96:.1f} 天）")
 
-    # PT/CT 校正（二次侧->一次侧）：质量已在二次侧打分，此后才转一次侧 W
-    # 供 ident/特征/cap 使用（默认 1.0=不校正，历史行为不变）
-    if pt_ratio != 1.0 or ct_ratio != 1.0:
-        bus_al = apply_pt_ct(bus_al, pt_ratio, ct_ratio)
-        log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g）",
-                 user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
+    # PT/CT 校正（二次侧->一次侧 kW）：质量已在二次侧打分，此后才转一次侧 kW
+    # 供 ident/特征/cap 使用（pt/ct=1.0 时仅功率 W->kW /1000）
+    bus_al = apply_pt_ct(bus_al, pt_ratio, ct_ratio)
+    log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g，功率转 kW）",
+             user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
 
     ident = {}
     if target is not None:
@@ -414,7 +413,7 @@ def _train_one_fold(pre: dict[str, dict], train_users: list[str], test_users: li
         "on_thr_map": on_thr_map,
         "pt_ct_map": {uk: {"pt_ratio": pre[uk].get("pt_ratio", 1.0),
                            "ct_ratio": pre[uk].get("ct_ratio", 1.0),
-                           "branch_scale": pre[uk].get("branch_scale", 1000.0)} for uk in pre},
+                           "branch_scale": pre[uk].get("branch_scale", 1.0)} for uk in pre},
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     })
     (fold_out / DONE_MARKER).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")

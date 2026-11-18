@@ -24,9 +24,10 @@ def make_bus_df(days: int = 21, start: str = "2026-01-01", seed: int = 0) -> pd.
     n5 = 288 * days
     idx5 = pd.date_range(start, periods=n5, freq="5min")
     t = np.arange(n5)
-    p_total = np.clip(120 + 50 * np.sin(2 * np.pi * (t % 288) / 288)
-                      + 15 * np.sin(2 * np.pi * (t % 96) / 96)
-                      + rng.normal(0, 3, n5), 1.0, None)
+    # kW 口径：总线 raw W（120kW 量级）-> 一次 120kW，与分路 60kW 对齐
+    p_total = np.clip(120000 + 50000 * np.sin(2 * np.pi * (t % 288) / 288)
+                      + 15000 * np.sin(2 * np.pi * (t % 96) / 96)
+                      + rng.normal(0, 3000, n5), 1000.0, None)
     pa = p_total / 3 * (1 + rng.normal(0, 0.02, n5))
     pb = p_total / 3 * (1 + rng.normal(0, 0.02, n5))
     pc = p_total - pa - pb
