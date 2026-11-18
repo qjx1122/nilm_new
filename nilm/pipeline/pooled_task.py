@@ -38,8 +38,9 @@ from nilm.preprocess.align import align_frames, resample_bus
 from nilm.preprocess.clean import Cleaner
 from nilm.preprocess.dataset import DEFAULT_WINDOW, drop_invalid_rows
 from nilm.preprocess.features import build_features
-from nilm.preprocess.normalize import (cap_from_bus, denormalize_target,
-                                       normalize_features, normalize_target)
+from nilm.preprocess.normalize import (apply_pt_ct, cap_from_bus,
+                                       denormalize_target, normalize_features,
+                                       normalize_target)
 from nilm.preprocess.pooled_splits import (assign_pooled_splits, louo_folds,
                                            split_mask_for_index)
 from nilm.preprocess.scaling import TrainFitScaler
@@ -120,6 +121,13 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     cleaner = Cleaner(clip_negative=not allow_negative,
                       max_gap_interp=int(pp.get("max_gap_interp", 2)))
     bus_c = cleaner.transform(bus_raw)
+    # PT/CT 变比校正（与 on_thr_w 同级，默认 1.0=不校正）：总线物理量对齐分路量级
+    pt_ratio = float(user_cfg.get("pt_ratio", 1.0))
+    ct_ratio = float(user_cfg.get("ct_ratio", 1.0))
+    if pt_ratio != 1.0 or ct_ratio != 1.0:
+        bus_c = apply_pt_ct(bus_c, pt_ratio, ct_ratio)
+        log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g）",
+                 user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
 
     branch_c = None
     target = None
@@ -233,6 +241,7 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     return {
         "user_key": user_key, "feat": f, "y_phys": y_phys, "y_norm": y_norm,
         "index": f.index, "cap": cap, "on_thr_w": float(user_cfg["on_thr_w"]),
+        "pt_ratio": pt_ratio, "ct_ratio": ct_ratio,
         "feature_names": [str(c) for c in f.columns],
         "bus_al": bus_al, "branch_al": branch_al, "target_cols": target_cols,
         "ident": ident,
@@ -390,6 +399,8 @@ def _train_one_fold(pre: dict[str, dict], train_users: list[str], test_users: li
         "cap_quantile": float((base_cfg.get("pooled") or {}).get("cap_quantile", 0.95)),
         "caps": {uk: pre[uk]["cap"] for uk in pre},
         "on_thr_map": on_thr_map,
+        "pt_ct_map": {uk: {"pt_ratio": pre[uk].get("pt_ratio", 1.0),
+                           "ct_ratio": pre[uk].get("ct_ratio", 1.0)} for uk in pre},
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     })
     (fold_out / DONE_MARKER).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")

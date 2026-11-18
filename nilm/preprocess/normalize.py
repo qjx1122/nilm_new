@@ -76,3 +76,27 @@ def denormalize_target(y_norm: np.ndarray, cap: float) -> np.ndarray:
 def cap_from_bus(bus: pd.DataFrame, quantile: float = 0.95) -> float:
     """便捷入口：由 15min 总线 DataFrame 计算 cap。"""
     return compute_cap(bus_total(bus), quantile=quantile)
+
+
+def apply_pt_ct(bus: pd.DataFrame, pt_ratio: float = 1.0,
+                ct_ratio: float = 1.0) -> pd.DataFrame:
+    """按 PT/CT 变比校正总线物理量（与 on_thr_w 同级的用户配置）。
+
+    - 电压 ua/ub/uc × pt_ratio；电流 ia/ib/ic × ct_ratio；
+    - 有功 pa/pb/pc/ptotal × (pt_ratio*ct_ratio)（P=U·I 一致）；
+    - pf* 不动（无量纲）；均为 1.0 时原样返回（历史行为不变）。
+    """
+    pt, ct = float(pt_ratio), float(ct_ratio)
+    if pt == 1.0 and ct == 1.0:
+        return bus
+    out = bus.copy()
+    for c in ("ua", "ub", "uc"):
+        if c in out.columns:
+            out[c] = out[c] * pt
+    for c in ("ia", "ib", "ic"):
+        if c in out.columns:
+            out[c] = out[c] * ct
+    for c in ("pa", "pb", "pc", "ptotal"):
+        if c in out.columns:
+            out[c] = out[c] * (pt * ct)
+    return out

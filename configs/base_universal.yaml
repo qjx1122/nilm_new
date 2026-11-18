@@ -55,6 +55,8 @@ pooled:
   val_ratio: 0.2              # train 池内 val 占比
   split_strategy: stratified_by_state
   target_col: p1              # 默认目标通道；CLI --target-col 覆盖；按 target_col 分组训练
+  # PT/CT 变比（与 on_thr_w 同级，time_filters.json 用户级，默认 1.0）：
+  # pt 缩电压、ct 缩电流、有功缩 pt*ct，使总线与分路同量级后再算 cap。
 
 bus_field_map:
   ua:    {ch: 1, column: load_iden_data9,  multiplier: 0.001, unit: V}

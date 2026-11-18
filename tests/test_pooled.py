@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from nilm.preprocess.normalize import (cap_from_bus, compute_cap,
+from nilm.preprocess.normalize import (apply_pt_ct, cap_from_bus, compute_cap,
                                        denormalize_target, normalize_features,
                                        normalize_target)
 from nilm.preprocess.pooled_splits import (assign_pooled_splits, louo_folds,
@@ -167,3 +167,29 @@ def test_pooled_task_smoke(tmp_path):
                             base_cfg, out_root, target_col="p1")
     assert res2.status == "OK", res2.message
     assert (Path(res2.output_dir) / "predictions" / "inference_result.csv").exists()
+
+
+def test_apply_pt_ct():
+    idx = pd.date_range("2026-01-01", periods=2, freq="15min")
+    bus = pd.DataFrame({"ua": [220.0, 220.0], "ia": [10.0, 20.0],
+                        "pa": [2200.0, 4400.0], "pfa": [0.9, 0.9]}, index=idx)
+    out = apply_pt_ct(bus, pt_ratio=2.0, ct_ratio=3.0)
+    assert out["ua"].tolist() == [440.0, 440.0]
+    assert out["ia"].tolist() == [30.0, 60.0]
+    assert out["pa"].tolist() == [13200.0, 26400.0]  # pt*ct=6
+    assert out["pfa"].tolist() == [0.9, 0.9]  # pf 不动
+    # 默认 1.0 不变
+    assert apply_pt_ct(bus)["pa"].tolist() == [2200.0, 4400.0]
+
+
+def test_pt_ct_config_defaults():
+    from nilm.common.contracts import CONFIG_RULES
+    from nilm.pipeline.user_config import resolve_user_config
+    assert CONFIG_RULES["pt_ratio"]["default"] == 1.0
+    assert CONFIG_RULES["ct_ratio"]["default"] == 1.0
+    cfg = {"_default": {"on_thr_w": 10.0}, "800080270001_4200000000001": {"target_col": "p1"}}
+    merged = resolve_user_config("800080270001_4200000000001", cfg)
+    assert merged["pt_ratio"] == 1.0 and merged["ct_ratio"] == 1.0
+    cfg2 = {"800080270001_4200000000001": {"target_col": "p1", "pt_ratio": 2.0, "ct_ratio": 3.0}}
+    merged2 = resolve_user_config("800080270001_4200000000001", cfg2)
+    assert merged2["pt_ratio"] == 2.0 and merged2["ct_ratio"] == 3.0

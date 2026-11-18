@@ -39,6 +39,7 @@ from nilm.preprocess.align import align_frames, estimate_time_offset, resample_b
 from nilm.preprocess.clean import Cleaner
 from nilm.preprocess.dataset import DEFAULT_WINDOW, build_windows, drop_invalid_rows
 from nilm.preprocess.features import build_features
+from nilm.preprocess.normalize import apply_pt_ct
 from nilm.preprocess.scaling import TrainFitScaler
 from nilm.preprocess.splits import build_split_masks
 from nilm.preprocess.target import build_target, resolve_target_cols
@@ -150,6 +151,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         cleaner = Cleaner(clip_negative=not allow_negative,
                           max_gap_interp=int(pp.get("max_gap_interp", 2)))
         bus_c, branch_c = cleaner.transform(bus_raw), cleaner.transform(branch_raw)
+        # PT/CT 变比校正（与 on_thr_w 同级，默认 1.0=不校正）
+        bus_c = apply_pt_ct(bus_c, float(user_cfg.get("pt_ratio", 1.0)),
+                            float(user_cfg.get("ct_ratio", 1.0)))
         save_cleaned = bool(pp.get("save_cleaned_csv", True))
         _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
 
@@ -584,6 +588,8 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         allow_negative = bool(pp.get("allow_negative_power", False))
         bus_c = Cleaner(clip_negative=not allow_negative,
                         max_gap_interp=int(pp.get("max_gap_interp", 2))).transform(bus_raw)
+        bus_c = apply_pt_ct(bus_c, float(user_cfg.get("pt_ratio", 1.0)),
+                            float(user_cfg.get("ct_ratio", 1.0)))
         save_cleaned = bool(pp.get("save_cleaned_csv", True))
         _save_cleaned_csv(out, "bus", bus_c, save_cleaned)
         bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))

@@ -137,6 +137,11 @@ CONFIG_RULES: dict[str, dict] = {
     # field: default, validator 说明（具体校验见 pipeline/user_config.py）
     "target_col":            {"default": None},
     "on_thr_w":              {"default": 10.0, "min": 0.001, "max": 5000.0},
+    # PT/CT 变比（与 on_thr_w 同级，用户级）：总线物理量校正到分路同量级。
+    # pt_ratio 缩电压（ua/ub/uc），ct_ratio 缩电流（ia/ib/ic），
+    # 有功（pa/pb/pc/ptotal）缩 pt*ct；默认 1.0=不校正（历史行为不变）。
+    "pt_ratio":              {"default": 1.0, "min": 0.001, "max": 10000.0},
+    "ct_ratio":              {"default": 1.0, "min": 0.001, "max": 10000.0},
     "split_ratios":          {"default": [0.6, 0.2, 0.2]},
     "split_strategy":        {"default": "stratified_day", "choices": SPLIT_STRATEGIES},
     "post_min_on":           {"default": 1, "min": 0},

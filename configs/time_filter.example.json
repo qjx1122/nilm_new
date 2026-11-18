@@ -2,6 +2,8 @@
   "800080270708_4206602981958": {
     "target_col": "p1+p2",
     "on_thr_w": 50.0,
+    "pt_ratio": 1.0,
+    "ct_ratio": 1.0,
     "split_ratios": [0.70, 0.15, 0.15],
     "split_strategy": "global_stratified",
     "post_min_on": 2,
@@ -25,6 +27,8 @@
   },
   "_default": {
     "on_thr_w": 10.0,
+    "pt_ratio": 1.0,
+    "ct_ratio": 1.0,
     "split_ratios": [0.6, 0.2, 0.2],
     "split_strategy": "stratified_day"
   }
