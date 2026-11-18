@@ -142,6 +142,9 @@ CONFIG_RULES: dict[str, dict] = {
     # 有功（pa/pb/pc/ptotal）缩 pt*ct；默认 1.0=不校正（历史行为不变）。
     "pt_ratio":              {"default": 1.0, "min": 0.001, "max": 10000.0},
     "ct_ratio":              {"default": 1.0, "min": 0.001, "max": 10000.0},
+    # 分路一次侧单位换算（与 on_thr_w 同级，用户级）：分路 CSV 单位为 kW 时填 1000.0
+    # 转为 W 与总线一次侧 W 对齐；默认 1.0=W 历史行为不变。仅缩功率列（pN）。
+    "branch_scale":          {"default": 1.0, "min": 0.001, "max": 10000.0},
     "split_ratios":          {"default": [0.6, 0.2, 0.2]},
     "split_strategy":        {"default": "stratified_day", "choices": SPLIT_STRATEGIES},
     "post_min_on":           {"default": 1, "min": 0},

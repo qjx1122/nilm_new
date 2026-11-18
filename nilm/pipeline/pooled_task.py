@@ -38,9 +38,9 @@ from nilm.preprocess.align import align_frames, resample_bus
 from nilm.preprocess.clean import Cleaner
 from nilm.preprocess.dataset import DEFAULT_WINDOW, drop_invalid_rows
 from nilm.preprocess.features import build_features
-from nilm.preprocess.normalize import (apply_pt_ct, cap_from_bus,
-                                       denormalize_target, normalize_features,
-                                       normalize_target)
+from nilm.preprocess.normalize import (apply_branch_scale, apply_pt_ct,
+                                       cap_from_bus, denormalize_target,
+                                       normalize_features, normalize_target)
 from nilm.preprocess.pooled_splits import (assign_pooled_splits, louo_folds,
                                            split_mask_for_index)
 from nilm.preprocess.scaling import TrainFitScaler
@@ -121,13 +121,13 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     cleaner = Cleaner(clip_negative=not allow_negative,
                       max_gap_interp=int(pp.get("max_gap_interp", 2)))
     bus_c = cleaner.transform(bus_raw)
-    # PT/CT 变比校正（与 on_thr_w 同级，默认 1.0=不校正）：总线物理量对齐分路量级
+    # PT/CT 变比（与 on_thr_w 同级，默认 1.0=不校正）：总线二次侧->一次侧。
+    # 质量打分（BOUNDS 1000V 二次侧 sanity 上限）必须在校正前（二次侧）执行，
+    # 校正推迟至 day_gate 之后、ident/特征/cap 之前（一次侧 W）。
     pt_ratio = float(user_cfg.get("pt_ratio", 1.0))
     ct_ratio = float(user_cfg.get("ct_ratio", 1.0))
-    if pt_ratio != 1.0 or ct_ratio != 1.0:
-        bus_c = apply_pt_ct(bus_c, pt_ratio, ct_ratio)
-        log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g）",
-                 user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
+    # 分路一次侧单位换算（kW->W 填 1000.0，默认 1.0=W 历史不变）
+    branch_scale = float(user_cfg.get("branch_scale", 1.0))
 
     branch_c = None
     target = None
@@ -141,6 +141,9 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             raise PooledTaskError(Status.DATA_MISSING_BRANCH_LABEL,
                                   f"[{user_key}] " + "; ".join(branch_schema["issues"]))
         branch_c = cleaner.transform(branch_raw)
+        if branch_scale != 1.0:
+            branch_c = apply_branch_scale(branch_c, branch_scale)
+            log.info("[%s] 分路单位换算 branch_scale=%.4g（kW->W）", user_key, branch_scale)
         tc = target_col_override or user_cfg.get("target_col")
         target_cols = resolve_target_cols(tc, branch_c)
         invalid_ch = [c for c in branch_c.columns if c not in target_cols]
@@ -153,6 +156,9 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if scan.branch_files:
             branch_raw, _ = CsvBranchLoader().load(scan.branch_files, sentinels=sentinels)
             branch_c = cleaner.transform(branch_raw)
+            if branch_scale != 1.0:
+                branch_c = apply_branch_scale(branch_c, branch_scale)
+                log.info("[%s] 分路单位换算 branch_scale=%.4g（kW->W）", user_key, branch_scale)
             tc = target_col_override or user_cfg.get("target_col")
             try:
                 target_cols = resolve_target_cols(tc, branch_c)
@@ -214,6 +220,13 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         raise PooledTaskError(Status.INSUFFICIENT_TIME_RANGE,
                               f"[{user_key}] 有效数据不足（{len(bus_al)/96:.1f} 天）")
 
+    # PT/CT 校正（二次侧->一次侧）：质量已在二次侧打分，此后才转一次侧 W
+    # 供 ident/特征/cap 使用（默认 1.0=不校正，历史行为不变）
+    if pt_ratio != 1.0 or ct_ratio != 1.0:
+        bus_al = apply_pt_ct(bus_al, pt_ratio, ct_ratio)
+        log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g）",
+                 user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
+
     ident = {}
     if target is not None:
         try:
@@ -241,7 +254,7 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     return {
         "user_key": user_key, "feat": f, "y_phys": y_phys, "y_norm": y_norm,
         "index": f.index, "cap": cap, "on_thr_w": float(user_cfg["on_thr_w"]),
-        "pt_ratio": pt_ratio, "ct_ratio": ct_ratio,
+        "pt_ratio": pt_ratio, "ct_ratio": ct_ratio, "branch_scale": branch_scale,
         "feature_names": [str(c) for c in f.columns],
         "bus_al": bus_al, "branch_al": branch_al, "target_cols": target_cols,
         "ident": ident,
@@ -400,7 +413,8 @@ def _train_one_fold(pre: dict[str, dict], train_users: list[str], test_users: li
         "caps": {uk: pre[uk]["cap"] for uk in pre},
         "on_thr_map": on_thr_map,
         "pt_ct_map": {uk: {"pt_ratio": pre[uk].get("pt_ratio", 1.0),
-                           "ct_ratio": pre[uk].get("ct_ratio", 1.0)} for uk in pre},
+                           "ct_ratio": pre[uk].get("ct_ratio", 1.0),
+                           "branch_scale": pre[uk].get("branch_scale", 1.0)} for uk in pre},
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     })
     (fold_out / DONE_MARKER).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")

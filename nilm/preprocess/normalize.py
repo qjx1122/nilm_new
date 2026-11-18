@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from nilm.common.logging import get_logger
-from nilm.common.schema import bus_total
+from nilm.common.schema import bus_total, is_power_column
 
 log = get_logger("preprocess.normalize")
 
@@ -99,4 +99,20 @@ def apply_pt_ct(bus: pd.DataFrame, pt_ratio: float = 1.0,
     for c in ("pa", "pb", "pc", "ptotal"):
         if c in out.columns:
             out[c] = out[c] * (pt * ct)
+    return out
+
+
+def apply_branch_scale(branch: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
+    """分路一次侧单位换算（与 on_thr_w 同级的用户配置 branch_scale）。
+
+    分路 CSV 单位为 kW 时填 1000.0 转为 W，与总线一次侧 W 对齐；
+    仅缩功率列（pN/pa/pb/pc/ptotal），为 1.0 时原样返回（历史行为不变）。
+    """
+    s = float(scale)
+    if s == 1.0:
+        return branch
+    out = branch.copy()
+    for c in list(out.columns):
+        if is_power_column(c):
+            out[c] = out[c] * s
     return out

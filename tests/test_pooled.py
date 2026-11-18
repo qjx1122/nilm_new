@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from nilm.preprocess.normalize import (apply_pt_ct, cap_from_bus, compute_cap,
+from nilm.preprocess.normalize import (apply_branch_scale, apply_pt_ct,
+                                       cap_from_bus, compute_cap,
                                        denormalize_target, normalize_features,
                                        normalize_target)
 from nilm.preprocess.pooled_splits import (assign_pooled_splits, louo_folds,
@@ -193,3 +194,39 @@ def test_pt_ct_config_defaults():
     cfg2 = {"800080270001_4200000000001": {"target_col": "p1", "pt_ratio": 2.0, "ct_ratio": 3.0}}
     merged2 = resolve_user_config("800080270001_4200000000001", cfg2)
     assert merged2["pt_ratio"] == 2.0 and merged2["ct_ratio"] == 3.0
+
+
+def test_apply_branch_scale():
+    idx = pd.date_range("2026-01-01", periods=2, freq="15min")
+    br = pd.DataFrame({"p2": [0.5, 1.0], "p1": [0.2, 0.3]}, index=idx)
+    out = apply_branch_scale(br, scale=1000.0)
+    assert out["p2"].tolist() == [500.0, 1000.0]
+    assert out["p1"].tolist() == [200.0, 300.0]
+    # 默认 1.0 不变
+    assert apply_branch_scale(br)["p2"].tolist() == [0.5, 1.0]
+
+
+def test_branch_scale_config_defaults():
+    from nilm.common.contracts import CONFIG_RULES
+    from nilm.pipeline.user_config import resolve_user_config
+    assert CONFIG_RULES["branch_scale"]["default"] == 1.0
+    cfg = {"_default": {"on_thr_w": 10.0}, "800080270001_4200000000001": {"target_col": "p1"}}
+    merged = resolve_user_config("800080270001_4200000000001", cfg)
+    assert merged["branch_scale"] == 1.0
+    cfg2 = {"800080270001_4200000000001": {"target_col": "p1", "branch_scale": 1000.0}}
+    merged2 = resolve_user_config("800080270001_4200000000001", cfg2)
+    assert merged2["branch_scale"] == 1000.0
+
+
+def test_quality_before_ptct():
+    """质量在二次侧打分：二次 100V 通过、一次 10000V 超 BOUNDS 1000V 失败。"""
+    from nilm.data_io.validator import daily_quality_table
+    idx = pd.date_range("2026-01-01", periods=96, freq="15min")
+    bus_sec = pd.DataFrame({"ua": [100.0] * 96, "ia": [5.0] * 96,
+                            "pa": [500.0] * 96, "pfa": [0.95] * 96}, index=idx)
+    br = pd.DataFrame({"p2": [500.0] * 96}, index=idx)
+    q_sec = daily_quality_table(bus_sec, br, 96, 70, False)
+    assert int(q_sec["qualified"].sum()) == 1
+    bus_pri = apply_pt_ct(bus_sec, pt_ratio=100.0, ct_ratio=120.0)
+    q_pri = daily_quality_table(bus_pri, br, 96, 70, False)
+    assert int(q_pri["qualified"].sum()) == 0
