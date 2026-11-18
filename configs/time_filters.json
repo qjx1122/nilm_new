@@ -1,9 +1,9 @@
 {
   "800080252842_4206894986488": {
     "target_col": "p1",
-    "on_thr_w": 0.05,
+    "on_thr_w": 50.0,
     "post_min_on": 8,
-    "decision_thr_w": 0.05,
+    "decision_thr_w": 50.0,
     "splits": {
       "train": {
         "include": []
@@ -29,7 +29,7 @@
     },
     "pt_ratio": 1.0,
     "ct_ratio": 1.0,
-    "branch_scale": 0.001
+    "branch_scale": 1.0
   },
   "800080252844_4206894986488": {
     "target_col": "p2",
@@ -128,7 +128,7 @@
   },
   "800080270789_4206680982373": {
     "target_col": "p1+p2",
-    "on_thr_w": 0.06,
+    "on_thr_w": 60.0,
     "splits": {
       "train": {
         "include": []
@@ -168,11 +168,11 @@
     },
     "pt_ratio": 1.0,
     "ct_ratio": 1.0,
-    "branch_scale": 0.001
+    "branch_scale": 1.0
   },
   "800080270800_4200904302272": {
     "target_col": "p1",
-    "on_thr_w": 0.05,
+    "on_thr_w": 50.0,
     "_note_splits": "2026-09-02 重划分：训练窗 05-21~06-29 共 40 有效天(开机17/全关23)，splits 显式锚定保证各子集开/关机日均衡——train 24(开10/关14)、val 8(开3/关5)、test 8(开4/关4)；旧训练窗 6 天全开机日致条件缺失(transformer 全关天全误报)",
     "splits": {
       "train": {
@@ -302,14 +302,14 @@
         ]
       ]
     },
-    "decision_thr_w": 0.03,
+    "decision_thr_w": 30.0,
     "_note_0800_thr30_20260917": "2026-09-17 0800重分析：test峰30(F1 0.614 vs 50的0.605) infer峰10/30(F1 0.787/0.783 vs 50的0.554) 生产50踩谷底；decision 30为test/infer折中（R 0.988/0.821 vs 50的0.883/0.418），多模型回退(A1)并行验证",
     "_OQ16_PAUSED": "2026-09-17 用户核实：该户分路数据不在p1/p2/p3，原target p1(40天hand-anchor/decision30/lag5/OFF8)全量历史结论降级为错误目标参考（同OQ-13），target待重定（如p4待查），暂时不对0800做分析",
     "_OQ16_action": "PAUSED: batch 5户全量改4户（2842/2844/778/789），执行包见 EXECUTION_PACKAGE_4USERS_OPTIMAL_20260917.md；历史 ANALYSIS_0800_* 12篇保留但不作为现行基线",
     "_status": "PAUSED_OQ16",
     "pt_ratio": 1.0,
     "ct_ratio": 1.0,
-    "branch_scale": 0.001
+    "branch_scale": 1.0
   },
   "_default": {
     "train": {
