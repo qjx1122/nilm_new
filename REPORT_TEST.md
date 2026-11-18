@@ -1029,3 +1029,26 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 - 遗留问题：①2842单户回退`lags[1,2,3,4]`追0.989峰值是否白名单；②`audit_user_run`多模型阈值自描述修复；③800 PAUSED待p4重定
 - 原落盘文件：`docs/ANALYSIS_4USERS_OPTIMAL_RESULTS_20260917.md`（已回填归档，本节为权威载体）
 
+
+## [2026-11-18] 专题：pooled泛化重验（kW口径+PT/CT，p2 2844/778 LOO）
+
+- 类型：验证专题（模式B，PT/CT+branch_scale+kW后重验）
+- 目标与假设：
+  - 验证 `PT/CT(100/120,100/150)+branch_scale=1.0+kW` 校正后，pooled `cap` 归一能否实现零样本泛化（LOO `f1_mean 0.85/f1_min 0.75/r2_mean 0.6`）
+  - 假设：总线一次侧 `kW` 与分路一次侧 `kW` 对齐后，`R2 -17` 收敛至 `>-0.5`
+- 方法 / 数据 / 参数：
+  - 配置：`time_filters.json` 2844 `pt100/ct120/branch1.0/on10/dec30kW`、778 `pt100/ct150(实跑160)/branch1.0/on50kW`；`base_universal.yaml`（ridge+transformer，`cap_quantile 0.95`，`stratified_by_state`）
+  - 数据：`data/trains 15目录/合法12`、`data/infers 38/37`；2844 `cap5099.6kW/n4314`（70无效+3 day_gate）、778 `cap5441.1kW/n2581`
+  - 产物：非LOO `outputs/universal/p2/train/20261118_153628`、LOO `20261118_153736`、零样本 `infer/20261118_153914/153938`
+- 用户执行命令（含实录路径；PowerShell，RTX3080 test_gpu）：
+  - `python scripts/precheck_pooled.py`（期望2844 `100/120/1.0/10/30/p2`、778 `100/120/1.0/50/None/p2`；实测778 `ct150`，实跑 `ct160`，以实跑为准）
+  - `python scripts/run_pooled.py --time-filter-config configs/time_filters.json --base-config configs/base_universal.yaml --target-col p2 --stage train --users 800080252844_4206894986488 800080270778_4200903422131`
+  - `python scripts/run_pooled.py --time-filter-config configs/time_filters.json --base-config configs/base_universal.yaml --target-col p2 --stage train --loo --users 800080252844_4206894986488 800080270778_4200903422131`
+  - `python scripts/run_pooled.py --time-filter-config configs/time_filters.json --base-config configs/base_universal.yaml --target-col p2 --stage infer --user-key 800080270856_4206810972139 --universal-dir "outputs\universal\p2\train\$ts"`（`$ts` 为非LOO `20261118_153628`）
+- 结果 / 结论：
+  - **非LOO（20261118_153628）**：ridge train `F1 0.7677/R2 0.8553`、transformer train `0.9592/0.9597` val `0.8033/0.6508`（早停ep46）；逐户 transformer val 2844 `0.6821`、778 `0.9244`。与上轮 `W` 口径（ridge `0.7657/0.8388`、transformer `0.8457/0.9338` val `0.8041/0.6357`）持平或微优，无回归；`PT/CT` 日志在 `day_gate` 后、`cap≈5100kW`（`425×12` 互证）。
+  - **LOO（20261118_153736）未达标**：ridge `mean 0.498/min 0.477/R2 -4.696`（上轮 `0.484/0.450/-9.13`，`R2 +4.43`）；transformer `mean 0.284/min 0.0/R2 -0.282`（上轮 `0.368/0.180/-0.496`，`R2 +0.21` 但 `F1 -0.084` 且留778折坍缩 `TP0/FN1295`）。留2844 ridge `0.5188/-9.082`（上轮 `0.5186/-17.865`，`R2 +8.78`）、transformer `0.5684/+0.137`（上轮 `0.5564/-0.385`，`R2 +0.52`）；留778 ridge `0.4774/-0.310`（上轮 `0.450/-0.396`）、transformer `0.0/-0.701`（上轮 `0.180/-0.607` 坍缩）。
+  - **判读**：`PT/CT+kW` 修复量级（`R2 -17→-9`、`-0.38→+0.14`），但 `F1` 仍 `0.28-0.50<0.85`，`n=2` 时 `LOO=单户训练` + `on_thr 10 vs 50kW` 档差使 `cap` 归一不足以跨档泛化。当前方案不具零样本泛化能力，不得合入生产；待 `A扩池（同档多户）/B分组（按on_thr档）` 拍板。
+  - **零样本（856）**：`OK model=transformer n=1627`（`pt100/ct60`，9无效+7 day_gate）；离线指标未贴，待回收 `offline_metrics.json` 判读。
+- 是否进入 REPORT.md：否（未达标，不入稳定结论）
+- 遗留问题：①778 `ct150 vs 160` 以实跑 `160` 为准，预检期望文本待同步；②`_default` 缺 `pt/ct/branch` 键（靠默认 `1.0` 兜底，建议补显式）；③856离线指标待贴；④`A扩池/B分组` 待拍板
