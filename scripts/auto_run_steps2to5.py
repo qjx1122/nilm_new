@@ -44,16 +44,31 @@ def sh(cmd, **kw):
     return rc
 
 def _write_overlay(tf_path: Path, cfg: dict, user_key: str) -> Path:
-    """把覆盖后的配置写入临时 overlay 文件（原 time_filters.json 永不修改）。"""
+    """把覆盖后的配置写入临时 overlay 文件（已有用户覆盖时用，原文件不动）。"""
     overlay = tf_path.parent / f"{tf_path.stem}.overlay.{user_key}.json"
     overlay.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     return overlay
 
-def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None, decision_thr=None) -> Path:
-    """脚本参数优先于 time_filters.json，但不写回原文件。
+def _write_cfg_with_backup(tf_path: Path, cfg: dict) -> Path:
+    """新用户补配置时备份原文件后写回（Windows 下 rename 目标已存在会 FileExistsError(183)，用时间戳+replace 兜底）"""
+    bak = tf_path.with_suffix(".bak.auto")
+    if bak.exists():
+        from datetime import datetime
+        bak = tf_path.with_suffix(f".bak.auto.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        if bak.exists():
+            bak.unlink()
+    try:
+        tf_path.rename(bak)
+    except FileExistsError:
+        tf_path.replace(bak)
+    tf_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return bak
 
-    返回本次运行实际使用的配置路径：无覆盖时返回原文件；有覆盖（或新用户）
-    时返回临时 overlay 文件（原文件不动）。target_col/on_thr/decision_thr
+def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None, decision_thr=None) -> Path:
+    """已有用户：脚本参数优先但不写回（overlay）；新用户：补原文件（带备份）。
+
+    返回本次运行实际使用的配置路径：已有用户无覆盖返回原文件，有覆盖返回
+    overlay；新用户写回原文件后返回原文件。target_col/on_thr/decision_thr
     为 None 表示未传，沿用配置值；新用户未传则用默认 p1/10/30。
     """
     cfg = json.loads(tf_path.read_text(encoding="utf-8"))
@@ -84,10 +99,10 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         "train": {"include": [["2025-07-10","2026-06-30"]]},
         "infer": {"include": [["2026-07-01","2026-07-31"]]}
     }
-    overlay = _write_overlay(tf_path, cfg, user_key)
-    log(f"新用户 {user_key} → 临时 overlay 补配置（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} dec={cfg[user_key]['decision_thr_w']}），原文件未动，用 {overlay.name}", "WARN")
-    log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）；需持久化请手动并入 time_filters.json", "WARN")
-    return overlay
+    bak = _write_cfg_with_backup(tf_path, cfg)
+    log(f"新用户 {user_key} → 已补原 time_filters.json（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} dec={cfg[user_key]['decision_thr_w']}），原文件备份 {bak.name}", "WARN")
+    log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）", "WARN")
+    return tf_path
 
 def step2_train(user_key, tf, base, data_root, out_root, force):
     cmd = [sys.executable, "scripts/run_batch_users.py",
