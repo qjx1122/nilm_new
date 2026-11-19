@@ -40,7 +40,6 @@ preprocess:
   save_cleaned_csv: false
   min_overlap: 0.3
   agg_strategy: {u: mean, i: mean, p: mean, pf: recompute}
-  scaler_clip: null  # pooled 暂不截断，待单用户验证后同步（null=不截断）
 
 features:
   lags: [5, 1, 2, 3, 4]

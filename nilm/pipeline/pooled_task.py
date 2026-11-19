@@ -335,8 +335,7 @@ def _train_one_fold(pre: dict[str, dict], train_users: list[str], test_users: li
     m_test = split_arr == "test"
     if m_train.sum() == 0:
         raise PooledTaskError(Status.INSUFFICIENT_TIME_RANGE, f"[{fold_tag}] train 为空")
-    scaler_clip = (base_cfg.get("preprocess", {}) or {}).get("scaler_clip", None)
-    scaler = TrainFitScaler(clip=scaler_clip).fit(X[m_train], cols=scale_cols)
+    scaler = TrainFitScaler().fit(X[m_train], cols=scale_cols)
     Xs = scaler.transform(X)
 
     metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae", "f1"])

@@ -374,8 +374,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         # Scaler 只由 Train 拟合（§11）；日历列不缩放
         scale_cols = [i for i, c in enumerate(names) if c not in NON_SCALED_COLS]
-        scaler_clip = (base_cfg.get("preprocess", {}) or {}).get("scaler_clip", None)
-        scaler = TrainFitScaler(clip=scaler_clip).fit(splits["train"][0], cols=scale_cols)
+        scaler = TrainFitScaler().fit(splits["train"][0], cols=scale_cols)
         scaled = {k: (scaler.transform(v[0]), v[1], v[2]) for k, v in splits.items()}
 
         # §10 窗口样本索引落盘（默认 Seq2Seq）
