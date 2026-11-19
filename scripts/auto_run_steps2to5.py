@@ -64,12 +64,13 @@ def _write_cfg_with_backup(tf_path: Path, cfg: dict) -> Path:
     tf_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     return bak
 
-def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None, decision_thr=None) -> Path:
+def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None,
+                       decision_thr=None, pbus_mode=None) -> Path:
     """已有用户：脚本参数优先但不写回（overlay）；新用户：补原文件（带备份）。
 
     返回本次运行实际使用的配置路径：已有用户无覆盖返回原文件，有覆盖返回
-    overlay；新用户写回原文件后返回原文件。target_col/on_thr/decision_thr
-    为 None 表示未传，沿用配置值；新用户未传则用默认 p1/10/30。
+    overlay；新用户写回原文件后返回原文件。target_col/on_thr/decision_thr/pbus_mode
+    为 None 表示未传，沿用配置值；新用户未传则用默认 p1/10/30/raw。
     """
     cfg = json.loads(tf_path.read_text(encoding="utf-8"))
     if user_key in cfg:
@@ -81,8 +82,11 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
             updates["on_thr_w"] = on_thr
         if decision_thr is not None and cur.get("decision_thr_w") != decision_thr:
             updates["decision_thr_w"] = decision_thr
+        eff_cur_pbus = cur.get("pbus_mode") or "raw"
+        if pbus_mode is not None and eff_cur_pbus != pbus_mode:
+            updates["pbus_mode"] = pbus_mode
         if not updates:
-            log(f"time_filters.json 已含 {user_key} → 沿用（target={cur.get('target_col')} on={cur.get('on_thr_w')} dec={cur.get('decision_thr_w')})")
+            log(f"time_filters.json 已含 {user_key} → 沿用（target={cur.get('target_col')} on={cur.get('on_thr_w')} dec={cur.get('decision_thr_w')} pbus_mode={eff_cur_pbus})")
             return tf_path
         old = {k: cur.get(k) for k in updates}
         cur.update(updates)
@@ -93,6 +97,7 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         "target_col": target_col if target_col is not None else "p1",
         "on_thr_w": on_thr if on_thr is not None else 10.0,
         "decision_thr_w": decision_thr if decision_thr is not None else 30.0,
+        "pbus_mode": pbus_mode if pbus_mode is not None else "raw",
         "post_min_on": 1,
         "post_fill_short_off": 3,
         "quality": {"day_gate": True, "min_on_day_ratio": 0.2},
@@ -100,7 +105,7 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         "infer": {"include": [["2026-07-01","2026-07-31"]]}
     }
     bak = _write_cfg_with_backup(tf_path, cfg)
-    log(f"新用户 {user_key} → 已补原 time_filters.json（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} dec={cfg[user_key]['decision_thr_w']}），原文件备份 {bak.name}", "WARN")
+    log(f"新用户 {user_key} → 已补原 time_filters.json（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} dec={cfg[user_key]['decision_thr_w']} pbus_mode={cfg[user_key]['pbus_mode']}），原文件备份 {bak.name}", "WARN")
     log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）", "WARN")
     return tf_path
 
@@ -198,6 +203,8 @@ def main(argv=None):
     ap.add_argument("--target-col", default=None, help="目标通道；已传且与 time_filters.json 不同则用 overlay 覆盖跑（不写回原文件），未传沿用（新用户默认 p1）")
     ap.add_argument("--on-thr", type=float, default=None, help="on_thr_w；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 10.0）")
     ap.add_argument("--decision-thr", type=float, default=None, help="decision_thr_w；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 30.0）")
+    ap.add_argument("--pbus-mode", choices=["raw", "scaled"], default=None,
+                    help="pbus_mode（raw=pbus未缩放+分摊，默认；scaled=pbus z-score+改学，大厂/多分路求和用）")
     ap.add_argument("--stage", choices=["all","train","infer","threshold"], default="all", help="all=2+3+5+4 完整，threshold=仅 Step4")
     ap.add_argument("--force", action="store_true", help="--force 忽略 _DONE 重跑")
     ap.add_argument("--skip-train", action="store_true", help="跳过 Step2（已有训练）")
@@ -214,7 +221,8 @@ def main(argv=None):
 
     effective_tf = tf
     if args.stage in ("all","train","infer"):
-        effective_tf = ensure_user_config(user_key, tf, args.target_col, args.on_thr, args.decision_thr)
+        effective_tf = ensure_user_config(user_key, tf, args.target_col, args.on_thr,
+                                          args.decision_thr, args.pbus_mode)
 
     if args.stage in ("all","train") and not args.skip_train:
         step2_train(user_key, effective_tf, base, data_root, out_root, args.force)

@@ -131,6 +131,7 @@ python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/420000
   "target_col": "p2",
   "on_thr_w": 10.0,
   "decision_thr_w": 30.0,
+  "pbus_mode": "raw",
   "post_min_on": 1,
   "post_fill_short_off": 3,
   "quality": {"day_gate": true, "min_on_day_ratio": 0.2},
@@ -140,6 +141,7 @@ python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/420000
 ```
 
 * `target_col` 必填，`on_thr` 看铭牌（10/50/60 三档：`p2`低频10，`p1`高功率50），`decision` 先 30。
+* `pbus_mode` 按户选双路径（默认 `"raw"`）：小厂大占比单路（总线/目标均值比 `<3`，如 856）用 `"raw"`（`pbus` 未缩放 + `proportional` 物理分摊，跨期抗漂移）；大厂小占比或多分路求和（总线/目标均值比 `>5` 或 `p1+p2+...` 求和，如 733）用 `"scaled"`（`pbus` z-score + `proportional` 线性改学）。切换 `pbus_mode` 后必须加 `--force` 重训重推。
 * `post_min_on 1` 去 <1 窗的抖动（恒空操作，防短闪），`post_fill_short_off 3` 填 ≤45min 的短关断。
 * `day_gate true` 全局默认（优先级 `day > train_range > full`），`min_on_day_ratio 0.2` 防“无可学开机模式”（2844旧池 31%→71%已验）。
 * `train/include` 为闭区间，`YYYY-MM-DD` 自动扩到 00:00-23:59:59。

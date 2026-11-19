@@ -107,17 +107,60 @@ class HistoryProfile(BaseModel):
 
 @MODEL_REGISTRY.register("proportional")
 class ProportionalAllocation(BaseModel):
-    """按训练集功率占比把母线总有功 pbus 分摊到各目标。需要特征列 ``pbus``。"""
+    """母线总有功 pbus 基线（双路径，与用户级 ``pbus_mode`` 联动）：
+
+    - ``mode="raw"``（默认，物理占比分摊，别名 ``"share"``）：
+      ``pred = clip(pbus × share, 0)``，要求 ``pbus`` 未做 z-score 缩放。
+    - ``mode="scaled"``（方向2线性改学，别名 ``"linear"``）：
+      在标准化 ``pbus`` 上最小二乘拟合 ``y ≈ a·pbus_z + b``，``pred = clip(a·p + b, 0)``；
+      ``pbus`` 常数（方差≈0）时回退目标均值，避免除零，也不再因物理分摊对求和目标崩盘。
+    需要特征列 ``pbus``。
+    """
 
     name = "proportional"
+    _MODE_ALIASES = {"raw": "raw", "share": "raw",
+                     "scaled": "scaled", "linear": "scaled"}
+
+    def __init__(self, mode: str = "raw", **params) -> None:
+        if not isinstance(mode, str) or mode not in self._MODE_ALIASES:
+            raise ValueError(
+                f"proportional.mode 仅支持 raw/scaled（或别名 share/linear）: {mode!r}")
+        norm_mode = self._MODE_ALIASES[mode]
+        super().__init__(mode=norm_mode, **params)
+        self.mode = norm_mode
 
     def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
             index=None, val_index=None) -> None:  # index 仅为接口一致（W-1），不使用
         self._p_idx = _col_index(feature_names, "pbus")
-        total = float(y.sum())
-        self._shares = y.sum(axis=0) / total if total > 0 else np.full(y.shape[1], 1.0 / y.shape[1])
+        if self.mode == "scaled":
+            p = np.asarray(X, dtype=np.float64)[:, self._p_idx]
+            Y = np.asarray(y, dtype=np.float64)
+            if Y.ndim == 1:
+                Y = Y[:, None]
+            self._n_out = Y.shape[1]
+            self._b = Y.mean(axis=0) if len(Y) else np.zeros(self._n_out)
+            self._a = np.zeros(self._n_out)
+            if len(p):
+                pm = float(p.mean())
+                pc = p - pm
+                denom = float(pc @ pc)
+                if denom > 1e-12:
+                    self._a = (pc @ (Y - self._b)) / denom
+                    self._b = self._b - self._a * pm
+        else:
+            total = float(y.sum())
+            self._shares = (y.sum(axis=0) / total if total > 0
+                            else np.full(y.shape[1], 1.0 / y.shape[1]))
 
     def predict(self, X, index=None) -> np.ndarray:  # index 仅为接口一致（W-1），不使用
+        mode = getattr(self, "mode", None)
+        if mode is None:
+            # 兼容历史 pickle：按已拟合属性自动识别（_a 为改学版，否则为物理分摊版）
+            mode = "scaled" if hasattr(self, "_a") else "raw"
+        if mode == "scaled":
+            p = np.asarray(X, dtype=np.float64)[:, self._p_idx]
+            out = p[:, None] * self._a[None, :] + self._b[None, :]
+            return np.clip(out, 0.0, None)
         p_bus = X[:, self._p_idx]
         return np.clip(p_bus[:, None] * self._shares[None, :], 0.0, None)
 

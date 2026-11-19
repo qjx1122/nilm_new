@@ -50,10 +50,32 @@ log = get_logger("pipeline.user_task")
 DONE_MARKER = "_DONE"
 NON_SCALED_COLS = {"slot", "hour", "minute", "day_of_week", "is_weekend",
                    "month", "day_of_year",
-                   # pbus 保持物理量纲（W）不缩放：基线模型（proportional 等）按列名
-                   # 取用其物理值——曾因被 z-score 标准化（中位≈0）+ clip(0) 导致
-                   # proportional 预测恒≈0、F1 全 0（2026-08-18 修复，2842 户实证）
+                   # 默认（pbus_mode="raw"）保持 pbus 不缩放：基线 proportional 走物理分摊
+                   # （2026-08-18 修复 2842 pred=share×z(pbus)→F1=0 缺陷，856 跨期稳健）。
+                   # pbus_mode="scaled" 时由 _non_scaled_cols 移出 pbus 做 z-score，并联动
+                   # proportional 走线性改学（y≈a·pbus_z+b，733 大厂/多分路求和目标适用）。
                    "pbus"}
+NON_SCALED_COLS_SCALED = NON_SCALED_COLS - {"pbus"}
+
+
+def _non_scaled_cols(pbus_mode: str) -> set[str]:
+    """按用户级 pbus_mode 返回不参与 z-score 缩放的特征列名集合。"""
+    if pbus_mode == "scaled":
+        return NON_SCALED_COLS_SCALED
+    if pbus_mode == "raw":
+        return NON_SCALED_COLS
+    raise ValueError(f"未知 pbus_mode={pbus_mode!r}（仅支持 'raw' / 'scaled'）")
+
+
+def _infer_trained_pbus_mode(meta: dict) -> str:
+    """从训练 meta 识别该模型的 pbus_mode（兼容无 pbus_mode 字段的历史产物）。"""
+    if meta.get("pbus_mode") in ("raw", "scaled"):
+        return str(meta["pbus_mode"])
+    fnames = meta.get("feature_names") or []
+    if "pbus" in fnames:
+        p_idx = fnames.index("pbus")
+        return "scaled" if p_idx in (meta.get("scale_cols") or []) else "raw"
+    return "raw"
 
 
 class UserTaskError(Exception):
@@ -372,8 +394,13 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                            daily_quality=daily_q, advice=advice,
                            qualified_detail=q_detail)  # 重写含双达标统计
 
-        # Scaler 只由 Train 拟合（§11）；日历列不缩放
-        scale_cols = [i for i, c in enumerate(names) if c not in NON_SCALED_COLS]
+        # Scaler 只由 Train 拟合（§11）；按用户级 pbus_mode 选择 pbus 是否参与 z-score
+        pbus_mode = str(user_cfg.get("pbus_mode") or "raw")
+        non_scaled = _non_scaled_cols(pbus_mode)
+        log.info("[%s] pbus_mode=%s（%s）", user_key, pbus_mode,
+                 "pbus z-score + proportional 线性改学"
+                 if pbus_mode == "scaled" else "pbus 未缩放 + proportional 物理分摊")
+        scale_cols = [i for i, c in enumerate(names) if c not in non_scaled]
         scaler = TrainFitScaler().fit(splits["train"][0], cols=scale_cols)
         scaled = {k: (scaler.transform(v[0]), v[1], v[2]) for k, v in splits.items()}
 
@@ -410,11 +437,22 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         mp_override = user_cfg.get("model_params") or {}
         for spec in base_cfg.get("models", []):
             name, params = spec["name"], dict(spec.get("params", {}))
+            # pbus_mode 双路径联动：proportional 默认跟随 pbus_mode（raw->分摊, scaled->改学），
+            # 严禁只改 NON_SCALED_COLS 不改 proportional 致 2842 F1=0 缺陷复活
+            if name == "proportional" and "mode" not in params:
+                params["mode"] = pbus_mode
             # 用户级模型参数覆盖（⑯）：按模型名浅合并（用户级 > base，逐键非整节）
             extra = mp_override.get(name) or {}
             if extra:
                 log.info("[train] 用户级模型参数覆盖 %s: %s", name, extra)
                 params.update(extra)
+            if name == "proportional":
+                eff_prop = {"share": "raw", "linear": "scaled"}.get(
+                    params.get("mode"), params.get("mode"))
+                if eff_prop != pbus_mode:
+                    log.warning("[%s] proportional.mode=%r 与 pbus_mode=%r 不一致"
+                                "（可能触发量级失配或 F1=0 退化）",
+                                user_key, params.get("mode"), pbus_mode)
             model = MODEL_REGISTRY.create(name, **params)
             # index/val_index：序列模型按时间连续段构窗（§10，W-1 修复）；其余模型忽略
             model.fit(scaled["train"][0], scaled["train"][1], feature_names=names,
@@ -541,11 +579,13 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         summary = summarize(table)
         write_markdown_report(out, f"{user_key}/train", table, summary,
                               notes=[f"target_col={'+'.join(target_cols)}",
-                                     f"split_strategy={user_cfg['split_strategy']}"])
+                                     f"split_strategy={user_cfg['split_strategy']}",
+                                     f"pbus_mode={pbus_mode}"])
         best = summary.get("overall_best")
 
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "target_cols": target_cols,
+            "pbus_mode": pbus_mode,
             "feature_names": names, "scale_cols": scale_cols,
             "scaler": scaler.state(), "window": window, "window_mode": wmode,
             "split_sizes": split_sizes, "split_strategy": user_cfg["split_strategy"],
@@ -682,6 +722,12 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if len(valid) == 0:
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, "推理区间无有效样本")
 
+        trained_pbus_mode = _infer_trained_pbus_mode(meta)
+        cfg_pbus_mode = str(user_cfg.get("pbus_mode") or "raw")
+        if cfg_pbus_mode != trained_pbus_mode:
+            log.warning("[%s] 配置 pbus_mode=%s 与训练产物 pbus_mode=%s（%s）不一致！"
+                        "推理仍按训练产物 scaler 执行；切换 pbus_mode 后须加 --force 重新训练",
+                        user_key, cfg_pbus_mode, trained_pbus_mode, train_dir.name)
         scaler = TrainFitScaler.from_state(meta["scaler"])
         X = scaler.transform(valid.to_numpy(np.float64))
 
@@ -821,6 +867,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "model": model_name,
+            "pbus_mode": trained_pbus_mode,
             "train_dir": str(train_dir), "n_points": len(valid),
             "quality": infer_quality,
             "finished_at": datetime.now().isoformat(timespec="seconds"),

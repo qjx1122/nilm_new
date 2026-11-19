@@ -514,9 +514,10 @@ def test_proportional_predicts_physical_scale(tmp_path, base_cfg_file,
               user_keys=[USER_KEY])
     train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
-    # pbus 不在缩放列
+    assert meta["pbus_mode"] == "raw"
+    # 默认 raw：pbus 不在缩放列
     i = meta["feature_names"].index("pbus")
-    assert i not in meta["scale_cols"], "pbus 不得被 z-score 标准化"
+    assert i not in meta["scale_cols"], "pbus_mode=raw 下 pbus 不得被 z-score 标准化"
     df = pd.read_csv(train_dir / "predictions" / "train_predictions.csv")
     # 合成数据 p1≈0.5×pbus（pbus>100W）：proportional 预测应为物理量级而非 z 值
     on = df[df["target"] > 50]
@@ -527,6 +528,99 @@ def test_proportional_predicts_physical_scale(tmp_path, base_cfg_file,
     t_on = df["target"] >= 10
     p_on = df["pred_proportional"] >= 10
     assert int((p_on & t_on).sum()) > 0, "proportional 应能产生 TP"
+
+
+def test_pbus_mode_scaled_dual_path_train_and_infer(tmp_path, base_cfg_file, caplog):
+    """按户双路径 pbus_mode='scaled'（733 类大厂小占比 + 多分路求和）：
+    - pbus 移出 NON_SCALED_COLS 参与 z-score；
+    - proportional 联动走线性改学（y≈a·pbus_z+b），既不坍缩为 0（2842 缺陷），
+      也不因分摊 share=1 爆成大总线功率（733 MAE 1300+ 缺陷）；
+    - infer 端复用训练 scaler 与模型，若配置切换 pbus_mode 未重训则打告警日志。
+    """
+    import logging
+
+    data_root = tmp_path / "data"
+    write_user_dir(data_root, USER_KEY, days=21)
+    write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+    # 模拟 733 大变比（pt*ct=15 -> 总线一次侧 ~1800kW，而 p1+p2 求和仅 ~96kW，占比 ~5%）
+    tf_cfg = {
+        USER_KEY: {
+            "target_col": "p1+p2",
+            "on_thr_w": 10.0,
+            "pbus_mode": "scaled",
+            "pt_ratio": 15.0,
+            "ct_ratio": 1.0,
+            "infer_model": "proportional",
+            "split_ratios": [0.7, 0.15, 0.15],
+            "split_strategy": "time",
+            "post_min_on": 1,
+            "post_fill_short_off": 3,
+        },
+        "_default": {"on_thr_w": 10.0},
+    }
+    tf_file = tmp_path / "tf_scaled.json"
+    tf_file.write_text(json.dumps(tf_cfg), encoding="utf-8")
+
+    out_root = tmp_path / "outputs"
+    run_batch(tf_file, base_config_path=base_cfg_file,
+              data_root=data_root, output_root=out_root,
+              stages=("train", "infer"), user_keys=[USER_KEY])
+
+    train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
+    meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["pbus_mode"] == "scaled"
+    p_idx = meta["feature_names"].index("pbus")
+    assert p_idx in meta["scale_cols"], "pbus_mode=scaled 下 pbus 必须参与 z-score 缩放"
+
+    df = pd.read_csv(train_dir / "predictions" / "train_predictions.csv")
+    mae_prop = (df["pred_proportional"] - df["target"]).abs().mean()
+    # 若误走物理分摊 pred≈1800kW，MAE 会 >1500；线性改学应紧贴 ~96kW 目标（含谐波噪声 MAE≈7.2 < 15）
+    assert mae_prop < 15.0, f"scaled 改学 proportional 不应爆成总线功率，实测 MAE={mae_prop}"
+    assert df["pred_proportional"].median() > 40.0, "scaled proportional 不得坍缩为 0"
+
+    infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+    infer_meta = json.loads((infer_dir / "meta.json").read_text(encoding="utf-8"))
+    assert infer_meta["pbus_mode"] == "scaled"
+    inf_df = pd.read_csv(infer_dir / "predictions" / "inference_result.csv")
+    assert (inf_df["pred"] - inf_df["target"]).abs().mean() < 15.0
+
+    # 若用户在配置中改回 raw 但未 --force 重训直接跑 infer，应输出不一致告警
+    tf_cfg[USER_KEY]["pbus_mode"] = "raw"
+    tf_file.write_text(json.dumps(tf_cfg), encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        run_batch(tf_file, base_config_path=base_cfg_file,
+                  data_root=data_root, output_root=out_root,
+                  stages=("infer",), user_keys=[USER_KEY], force=True)
+    assert any("pbus_mode" in r.message and "不一致" in r.message for r in caplog.records)
+
+
+def test_proportional_legacy_pickle_and_mode_validation():
+    """ProportionalAllocation 兼容无 mode 属性的旧版 pickle（分摊版 & 改学版），且拒绝非法 mode。"""
+    import pickle
+    import numpy as np
+    import pytest
+    from nilm.models.baselines import ProportionalAllocation
+
+    with pytest.raises(ValueError, match="proportional.mode"):
+        ProportionalAllocation(mode="bad")
+
+    X = np.array([[100.0, 1.0], [200.0, 2.0]])
+    y = np.array([[30.0], [60.0]])
+
+    # 模拟旧版物理分摊 pickle（无 mode 属性，仅有 _p_idx/_shares）
+    m_raw = ProportionalAllocation(mode="share")
+    m_raw.fit(X, y, feature_names=["pbus", "slot"])
+    del m_raw.__dict__["mode"]
+    m_raw_loaded = pickle.loads(pickle.dumps(m_raw))
+    np.testing.assert_allclose(m_raw_loaded.predict(X), [[100.0], [200.0]])
+
+    # 模拟旧版线性改学 pickle（无 mode 属性，仅有 _p_idx/_a/_b）
+    Xz = np.array([[-1.0, 1.0], [1.0, 2.0]])
+    m_lin = ProportionalAllocation(mode="linear")
+    m_lin.fit(Xz, y, feature_names=["pbus", "slot"])
+    del m_lin.__dict__["mode"]
+    m_lin_loaded = pickle.loads(pickle.dumps(m_lin))
+    np.testing.assert_allclose(m_lin_loaded.predict(Xz), [[30.0], [60.0]])
 
 
 class _ConstantStub:

@@ -105,3 +105,39 @@ def test_global_infer_model_not_a_user_key():
 def test_global_infer_model_must_be_string():
     with pytest.raises(UserConfigError, match="infer_model"):
         resolve_user_config(UK, _cfg(infer_model=123))
+
+
+# ---------------------------------------------------------------- 用户级 pbus_mode
+def test_pbus_mode_default_and_override():
+    """默认 raw；支持 _default 与用户级覆盖为 scaled；显式 null 回退 raw；非法值报错。"""
+    # 1) 未配置默认 raw
+    m0 = resolve_user_config(UK, _cfg())
+    assert m0["pbus_mode"] == "raw"
+
+    # 2) _default 配置 scaled，用户级未配 -> 继承 scaled
+    c1 = _cfg()
+    c1["_default"]["pbus_mode"] = "scaled"
+    m1 = resolve_user_config(UK, c1)
+    assert m1["pbus_mode"] == "scaled"
+    assert m1["_provenance"]["pbus_mode"] == "_default"
+
+    # 3) 用户级覆盖 _default
+    c2 = _cfg()
+    c2["_default"]["pbus_mode"] = "scaled"
+    c2[UK]["pbus_mode"] = "raw"
+    m2 = resolve_user_config(UK, c2)
+    assert m2["pbus_mode"] == "raw"
+    assert m2["_provenance"]["pbus_mode"] == UK
+
+    # 4) 显式 null 回退默认 raw
+    c3 = _cfg()
+    c3[UK]["pbus_mode"] = None
+    assert resolve_user_config(UK, c3)["pbus_mode"] == "raw"
+
+    # 5) 非法取值拒绝
+    for bad in ("zscore", "auto", 123, True):
+        c_bad = _cfg()
+        c_bad[UK]["pbus_mode"] = bad
+        with pytest.raises(UserConfigError, match="pbus_mode"):
+            resolve_user_config(UK, c_bad)
+
