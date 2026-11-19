@@ -132,13 +132,16 @@ class Status:
 # ---------------------------------------------------------------- 用户 JSON 配置契约（§12.3）
 SPLIT_STRATEGIES = ("stratified_day", "stratified", "time", "global_stratified",
                     "stratified_by_state")
-# pbus_mode（按户选双路径）：
-#   raw（默认，退回/忽略电平）：pbus 保留在 NON_SCALED_COLS 不做 z-score 缩放，
+# pbus_mode（按户选/自动判定双路径）：
+#   auto（全局默认）：训练时仅基于 train 集无泄漏统计量（一次侧 pbus 的 P95/标准差 +
+#     目标贡献率 contribution_ratio）前置判定 raw 或 scaled；若前置初判 raw 但验证集
+#     检测到序列模型欠拟合信号，自动重训切换 scaled 并输出红色日志提示；推理自动继承训练产物。
+#   raw（退回/忽略电平）：pbus 保留在 NON_SCALED_COLS 不做 z-score 缩放，
 #     proportional 按物理占比分摊（pred = pbus × share）；适用于大占比单分路、
 #     跨期基线易漂移用户（如 856）。
 #   scaled（方向2/学比例）：pbus 做 z-score 标准化，proportional 改学最小二乘
 #     线性映射（y ≈ a·pbus_z + b）；适用于大厂小占比或多分路求和目标（如 733）。
-PBUS_MODES = ("raw", "scaled")
+PBUS_MODES = ("auto", "raw", "scaled")
 
 CONFIG_RULES: dict[str, dict] = {
     # field: default, validator 说明（具体校验见 pipeline/user_config.py）
@@ -153,8 +156,8 @@ CONFIG_RULES: dict[str, dict] = {
     # 分路一次侧单位换算到 kW（与 on_thr_w 同级，用户级）：CSV 为 kW 时 1.0（默认），
     # 为 W 时 0.001（W->kW）。仅缩功率列（pN）。
     "branch_scale":          {"default": 1.0, "min": 0.001, "max": 10000.0},
-    # 总线总有功 pbus 缩放与 proportional 基线联动模式（按户选，"raw" | "scaled"）
-    "pbus_mode":             {"default": "raw", "choices": PBUS_MODES},
+    # 总线总有功 pbus 缩放与 proportional 基线联动模式（"auto" | "raw" | "scaled"，默认 "auto"）
+    "pbus_mode":             {"default": "auto", "choices": PBUS_MODES},
     "split_ratios":          {"default": [0.6, 0.2, 0.2]},
     "split_strategy":        {"default": "stratified_day", "choices": SPLIT_STRATEGIES},
     "post_min_on":           {"default": 1, "min": 0},

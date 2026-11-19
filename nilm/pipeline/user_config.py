@@ -113,7 +113,7 @@ def resolve_user_config(user_key: str, cfg: dict) -> dict:
             merged[k] = v
             provenance[k] = layer_name
 
-    # pbus_mode 显式写 null 时回退硬编码默认 "raw"
+    # pbus_mode 显式写 null 时回退硬编码默认 "auto"
     if merged.get("pbus_mode") is None:
         merged["pbus_mode"] = CONFIG_RULES["pbus_mode"]["default"]
 

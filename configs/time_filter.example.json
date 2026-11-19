@@ -4,7 +4,7 @@
     "on_thr_w": 50.0,
     "pt_ratio": 1.0,
     "ct_ratio": 1.0,
-    "pbus_mode": "raw",
+    "pbus_mode": "auto",
     "split_ratios": [
       0.7,
       0.15,

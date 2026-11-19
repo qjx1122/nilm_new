@@ -18,7 +18,7 @@ import pandas as pd
 from nilm.analysis import analyze_branch_sessions, identifiability_report
 from nilm.common.contracts import (INFER_RESULT_COLUMNS, INFERENCE_RESULT_REL,
                                    Status, split_user_key)
-from nilm.common.logging import get_logger
+from nilm.common.logging import get_logger, red_text
 from nilm.common.schema import bus_total
 from nilm.common.timefilter import filter_dataframe
 from nilm.data_io.csv_source import CsvBranchLoader, CsvBusLoader
@@ -50,21 +50,140 @@ log = get_logger("pipeline.user_task")
 DONE_MARKER = "_DONE"
 NON_SCALED_COLS = {"slot", "hour", "minute", "day_of_week", "is_weekend",
                    "month", "day_of_year",
-                   # 默认（pbus_mode="raw"）保持 pbus 不缩放：基线 proportional 走物理分摊
+                   # pbus_mode="raw" 时保持 pbus 不缩放：基线 proportional 走物理分摊
                    # （2026-08-18 修复 2842 pred=share×z(pbus)→F1=0 缺陷，856 跨期稳健）。
                    # pbus_mode="scaled" 时由 _non_scaled_cols 移出 pbus 做 z-score，并联动
                    # proportional 走线性改学（y≈a·pbus_z+b，733 大厂/多分路求和目标适用）。
                    "pbus"}
 NON_SCALED_COLS_SCALED = NON_SCALED_COLS - {"pbus"}
+SEQ_MODEL_NAMES = ("transformer", "lstm", "cnn1d")
 
 
 def _non_scaled_cols(pbus_mode: str) -> set[str]:
-    """按用户级 pbus_mode 返回不参与 z-score 缩放的特征列名集合。"""
+    """按实际生效的物理 pbus_mode ('raw'|'scaled') 返回不参与 z-score 的特征列名集合。"""
     if pbus_mode == "scaled":
         return NON_SCALED_COLS_SCALED
     if pbus_mode == "raw":
         return NON_SCALED_COLS
-    raise ValueError(f"未知 pbus_mode={pbus_mode!r}（仅支持 'raw' / 'scaled'）")
+    raise ValueError(f"未知物理 pbus_mode={pbus_mode!r}（仅支持 'raw' / 'scaled'）")
+
+
+def resolve_auto_pbus_mode(pbus_train: np.ndarray, y_train: np.ndarray) -> tuple[str, dict]:
+    """基于 train 集无泄漏物理统计量自动判定 pbus_mode（对应三步决策法第1、2步）。
+
+    严格仅使用 splits['train']（严禁接触 val/test，遵守 §11 零泄漏契约）：
+    - R1 幅值防淹没：P95(pbus) > 800kW 或 std(pbus) > 150kW -> scaled
+      （防大母线激活方差碾压 slot(0..95, std≈28) 与标准化特征致 LayerNorm 淹没欠拟合）；
+    - R2 低贡献率防背景淹没：contribution_ratio = mean(y)/mean(pbus) < 0.20 -> scaled
+      （母线均值 > 目标均值 5 倍，大厂局部产线/低占比求和，raw 下 proportional 必崩盘）；
+    - R3 灰区联合判定：500 < P95(pbus) <= 800 且 contribution_ratio < 0.33 -> scaled；
+    - 其余中小母线主导负荷（如 856/2842/2844）保持 raw，兼顾物理分摊与跨月抗漂移。
+    """
+    pb_arr = np.asarray(pbus_train, dtype=np.float64).reshape(-1)
+    yt_arr = np.asarray(y_train, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(pb_arr) & np.isfinite(yt_arr)
+    pb, yt = pb_arr[valid], yt_arr[valid]
+    if len(pb) == 0:
+        return "raw", {
+            "configured_mode": "auto", "resolved_mode": "raw",
+            "stage": "pre_rule", "train_pbus_p95": 0.0, "train_pbus_std": 0.0,
+            "train_pbus_mean": 0.0, "train_target_mean": 0.0,
+            "train_contrib_ratio": 1.0, "reasons": ["EMPTY_TRAIN_FALLBACK_RAW"],
+        }
+
+    p95 = float(np.quantile(pb, 0.95))
+    pstd = float(np.std(pb))
+    mean_pb = float(np.mean(pb))
+    mean_y = float(np.mean(yt))
+    contrib = (mean_y / mean_pb) if mean_pb > 1e-9 else 1.0
+
+    reasons: list[str] = []
+    if p95 > 800.0 or pstd > 150.0:
+        reasons.append(f"HIGH_BUS_SCALE(p95={p95:.1f}>800 or std={pstd:.1f}>150)")
+    if contrib < 0.20:
+        reasons.append(f"LOW_CONTRIB_RATIO(contrib={contrib:.4f}<0.20)")
+    if 500.0 < p95 <= 800.0 and contrib < 0.33:
+        reasons.append(f"GRAY_ZONE_BUS(p95={p95:.1f}, contrib={contrib:.4f}<0.33)")
+
+    mode = "scaled" if reasons else "raw"
+    return mode, {
+        "configured_mode": "auto",
+        "resolved_mode": mode,
+        "stage": "pre_rule",
+        "train_pbus_p95": round(p95, 2),
+        "train_pbus_std": round(pstd, 2),
+        "train_pbus_mean": round(mean_pb, 2),
+        "train_target_mean": round(mean_y, 2),
+        "train_contrib_ratio": round(contrib, 4),
+        "reasons": reasons or ["SMALL_DOMINANT_BUS_KEEP_RAW"],
+    }
+
+
+def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
+                                   split_bands: dict[str, dict[str, float]],
+                                   on_thr: float) -> tuple[bool, list[str]]:
+    """后置单向熔断检测（对应三步决策法第3步，仅检视 train/val 严禁看 test）：
+
+    当前置规则初判为 raw 时，检查深度序列模型是否因未缩放 pbus 条件数病态触发欠拟合/坍缩：
+    1) 预测带宽坍缩（train 或 val 带宽 < on_thr_w）或 train R² < 0；
+    2) 序列模型在 train 与 val 上双双显著劣于非退化基线（history_profile / ridge）；
+    3) 序列模型在 val 上显著劣于纯静态槽位画像 history_profile 且 proportional 严重失配（R² < -1）。
+    """
+    reasons: list[str] = []
+    ref_models = [b for b in ("history_profile", "ridge") if b in results_by_split]
+    prop_tr_r2 = (results_by_split.get("proportional", {})
+                  .get("train", {}).get("r2", {}).get("macro", 0.0))
+
+    for seq_name in SEQ_MODEL_NAMES:
+        if seq_name not in results_by_split:
+            continue
+        by_sp = results_by_split[seq_name]
+        tr_r2 = by_sp.get("train", {}).get("r2", {}).get("macro")
+        val_r2 = by_sp.get("val", {}).get("r2", {}).get("macro")
+        bands = split_bands.get(seq_name, {})
+        tr_band = bands.get("train")
+        val_band = bands.get("val")
+
+        if tr_band is not None and tr_band < on_thr:
+            reasons.append(f"{seq_name}_TRAIN_COLLAPSED(band={tr_band:.2f}<{on_thr:.2f})")
+            continue
+        if val_band is not None and val_band < on_thr:
+            reasons.append(f"{seq_name}_VAL_COLLAPSED(band={val_band:.2f}<{on_thr:.2f})")
+            continue
+        if tr_r2 is not None and tr_r2 < 0.0:
+            reasons.append(f"{seq_name}_TRAIN_NEG_R2(r2={tr_r2:.4f}<0)")
+            continue
+
+        if ref_models and tr_r2 is not None:
+            ref_tr = [results_by_split[b]["train"]["r2"]["macro"]
+                      for b in ref_models
+                      if "train" in results_by_split[b] and "r2" in results_by_split[b]["train"]]
+            best_ref_tr = max(ref_tr) if ref_tr else None
+            if val_r2 is not None:
+                ref_val = [results_by_split[b]["val"]["r2"]["macro"]
+                           for b in ref_models
+                           if "val" in results_by_split[b] and "r2" in results_by_split[b]["val"]]
+                best_ref_val = max(ref_val) if ref_val else None
+                if (best_ref_tr is not None and best_ref_val is not None
+                        and tr_r2 < best_ref_tr - 0.03 and val_r2 < best_ref_val - 0.02):
+                    reasons.append(
+                        f"{seq_name}_UNDERFIT_VS_BASELINE("
+                        f"train_r2={tr_r2:.4f}<{best_ref_tr:.4f}-0.03, "
+                        f"val_r2={val_r2:.4f}<{best_ref_val:.4f}-0.02)")
+                    continue
+                hp_val = (results_by_split.get("history_profile", {})
+                          .get("val", {}).get("r2", {}).get("macro"))
+                if hp_val is not None and val_r2 < hp_val - 0.02 and prop_tr_r2 < -1.0:
+                    reasons.append(
+                        f"{seq_name}_VAL_WORSE_THAN_PROFILE("
+                        f"val_r2={val_r2:.4f}<{hp_val:.4f}-0.02, prop_train_r2={prop_tr_r2:.2f})")
+                    continue
+            elif best_ref_tr is not None and tr_r2 < best_ref_tr - 0.05:
+                reasons.append(
+                    f"{seq_name}_TRAIN_UNDERFIT_VS_BASELINE("
+                    f"train_r2={tr_r2:.4f}<{best_ref_tr:.4f}-0.05)")
+
+    return bool(reasons), reasons
 
 
 def _infer_trained_pbus_mode(meta: dict) -> str:
@@ -394,128 +513,164 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                            daily_quality=daily_q, advice=advice,
                            qualified_detail=q_detail)  # 重写含双达标统计
 
-        # Scaler 只由 Train 拟合（§11）；按用户级 pbus_mode 选择 pbus 是否参与 z-score
-        pbus_mode = str(user_cfg.get("pbus_mode") or "raw")
-        non_scaled = _non_scaled_cols(pbus_mode)
-        log.info("[%s] pbus_mode=%s（%s）", user_key, pbus_mode,
-                 "pbus z-score + proportional 线性改学"
-                 if pbus_mode == "scaled" else "pbus 未缩放 + proportional 物理分摊")
-        scale_cols = [i for i, c in enumerate(names) if c not in non_scaled]
-        scaler = TrainFitScaler().fit(splits["train"][0], cols=scale_cols)
-        scaled = {k: (scaler.transform(v[0]), v[1], v[2]) for k, v in splits.items()}
+        # Scaler 只由 Train 拟合（§11）；按用户级 pbus_mode 选择（默认 "auto" 自动判定+欠拟合熔断）
+        pbus_col = names.index("pbus")
+        cfg_pbus_mode = str(user_cfg.get("pbus_mode") or "auto")
+        if cfg_pbus_mode == "auto":
+            pbus_mode, pbus_decision = resolve_auto_pbus_mode(
+                splits["train"][0][:, pbus_col], splits["train"][1][:, 0])
+            log.info("[%s] [auto] 前置判定 pbus_mode=%s（train_p95=%.1f, std=%.1f, "
+                     "contrib_ratio=%.4f, reasons=%s）",
+                     user_key, pbus_mode, pbus_decision["train_pbus_p95"],
+                     pbus_decision["train_pbus_std"],
+                     pbus_decision["train_contrib_ratio"],
+                     pbus_decision["reasons"])
+        else:
+            pbus_mode = cfg_pbus_mode
+            pbus_decision = {
+                "configured_mode": cfg_pbus_mode,
+                "resolved_mode": cfg_pbus_mode,
+                "stage": "explicit",
+                "reasons": ["EXPLICIT_USER_CONFIG"],
+            }
 
-        # §10 窗口样本索引落盘（默认 Seq2Seq）
         wmode = base_cfg.get("dataset", {}).get("mode", "seq2seq")
-        if split_sizes["train"] >= window:
-            _, _, wmeta = build_windows(scaled["train"][0], scaled["train"][1],
-                                        scaled["train"][2], window=window, mode=wmode)
-            wmeta.to_csv(out / "train_window_index.csv", index=False)
-
-        # —— 多模型训练与三阶段（train/val/test）评估（模块解耦：只经注册表接口）
         metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
         on_thr = float(user_cfg["on_thr_w"])
         dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
         post_min_on = int(user_cfg["post_min_on"])
         post_fill_off = int(user_cfg["post_fill_short_off"])
-        pbus_col = names.index("pbus")
-        results: dict[str, dict] = {}          # {model: test 指标}（选型口径不变）
-        results_by_split: dict[str, dict] = {}  # {model: {split: 指标}} 三阶段全量
-        daily_rows: list[pd.DataFrame] = []     # 每模型×每阶段×每天 指标（能力口径）
-        daily_chain_rows: list[pd.DataFrame] = []  # 每模型×每阶段×每天 指标（链口径）
-        test_preds: dict[str, np.ndarray] = {}  # {model: test 段预测}（状态策略评估用）
-        collapsed_models: list[dict] = []       # 预测坍缩模型（带宽<on_thr_w，勿用于推理）
-        pred_frames: dict[str, pd.DataFrame] = {  # 训练预测结果落盘（真实值+各模型预测）
-            s: pd.DataFrame({"timestamp": splits[s][2]
-                             .strftime("%Y-%m-%d %H:%M:%S"),
-                             "split": s, "target": splits[s][1][:, 0],
-                             # 真实状态：真值按 on_thr_w 二值化（与推理 target_state 同口径）
-                             "target_state": (splits[s][1][:, 0] >= on_thr).astype(int),
-                             # 状态判定阈值（口径自描述）：真值判态 / 预测判态
-                             "on_thr_w": on_thr, "decision_thr_w": dec_thr})
-            for s in ("train", "val", "test") if split_sizes.get(s, 0) > 0}
-        best = None
         mp_override = user_cfg.get("model_params") or {}
-        for spec in base_cfg.get("models", []):
-            name, params = spec["name"], dict(spec.get("params", {}))
-            # pbus_mode 双路径联动：proportional 默认跟随 pbus_mode（raw->分摊, scaled->改学），
-            # 严禁只改 NON_SCALED_COLS 不改 proportional 致 2842 F1=0 缺陷复活
-            if name == "proportional" and "mode" not in params:
-                params["mode"] = pbus_mode
-            # 用户级模型参数覆盖（⑯）：按模型名浅合并（用户级 > base，逐键非整节）
-            extra = mp_override.get(name) or {}
-            if extra:
-                log.info("[train] 用户级模型参数覆盖 %s: %s", name, extra)
-                params.update(extra)
-            if name == "proportional":
-                eff_prop = {"share": "raw", "linear": "scaled"}.get(
-                    params.get("mode"), params.get("mode"))
-                if eff_prop != pbus_mode:
-                    log.warning("[%s] proportional.mode=%r 与 pbus_mode=%r 不一致"
-                                "（可能触发量级失配或 F1=0 退化）",
-                                user_key, params.get("mode"), pbus_mode)
-            model = MODEL_REGISTRY.create(name, **params)
-            # index/val_index：序列模型按时间连续段构窗（§10，W-1 修复）；其余模型忽略
-            model.fit(scaled["train"][0], scaled["train"][1], feature_names=names,
-                      X_val=scaled["val"][0], y_val=scaled["val"][1],
-                      index=splits["train"][2],
-                      val_index=(splits["val"][2] if split_sizes.get("val", 0) > 0 else None))
-            model.save(out / "models" / f"{name}.pkl")
 
-            results_by_split[name] = {}
-            for split in ("train", "val", "test"):
-                if len(scaled[split][0]) == 0:
-                    continue
-                y_hat = model.predict(scaled[split][0], index=splits[split][2])
-                y_hat = apply_constraints(y_hat, splits[split][0][:, pbus_col],
-                                          nonnegative=not allow_negative,
-                                          sum_consistency=False)
-                metrics = evaluate_all(scaled[split][1], y_hat, metric_names,
-                                       on_thr_w=on_thr)
-                results_by_split[name][split] = metrics
-                # 链口径：先得 pred_state（判决链），再算两套日级
-                pred_state_arr = postprocess_state(
-                    y_hat[:, 0], dec_thr, post_min_on, post_fill_off).astype(int)
-                daily = evaluate_daily(scaled[split][1], y_hat, splits[split][2],
-                                       metric_names, on_thr_w=on_thr)
-                daily.insert(0, "split", split)
-                daily.insert(0, "model", name)
-                # 状态判定阈值自描述：分类指标（f1/tp/fp/fn/tn）真值与预测均按
-                # on_thr_w 判态（模型能力口径，非 pred_state 的判决链口径）
-                daily["state_thr_w"] = on_thr
-                daily_rows.append(daily)
-                # 链口径日级（回归同能力口径、分类按 target_state vs pred_state）
-                daily_chain = evaluate_daily_chain(
-                    scaled[split][1], y_hat, pred_state_arr, splits[split][2],
-                    metric_names, on_thr_w=on_thr)
-                daily_chain.insert(0, "split", split)
-                daily_chain.insert(0, "model", name)
-                daily_chain["state_thr_w"] = on_thr
-                daily_chain["decision_thr_w"] = dec_thr
-                daily_chain["post_min_on"] = post_min_on
-                daily_chain["post_fill_short_off"] = post_fill_off
-                daily_chain_rows.append(daily_chain)
-                log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
-                         {m: round(v["macro"], 4) for m, v in metrics.items()})
-                pred_frames[split][f"pred_{name}"] = y_hat[:, 0]
-                # 预测状态：生产判决链口径（decision_thr_w + 游程后处理），
-                # 与推理 pred_state / state_strategy 的 decision+runs 行一致
-                pred_frames[split][f"pred_state_{name}"] = pred_state_arr
-                if split == "test":
-                    test_preds[name] = y_hat[:, 0]
-                    # —— 坍缩模型检测（0800 transformer 均值坍缩教训，2026-09-02）：
-                    # test 预测带宽 < on_thr_w 时该模型永远无法产生开态判定
-                    # （F1=0 且 FP=0 貌似保守，实为未收敛），标记防止被
-                    # infer_model 指定后静默上线全漏报。
-                    band = float(y_hat[:, 0].max() - y_hat[:, 0].min())
-                    if band < on_thr:
-                        collapsed_models.append(
-                            {"model": name, "pred_band_w": round(band, 2),
-                             "on_thr_w": on_thr})
-                        log.warning(
-                            "[%s] PRED_COLLAPSED：模型 %s test 预测带宽 %.1fW < "
-                            "on_thr_w %.0fW——预测坍缩（疑似欠训练），该模型无法识别"
-                            "任何开机点，勿用于推理", user_key, name, band, on_thr)
-            results[name] = results_by_split[name]["test"]  # 选型口径：test（不变）
+        def _run_pbus_mode_pass(eff_mode: str):
+            non_scaled_local = _non_scaled_cols(eff_mode)
+            log.info("[%s] pbus_mode=%s（配置=%s；%s）", user_key, eff_mode, cfg_pbus_mode,
+                     "pbus z-score + proportional 线性改学"
+                     if eff_mode == "scaled" else "pbus 未缩放 + proportional 物理分摊")
+            sc_cols = [i for i, c in enumerate(names) if c not in non_scaled_local]
+            sc = TrainFitScaler().fit(splits["train"][0], cols=sc_cols)
+            sc_splits = {k: (sc.transform(v[0]), v[1], v[2]) for k, v in splits.items()}
+
+            fitted_models_local: dict[str, BaseModel] = {}
+            res_local: dict[str, dict] = {}
+            res_by_sp_local: dict[str, dict] = {}
+            daily_local: list[pd.DataFrame] = []
+            daily_chain_local: list[pd.DataFrame] = []
+            test_preds_local: dict[str, np.ndarray] = {}
+            collapsed_local: list[dict] = []
+            split_bands_local: dict[str, dict[str, float]] = {}
+            pred_frames_local: dict[str, pd.DataFrame] = {
+                s: pd.DataFrame({"timestamp": splits[s][2]
+                                 .strftime("%Y-%m-%d %H:%M:%S"),
+                                 "split": s, "target": splits[s][1][:, 0],
+                                 "target_state": (splits[s][1][:, 0] >= on_thr).astype(int),
+                                 "on_thr_w": on_thr, "decision_thr_w": dec_thr})
+                for s in ("train", "val", "test") if split_sizes.get(s, 0) > 0}
+
+            for spec in base_cfg.get("models", []):
+                name, params = spec["name"], dict(spec.get("params", {}))
+                # pbus_mode 双路径联动：proportional 默认跟随 eff_mode（raw->分摊, scaled->改学）
+                if name == "proportional" and "mode" not in params:
+                    params["mode"] = eff_mode
+                extra = mp_override.get(name) or {}
+                if extra:
+                    log.info("[train] 用户级模型参数覆盖 %s: %s", name, extra)
+                    params.update(extra)
+                if name == "proportional":
+                    eff_prop = {"share": "raw", "linear": "scaled"}.get(
+                        params.get("mode"), params.get("mode"))
+                    if eff_prop != eff_mode:
+                        log.warning("[%s] proportional.mode=%r 与 pbus_mode=%r 不一致"
+                                    "（可能触发量级失配或 F1=0 退化）",
+                                    user_key, params.get("mode"), eff_mode)
+                model = MODEL_REGISTRY.create(name, **params)
+                model.fit(sc_splits["train"][0], sc_splits["train"][1], feature_names=names,
+                          X_val=sc_splits["val"][0], y_val=sc_splits["val"][1],
+                          index=splits["train"][2],
+                          val_index=(splits["val"][2] if split_sizes.get("val", 0) > 0 else None))
+                fitted_models_local[name] = model
+
+                res_by_sp_local[name] = {}
+                split_bands_local[name] = {}
+                for split in ("train", "val", "test"):
+                    if len(sc_splits[split][0]) == 0:
+                        continue
+                    y_hat = model.predict(sc_splits[split][0], index=splits[split][2])
+                    y_hat = apply_constraints(y_hat, splits[split][0][:, pbus_col],
+                                              nonnegative=not allow_negative,
+                                              sum_consistency=False)
+                    metrics = evaluate_all(sc_splits[split][1], y_hat, metric_names,
+                                           on_thr_w=on_thr)
+                    res_by_sp_local[name][split] = metrics
+                    band_sp = float(y_hat[:, 0].max() - y_hat[:, 0].min())
+                    split_bands_local[name][split] = band_sp
+                    pred_state_arr = postprocess_state(
+                        y_hat[:, 0], dec_thr, post_min_on, post_fill_off).astype(int)
+                    daily = evaluate_daily(sc_splits[split][1], y_hat, splits[split][2],
+                                           metric_names, on_thr_w=on_thr)
+                    daily.insert(0, "split", split)
+                    daily.insert(0, "model", name)
+                    daily["state_thr_w"] = on_thr
+                    daily_local.append(daily)
+                    daily_chain = evaluate_daily_chain(
+                        sc_splits[split][1], y_hat, pred_state_arr, splits[split][2],
+                        metric_names, on_thr_w=on_thr)
+                    daily_chain.insert(0, "split", split)
+                    daily_chain.insert(0, "model", name)
+                    daily_chain["state_thr_w"] = on_thr
+                    daily_chain["decision_thr_w"] = dec_thr
+                    daily_chain["post_min_on"] = post_min_on
+                    daily_chain["post_fill_short_off"] = post_fill_off
+                    daily_chain_local.append(daily_chain)
+                    log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
+                             {m: round(v["macro"], 4) for m, v in metrics.items()})
+                    pred_frames_local[split][f"pred_{name}"] = y_hat[:, 0]
+                    pred_frames_local[split][f"pred_state_{name}"] = pred_state_arr
+                    if split == "test":
+                        test_preds_local[name] = y_hat[:, 0]
+                        if band_sp < on_thr:
+                            collapsed_local.append(
+                                {"model": name, "pred_band_w": round(band_sp, 2),
+                                 "on_thr_w": on_thr})
+                            log.warning(
+                                "[%s] PRED_COLLAPSED：模型 %s test 预测带宽 %.1fW < "
+                                "on_thr_w %.0fW——预测坍缩（疑似欠训练），该模型无法识别"
+                                "任何开机点，勿用于推理", user_key, name, band_sp, on_thr)
+                res_local[name] = res_by_sp_local[name]["test"]
+            return (sc_cols, sc, sc_splits, fitted_models_local, res_local,
+                    res_by_sp_local, daily_local, daily_chain_local,
+                    test_preds_local, collapsed_local, pred_frames_local,
+                    split_bands_local)
+
+        (scale_cols, scaler, scaled, fitted_models, results, results_by_split,
+         daily_rows, daily_chain_rows, test_preds, collapsed_models,
+         pred_frames, split_bands) = _run_pbus_mode_pass(pbus_mode)
+
+        # 后置单向熔断（仅 auto 且前置初判 raw 时）：若 train/val 检测到序列模型欠拟合，
+        # 红色高亮告警并自动切换 scaled 重新训练
+        if cfg_pbus_mode == "auto" and pbus_mode == "raw":
+            need_fb, fb_reasons = _should_fallback_raw_to_scaled(
+                results_by_split, split_bands, on_thr)
+            if need_fb:
+                log.warning("%s", red_text(
+                    f"[{user_key}] [AUTO-FALLBACK] 前置初判 pbus_mode=raw 触发欠拟合熔断"
+                    f"（{'; '.join(fb_reasons)}），自动重训切换为 pbus_mode=scaled！"
+                ))
+                pbus_mode = "scaled"
+                pbus_decision["resolved_mode"] = "scaled"
+                pbus_decision["stage"] = "post_fallback"
+                pbus_decision["fallback_reasons"] = fb_reasons
+                (scale_cols, scaler, scaled, fitted_models, results, results_by_split,
+                 daily_rows, daily_chain_rows, test_preds, collapsed_models,
+                 pred_frames, split_bands) = _run_pbus_mode_pass(pbus_mode)
+
+        # 最终选定模式落盘：窗口样本索引（§10）与各模型权重
+        if split_sizes["train"] >= window:
+            _, _, wmeta = build_windows(scaled["train"][0], scaled["train"][1],
+                                        scaled["train"][2], window=window, mode=wmode)
+            wmeta.to_csv(out / "train_window_index.csv", index=False)
+        for mname, mobj in fitted_models.items():
+            mobj.save(out / "models" / f"{mname}.pkl")
 
         # 三阶段汇总 CSV：model × split 行 × 指标列（state_thr_w=分类指标判定阈值）
         split_rows = [{"model": mname, "split": s, "state_thr_w": on_thr,
@@ -577,15 +732,20 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         table = build_comparison_table(results)
         table.to_csv(out / "comparison.csv", encoding="utf-8")
         summary = summarize(table)
+        pbus_note = (f"pbus_mode={pbus_mode} (configured={cfg_pbus_mode}, "
+                     f"stage={pbus_decision.get('stage')})"
+                     if cfg_pbus_mode == "auto" else f"pbus_mode={pbus_mode}")
         write_markdown_report(out, f"{user_key}/train", table, summary,
                               notes=[f"target_col={'+'.join(target_cols)}",
                                      f"split_strategy={user_cfg['split_strategy']}",
-                                     f"pbus_mode={pbus_mode}"])
+                                     pbus_note])
         best = summary.get("overall_best")
 
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "target_cols": target_cols,
             "pbus_mode": pbus_mode,
+            "pbus_mode_configured": cfg_pbus_mode,
+            "pbus_mode_decision": pbus_decision,
             "feature_names": names, "scale_cols": scale_cols,
             "scaler": scaler.state(), "window": window, "window_mode": wmode,
             "split_sizes": split_sizes, "split_strategy": user_cfg["split_strategy"],
@@ -723,11 +883,14 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, "推理区间无有效样本")
 
         trained_pbus_mode = _infer_trained_pbus_mode(meta)
-        cfg_pbus_mode = str(user_cfg.get("pbus_mode") or "raw")
-        if cfg_pbus_mode != trained_pbus_mode:
+        cfg_pbus_mode = str(user_cfg.get("pbus_mode") or "auto")
+        if cfg_pbus_mode != "auto" and cfg_pbus_mode != trained_pbus_mode:
             log.warning("[%s] 配置 pbus_mode=%s 与训练产物 pbus_mode=%s（%s）不一致！"
                         "推理仍按训练产物 scaler 执行；切换 pbus_mode 后须加 --force 重新训练",
                         user_key, cfg_pbus_mode, trained_pbus_mode, train_dir.name)
+        else:
+            log.info("[%s] 推理沿用训练 pbus_mode=%s（配置=%s）",
+                     user_key, trained_pbus_mode, cfg_pbus_mode)
         scaler = TrainFitScaler.from_state(meta["scaler"])
         X = scaler.transform(valid.to_numpy(np.float64))
 
@@ -868,6 +1031,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "model": model_name,
             "pbus_mode": trained_pbus_mode,
+            "pbus_mode_configured": cfg_pbus_mode,
             "train_dir": str(train_dir), "n_points": len(valid),
             "quality": infer_quality,
             "finished_at": datetime.now().isoformat(timespec="seconds"),

@@ -514,8 +514,11 @@ def test_proportional_predicts_physical_scale(tmp_path, base_cfg_file,
               user_keys=[USER_KEY])
     train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+    # 全局默认 auto：中小母线主导单路（p95≈175<=500, contrib≈0.50>=0.33）自动前置判为 raw
+    assert meta["pbus_mode_configured"] == "auto"
     assert meta["pbus_mode"] == "raw"
-    # 默认 raw：pbus 不在缩放列
+    assert meta["pbus_mode_decision"]["stage"] == "pre_rule"
+    # raw 下 pbus 不在缩放列
     i = meta["feature_names"].index("pbus")
     assert i not in meta["scale_cols"], "pbus_mode=raw 下 pbus 不得被 z-score 标准化"
     df = pd.read_csv(train_dir / "predictions" / "train_predictions.csv")
@@ -621,6 +624,231 @@ def test_proportional_legacy_pickle_and_mode_validation():
     del m_lin.__dict__["mode"]
     m_lin_loaded = pickle.loads(pickle.dumps(m_lin))
     np.testing.assert_allclose(m_lin_loaded.predict(Xz), [[30.0], [60.0]])
+
+
+def test_resolve_auto_pbus_mode_boundaries():
+    """前置无泄漏三规则边界单测：R1 幅值防淹没、R2 低贡献率、R3 灰区联合、中小主导负荷保 raw。"""
+    import numpy as np
+    from nilm.pipeline.user_task import resolve_auto_pbus_mode
+
+    # 1) 856/2842 类中小母线主导单路（p95≈200<=500, std≈40<=150, contrib=0.50>=0.33）-> raw
+    pb_small = np.linspace(100.0, 210.0, 200)
+    y_dom = 0.5 * pb_small
+    m1, d1 = resolve_auto_pbus_mode(pb_small, y_dom)
+    assert m1 == "raw" and d1["stage"] == "pre_rule"
+
+    # 2) R1 大母线（p95 > 800 或 std > 150，即使贡献率高也必须防 LayerNorm 淹没）-> scaled
+    pb_large = np.linspace(1000.0, 2500.0, 200)
+    m2, d2 = resolve_auto_pbus_mode(pb_large, 0.4 * pb_large)
+    assert m2 == "scaled" and any("HIGH_BUS_SCALE" in r for r in d2["reasons"])
+
+    # 3) R2 低贡献率（母线不大 300kW，但分路仅 30kW -> contrib=0.10 < 0.20）-> scaled
+    pb_mid = np.linspace(250.0, 350.0, 200)
+    m3, d3 = resolve_auto_pbus_mode(pb_mid, 0.10 * pb_mid)
+    assert m3 == "scaled" and any("LOW_CONTRIB_RATIO" in r for r in d3["reasons"])
+
+    # 4) R3 灰区联合（p95∈(500, 800] 且 contrib < 0.33 -> scaled；contrib >= 0.33 -> raw）
+    pb_gray = np.linspace(450.0, 680.0, 200)
+    m4a, d4a = resolve_auto_pbus_mode(pb_gray, 0.25 * pb_gray)
+    assert m4a == "scaled" and any("GRAY_ZONE_BUS" in r for r in d4a["reasons"])
+    m4b, _ = resolve_auto_pbus_mode(pb_gray, 0.45 * pb_gray)
+    assert m4b == "raw"
+
+    # 5) 后置单向熔断单测：坍缩与欠拟合均命中，正常领先基线不命中
+    from nilm.pipeline.user_task import _should_fallback_raw_to_scaled
+    res_ok = {
+        "history_profile": {"train": {"r2": {"macro": 0.80}}, "val": {"r2": {"macro": 0.72}}},
+        "ridge": {"train": {"r2": {"macro": 0.91}}, "val": {"r2": {"macro": 0.82}}},
+        "transformer": {"train": {"r2": {"macro": 0.96}}, "val": {"r2": {"macro": 0.80}}},
+    }
+    bands_ok = {"transformer": {"train": 500.0, "val": 500.0}}
+    assert _should_fallback_raw_to_scaled(res_ok, bands_ok, 10.0) == (False, [])
+
+    # 复现 733 raw 指标（transformer train 0.8297 < ridge 0.9137, val 0.7673 < ridge 0.8199）
+    res_733_raw = {
+        "history_profile": {"train": {"r2": {"macro": 0.7979}}, "val": {"r2": {"macro": 0.7197}}},
+        "ridge": {"train": {"r2": {"macro": 0.9137}}, "val": {"r2": {"macro": 0.8199}}},
+        "transformer": {"train": {"r2": {"macro": 0.8297}}, "val": {"r2": {"macro": 0.7673}}},
+    }
+    fb, fb_r = _should_fallback_raw_to_scaled(res_733_raw, bands_ok, 10.0)
+    assert fb is True and any("UNDERFIT_VS_BASELINE" in r for r in fb_r)
+
+    # 坍缩触发
+    fb_c, fb_cr = _should_fallback_raw_to_scaled(
+        res_ok, {"transformer": {"train": 3.0, "val": 3.0}}, 10.0)
+    assert fb_c is True and any("TRAIN_COLLAPSED" in r for r in fb_cr)
+
+
+def test_pbus_mode_auto_pre_rule_selects_scaled_for_large_bus(tmp_path, base_cfg_file, caplog):
+    """全局默认 pbus_mode='auto'：733 类大变比小占比用户无需手写 pbus_mode，
+    前置规则自动选 scaled，且 infer 默认 auto 自动继承不触发混版告警。"""
+    import logging
+
+    data_root = tmp_path / "data"
+    write_user_dir(data_root, USER_KEY, days=21)
+    write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+    # 不写 pbus_mode（走全局默认 "auto"），模拟 733 大变比 pt=15 -> pbus≈1800kW, p1+p2≈96kW
+    tf_cfg = {
+        USER_KEY: {
+            "target_col": "p1+p2",
+            "on_thr_w": 10.0,
+            "pt_ratio": 15.0,
+            "ct_ratio": 1.0,
+            "infer_model": "proportional",
+            "split_ratios": [0.7, 0.15, 0.15],
+            "split_strategy": "time",
+            "post_min_on": 1,
+            "post_fill_short_off": 3,
+        },
+        "_default": {"on_thr_w": 10.0},
+    }
+    tf_file = tmp_path / "tf_auto_large.json"
+    tf_file.write_text(json.dumps(tf_cfg), encoding="utf-8")
+
+    out_root = tmp_path / "outputs"
+    with caplog.at_level(logging.WARNING):
+        run_batch(tf_file, base_config_path=base_cfg_file,
+                  data_root=data_root, output_root=out_root,
+                  stages=("train", "infer"), user_keys=[USER_KEY])
+
+    train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
+    meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["pbus_mode_configured"] == "auto"
+    assert meta["pbus_mode"] == "scaled"
+    assert meta["pbus_mode_decision"]["stage"] == "pre_rule"
+    assert meta["feature_names"].index("pbus") in meta["scale_cols"]
+
+    infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+    infer_meta = json.loads((infer_dir / "meta.json").read_text(encoding="utf-8"))
+    assert infer_meta["pbus_mode"] == "scaled"
+    assert infer_meta["pbus_mode_configured"] == "auto"
+    # 默认 auto 下 infer 自动继承 scaled，不应产生不一致告警
+    assert not any("pbus_mode" in r.message and "不一致" in r.message for r in caplog.records)
+
+
+from nilm.models.base import BaseModel as _BaseModelForStub
+
+
+class _RawSensitiveTransformerStub(_BaseModelForStub):
+    """模块级可 pickle 桩模型：模拟序列模型在未缩放 pbus(std>5) 下病态欠拟合、
+    在 z-score pbus(std<=5) 下正常收敛，用于端到端验证后置红色熔断自动重训。"""
+    name = "transformer"
+
+    def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+            index=None, val_index=None):
+        import numpy as np
+        self._p_idx = list(feature_names).index("pbus")
+        p = np.asarray(X[:, self._p_idx], dtype=np.float64)
+        yv = np.asarray(y[:, 0], dtype=np.float64)
+        self._k = y.shape[1]
+        self._y_mean = float(yv.mean())
+        if float(p.std()) > 5.0:
+            # 未缩放 raw pbus：模拟早停欠拟合（带宽>10非坍缩，但斜率失准 R²≈0.75 << ridge 0.995）
+            self._underfit = True
+            self._a = 0.25
+            self._b = self._y_mean - self._a * float(p.mean())
+        else:
+            # z-score scaled pbus：正常最小二乘收敛 -> R²>0.99
+            self._underfit = False
+            pc = p - p.mean()
+            self._a = float((pc @ (yv - self._y_mean)) / (pc @ pc))
+            self._b = self._y_mean - self._a * float(p.mean())
+
+    def predict(self, X, index=None):
+        import numpy as np
+        p = np.asarray(X[:, self._p_idx], dtype=np.float64)
+        out = p * self._a + self._b
+        return np.repeat(out[:, None], self._k, axis=1)
+
+
+def test_pbus_mode_auto_post_fallback_retrains_scaled_with_red_warning(
+        tmp_path, base_cfg, time_filter_file, caplog):
+    """端到端验证第3步后置熔断：
+    - 前置初判因中小母线选 raw；
+    - transformer 在 raw 下欠拟合输给 history_profile/ridge；
+    - 自动输出 ANSI 亮红色告警日志并重训切换为 pbus_mode='scaled'；
+    - 文件日志剥离 ANSI 转义符保持干净，落盘模型与推理均为重训后的 scaled 版本。
+    """
+    import logging
+    import yaml
+    from nilm.common.logging import setup_logging
+    from nilm.models import MODEL_REGISTRY
+
+    log_file = tmp_path / "run.log"
+    setup_logging(log_path=log_file)
+
+    orig_cls = MODEL_REGISTRY._factories.get("transformer")
+    MODEL_REGISTRY._factories["transformer"] = _RawSensitiveTransformerStub
+    try:
+        cfg_with_tf = dict(base_cfg)
+        cfg_with_tf["models"] = list(base_cfg["models"]) + [{"name": "transformer"}]
+        base_path = tmp_path / "base_with_tf.yaml"
+        base_path.write_text(yaml.safe_dump(cfg_with_tf, allow_unicode=True, sort_keys=False),
+                             encoding="utf-8")
+
+        data_root = tmp_path / "data"
+        write_user_dir(data_root, USER_KEY, days=21)
+        write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+        out_root = tmp_path / "outputs"
+
+        with caplog.at_level(logging.WARNING):
+            run_batch(time_filter_file, base_config_path=base_path,
+                      data_root=data_root, output_root=out_root,
+                      stages=("train", "infer"), user_keys=[USER_KEY])
+
+        # 1) 控制台日志含 ANSI 红色转义符 (\033[91m) 与 AUTO-FALLBACK 重训提示
+        fb_logs = [r.message for r in caplog.records if "[AUTO-FALLBACK]" in r.message]
+        assert len(fb_logs) == 1, f"应精确触发一次后置熔断日志，实得: {fb_logs}"
+        assert "\033[91m" in fb_logs[0] and "\033[0m" in fb_logs[0], "熔断日志须为 ANSI 红色字体"
+        assert "自动重训切换为 pbus_mode=scaled" in fb_logs[0]
+
+        # 2) 文件日志已自动剥离 ANSI 控制符
+        file_text = log_file.read_text(encoding="utf-8")
+        assert "[AUTO-FALLBACK]" in file_text
+        assert "\033[91m" not in file_text
+
+        # 3) 训练产物已切换为重训后的 scaled 版本，transformer 恢复正常高准度
+        train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
+        meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+        assert meta["pbus_mode_configured"] == "auto"
+        assert meta["pbus_mode"] == "scaled"
+        assert meta["pbus_mode_decision"]["stage"] == "post_fallback"
+        assert any("transformer_UNDERFIT" in r for r in meta["pbus_mode_decision"]["fallback_reasons"])
+        assert meta["feature_names"].index("pbus") in meta["scale_cols"]
+
+        pred_df = pd.read_csv(train_dir / "predictions" / "train_predictions.csv")
+        mae_tf = (pred_df["pred_transformer"] - pred_df["target"]).abs().mean()
+        assert mae_tf < 5.0, f"重训切换 scaled 后 transformer 应收敛，实测 MAE={mae_tf}"
+
+        # 4) 推理产物无缝沿用 scaled
+        infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+        infer_meta = json.loads((infer_dir / "meta.json").read_text(encoding="utf-8"))
+        assert infer_meta["pbus_mode"] == "scaled"
+    finally:
+        if orig_cls is not None:
+            MODEL_REGISTRY._factories["transformer"] = orig_cls
+        else:
+            MODEL_REGISTRY._factories.pop("transformer", None)
+
+
+def test_auto_run_ensure_user_config_defaults_to_auto(tmp_path):
+    """auto_run_steps2to5: 新用户默认补 pbus_mode='auto'；已有用户覆盖生成 overlay 不改原文件。"""
+    from scripts.auto_run_steps2to5 import ensure_user_config
+
+    tf_path = tmp_path / "time_filters.json"
+    tf_path.write_text(json.dumps({"_default": {"on_thr_w": 10.0}}), encoding="utf-8")
+
+    # 1) 新用户未传 pbus_mode -> 默认写入 "auto"
+    out_tf = ensure_user_config(USER_KEY, tf_path, target_col="p1+p2")
+    assert out_tf == tf_path
+    saved = json.loads(tf_path.read_text(encoding="utf-8"))
+    assert saved[USER_KEY]["pbus_mode"] == "auto"
+
+    # 2) 已有用户传 --pbus-mode raw -> 生成 overlay，原文件仍为 "auto"
+    ov = ensure_user_config(USER_KEY, tf_path, pbus_mode="raw")
+    assert ov != tf_path and "overlay" in ov.name
+    assert json.loads(ov.read_text(encoding="utf-8"))[USER_KEY]["pbus_mode"] == "raw"
+    assert json.loads(tf_path.read_text(encoding="utf-8"))[USER_KEY]["pbus_mode"] == "auto"
 
 
 class _ConstantStub:

@@ -70,7 +70,7 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
 
     返回本次运行实际使用的配置路径：已有用户无覆盖返回原文件，有覆盖返回
     overlay；新用户写回原文件后返回原文件。target_col/on_thr/decision_thr/pbus_mode
-    为 None 表示未传，沿用配置值；新用户未传则用默认 p1/10/30/raw。
+    为 None 表示未传，沿用配置值；新用户未传则用默认 p1/10/30/auto。
     """
     cfg = json.loads(tf_path.read_text(encoding="utf-8"))
     if user_key in cfg:
@@ -82,7 +82,7 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
             updates["on_thr_w"] = on_thr
         if decision_thr is not None and cur.get("decision_thr_w") != decision_thr:
             updates["decision_thr_w"] = decision_thr
-        eff_cur_pbus = cur.get("pbus_mode") or "raw"
+        eff_cur_pbus = cur.get("pbus_mode") or "auto"
         if pbus_mode is not None and eff_cur_pbus != pbus_mode:
             updates["pbus_mode"] = pbus_mode
         if not updates:
@@ -97,7 +97,7 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         "target_col": target_col if target_col is not None else "p1",
         "on_thr_w": on_thr if on_thr is not None else 10.0,
         "decision_thr_w": decision_thr if decision_thr is not None else 30.0,
-        "pbus_mode": pbus_mode if pbus_mode is not None else "raw",
+        "pbus_mode": pbus_mode if pbus_mode is not None else "auto",
         "post_min_on": 1,
         "post_fill_short_off": 3,
         "quality": {"day_gate": True, "min_on_day_ratio": 0.2},
@@ -203,8 +203,8 @@ def main(argv=None):
     ap.add_argument("--target-col", default=None, help="目标通道；已传且与 time_filters.json 不同则用 overlay 覆盖跑（不写回原文件），未传沿用（新用户默认 p1）")
     ap.add_argument("--on-thr", type=float, default=None, help="on_thr_w；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 10.0）")
     ap.add_argument("--decision-thr", type=float, default=None, help="decision_thr_w；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 30.0）")
-    ap.add_argument("--pbus-mode", choices=["raw", "scaled"], default=None,
-                    help="pbus_mode（raw=pbus未缩放+分摊，默认；scaled=pbus z-score+改学，大厂/多分路求和用）")
+    ap.add_argument("--pbus-mode", choices=["auto", "raw", "scaled"], default=None,
+                    help="pbus_mode（auto=自动判定+欠拟合红色熔断切scaled，默认；raw=锁死未缩放+分摊；scaled=锁死z-score+改学）")
     ap.add_argument("--stage", choices=["all","train","infer","threshold"], default="all", help="all=2+3+5+4 完整，threshold=仅 Step4")
     ap.add_argument("--force", action="store_true", help="--force 忽略 _DONE 重跑")
     ap.add_argument("--skip-train", action="store_true", help="跳过 Step2（已有训练）")
