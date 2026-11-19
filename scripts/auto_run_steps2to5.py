@@ -9,8 +9,9 @@
 用法（仓库根目录）：
   # 新用户 733 一键（默认自动补 time_filters.json 缺省配置 target p1/on10/decision30/day_gate）
   python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219
-  # 覆盖目标/阈值
+  # 覆盖目标/阈值（脚本参数优先于 time_filters.json：已传且与配置不同则覆盖写回，带备份）
   python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219 --target-col p2 --on-thr 10 --decision-thr 30
+  # 未传的参数沿用 time_filters.json 现有值；新用户未传则用默认 p1/10/30
   # 仅推理/仅训练
   python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219 --stage infer
   # 强制重跑
@@ -42,37 +43,57 @@ def sh(cmd, **kw):
         raise SystemExit(rc.returncode)
     return rc
 
-def ensure_user_config(user_key: str, tf_path: Path, target_col: str, on_thr: float, decision_thr: float):
-    """若 time_filters.json 缺该用户，自动补最小可用配置（Step1 模板），并备份原文件"""
+def _write_cfg_with_backup(tf_path: Path, cfg: dict) -> Path:
+    """备份原文件后写回（Windows 下 rename 目标已存在会 FileExistsError(183)，用时间戳+replace 兜底）"""
+    bak = tf_path.with_suffix(".bak.auto")
+    if bak.exists():
+        from datetime import datetime
+        bak = tf_path.with_suffix(f".bak.auto.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        if bak.exists():
+            bak.unlink()
+    try:
+        tf_path.rename(bak)
+    except FileExistsError:
+        tf_path.replace(bak)
+    tf_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return bak
+
+def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None, decision_thr=None):
+    """脚本参数优先于 time_filters.json：已传且与配置不同则覆盖写回（带备份）。
+
+    target_col/on_thr/decision_thr 为 None 表示未传，沿用配置值；
+    新用户未传则用默认 p1/10/30。
+    """
     cfg = json.loads(tf_path.read_text(encoding="utf-8"))
     if user_key in cfg:
-        log(f"time_filters.json 已含 {user_key} → 沿用（target={cfg[user_key].get('target_col')} on={cfg[user_key].get('on_thr_w')} dec={cfg[user_key].get('decision_thr_w')})")
-        return False
+        cur = cfg[user_key]
+        updates = {}
+        if target_col is not None and cur.get("target_col") != target_col:
+            updates["target_col"] = target_col
+        if on_thr is not None and cur.get("on_thr_w") != on_thr:
+            updates["on_thr_w"] = on_thr
+        if decision_thr is not None and cur.get("decision_thr_w") != decision_thr:
+            updates["decision_thr_w"] = decision_thr
+        if not updates:
+            log(f"time_filters.json 已含 {user_key} → 沿用（target={cur.get('target_col')} on={cur.get('on_thr_w')} dec={cur.get('decision_thr_w')})")
+            return False
+        old = {k: cur.get(k) for k in updates}
+        cur.update(updates)
+        bak = _write_cfg_with_backup(tf_path, cfg)
+        log(f"time_filters.json 已含 {user_key} → 脚本参数覆盖（{old} → {updates}），原文件备份 {bak.name}", "WARN")
+        return True
     cfg[user_key] = {
-        "target_col": target_col,
-        "on_thr_w": on_thr,
-        "decision_thr_w": decision_thr,
+        "target_col": target_col if target_col is not None else "p1",
+        "on_thr_w": on_thr if on_thr is not None else 10.0,
+        "decision_thr_w": decision_thr if decision_thr is not None else 30.0,
         "post_min_on": 1,
         "post_fill_short_off": 3,
         "quality": {"day_gate": True, "min_on_day_ratio": 0.2},
         "train": {"include": [["2025-07-10","2026-06-30"]]},
         "infer": {"include": [["2026-07-01","2026-07-31"]]}
     }
-    bak = tf_path.with_suffix(".bak.auto")
-    # Windows 下 rename 若目标已存在会 FileExistsError(183)；此前 800080270815 已产生 .bak.auto，第二新户即撞
-    if bak.exists():
-        from datetime import datetime
-        bak = tf_path.with_suffix(f".bak.auto.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        # 极小概率同秒再撞则直接覆盖
-        if bak.exists():
-            bak.unlink()
-    try:
-        tf_path.rename(bak)
-    except FileExistsError:
-        # 兜底：原子覆盖（Windows 需用 replace）
-        tf_path.replace(bak)
-    tf_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    log(f"已为新用户 {user_key} 补 time_filters.json（target={target_col} on={on_thr} dec={decision_thr}），原文件备份 {bak.name}", "WARN")
+    bak = _write_cfg_with_backup(tf_path, cfg)
+    log(f"已为新用户 {user_key} 补 time_filters.json（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} dec={cfg[user_key]['decision_thr_w']}），原文件备份 {bak.name}", "WARN")
     log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）", "WARN")
     return True
 
@@ -167,9 +188,9 @@ def main(argv=None):
     ap.add_argument("--base-config", default=str(DEFAULT_BASE))
     ap.add_argument("--data-root", default="data")
     ap.add_argument("--output-root", default="outputs")
-    ap.add_argument("--target-col", default="p1", help="新用户自动补配置时的 target_col（默认 p1，需按 §1 核实）")
-    ap.add_argument("--on-thr", type=float, default=10.0)
-    ap.add_argument("--decision-thr", type=float, default=30.0)
+    ap.add_argument("--target-col", default=None, help="目标通道；已传且与 time_filters.json 不同则覆盖写回，未传沿用配置（新用户默认 p1）")
+    ap.add_argument("--on-thr", type=float, default=None, help="on_thr_w；已传且与配置不同则覆盖，未传沿用（新用户默认 10.0）")
+    ap.add_argument("--decision-thr", type=float, default=None, help="decision_thr_w；已传且与配置不同则覆盖，未传沿用（新用户默认 30.0）")
     ap.add_argument("--stage", choices=["all","train","infer","threshold"], default="all", help="all=2+3+5+4 完整，threshold=仅 Step4")
     ap.add_argument("--force", action="store_true", help="--force 忽略 _DONE 重跑")
     ap.add_argument("--skip-train", action="store_true", help="跳过 Step2（已有训练）")
