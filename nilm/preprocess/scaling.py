@@ -13,9 +13,17 @@ EPS = 1e-12
 
 
 class TrainFitScaler:
-    """z-score 标准化（仅指定列）；fit 只接受训练集，transform 用于任意划分。"""
+    """z-score 标准化（仅指定列）；fit 只接受训练集，transform 用于任意划分。
 
-    def __init__(self) -> None:
+    clip（可选）：transform 后将 z 值截断到 [-clip, clip]，限制分布外
+    （如训练期→推理期基线漂移）的外推幅度；None（默认）= 不截断，
+    保持历史行为。由 base_cfg.preprocess.scaler_clip 传入。
+    """
+
+    def __init__(self, clip: float | None = None) -> None:
+        if clip is not None and float(clip) <= 0:
+            raise ValueError(f"scaler clip 必须为正数或 None，收到 {clip}")
+        self.clip_: float | None = None if clip is None else float(clip)
         self.cols_: np.ndarray | None = None
         self.mean_: np.ndarray | None = None
         self.std_: np.ndarray | None = None
@@ -32,7 +40,10 @@ class TrainFitScaler:
         if self.mean_ is None:
             raise RuntimeError("Scaler 尚未由训练集 fit（§11：只能由 Train 拟合）")
         out = X.astype(np.float64).copy()
-        out[:, self.cols_] = (out[:, self.cols_] - self.mean_) / self.std_
+        z = (out[:, self.cols_] - self.mean_) / self.std_
+        if self.clip_ is not None:
+            z = np.clip(z, -self.clip_, self.clip_)
+        out[:, self.cols_] = z
         return out
 
     def state(self) -> dict:
@@ -40,11 +51,12 @@ class TrainFitScaler:
             "cols": self.cols_.tolist() if self.cols_ is not None else None,
             "mean": self.mean_.tolist() if self.mean_ is not None else None,
             "std": self.std_.tolist() if self.std_ is not None else None,
+            "clip": self.clip_,
         }
 
     @classmethod
     def from_state(cls, state: dict) -> "TrainFitScaler":
-        s = cls()
+        s = cls(clip=state.get("clip", None))
         s.cols_ = np.asarray(state["cols"]) if state.get("cols") is not None else None
         s.mean_ = np.asarray(state["mean"]) if state.get("mean") is not None else None
         s.std_ = np.asarray(state["std"]) if state.get("std") is not None else None

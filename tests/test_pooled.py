@@ -219,6 +219,31 @@ def test_branch_scale_config_defaults():
     assert merged2["branch_scale"] == 0.001
 
 
+def test_scaler_clip():
+    """z-score 截断：分布内不变，分布外限幅；state 往返保留 clip。"""
+    from nilm.preprocess.scaling import TrainFitScaler
+    Xtr = np.array([[0.0], [2.0], [4.0], [6.0]])  # mean 3, std sqrt(5)
+    sc = TrainFitScaler(clip=1.0).fit(Xtr, cols=[0])
+    z = sc.transform(np.array([[3.0], [13.0], [-7.0]]))
+    assert z[0, 0] == pytest.approx(0.0)
+    assert z[1, 0] == pytest.approx(1.0)   # (13-3)/sqrt(5)=4.47 -> 1.0
+    assert z[2, 0] == pytest.approx(-1.0)  # (-7-3)/sqrt(5)=-4.47 -> -1.0
+    # 默认 None 不截断（历史行为）
+    sc2 = TrainFitScaler().fit(Xtr, cols=[0])
+    assert sc2.transform(np.array([[13.0]]))[0, 0] > 4.0
+    # state 往返
+    st = sc.state()
+    assert st["clip"] == 1.0
+    sc3 = TrainFitScaler.from_state(st)
+    assert sc3.transform(np.array([[13.0]]))[0, 0] == pytest.approx(1.0)
+    # 旧 state 无 clip 键 -> 默认 None
+    st_old = {k: v for k, v in st.items() if k != "clip"}
+    assert TrainFitScaler.from_state(st_old).clip_ is None
+    # 非法 clip
+    with pytest.raises(ValueError):
+        TrainFitScaler(clip=0)
+
+
 def test_quality_before_ptct():
     """质量在二次侧打分：二次 100V 通过、一次 10000V 超 BOUNDS 1000V 失败。"""
     from nilm.data_io.validator import daily_quality_table
