@@ -9,9 +9,9 @@
 用法（仓库根目录）：
   # 新用户 733 一键（默认自动补 time_filters.json 缺省配置 target p1/on10/decision30/day_gate）
   python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219
-  # 覆盖目标/阈值（脚本参数优先于 time_filters.json：已传且与配置不同则覆盖写回，带备份）
+  # 覆盖目标/阈值（脚本参数优先于 time_filters.json：已传且与配置不同则用临时 overlay 跑，不写回原文件）
   python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219 --target-col p2 --on-thr 10 --decision-thr 30
-  # 未传的参数沿用 time_filters.json 现有值；新用户未传则用默认 p1/10/30
+  # 未传的参数沿用 time_filters.json 现有值；新用户未传则用默认 p1/10/30（同样走 overlay，原文件不动）
   # 仅推理/仅训练
   python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219 --stage infer
   # 强制重跑
@@ -43,26 +43,18 @@ def sh(cmd, **kw):
         raise SystemExit(rc.returncode)
     return rc
 
-def _write_cfg_with_backup(tf_path: Path, cfg: dict) -> Path:
-    """备份原文件后写回（Windows 下 rename 目标已存在会 FileExistsError(183)，用时间戳+replace 兜底）"""
-    bak = tf_path.with_suffix(".bak.auto")
-    if bak.exists():
-        from datetime import datetime
-        bak = tf_path.with_suffix(f".bak.auto.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        if bak.exists():
-            bak.unlink()
-    try:
-        tf_path.rename(bak)
-    except FileExistsError:
-        tf_path.replace(bak)
-    tf_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    return bak
+def _write_overlay(tf_path: Path, cfg: dict, user_key: str) -> Path:
+    """把覆盖后的配置写入临时 overlay 文件（原 time_filters.json 永不修改）。"""
+    overlay = tf_path.parent / f"{tf_path.stem}.overlay.{user_key}.json"
+    overlay.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return overlay
 
-def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None, decision_thr=None):
-    """脚本参数优先于 time_filters.json：已传且与配置不同则覆盖写回（带备份）。
+def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None, decision_thr=None) -> Path:
+    """脚本参数优先于 time_filters.json，但不写回原文件。
 
-    target_col/on_thr/decision_thr 为 None 表示未传，沿用配置值；
-    新用户未传则用默认 p1/10/30。
+    返回本次运行实际使用的配置路径：无覆盖时返回原文件；有覆盖（或新用户）
+    时返回临时 overlay 文件（原文件不动）。target_col/on_thr/decision_thr
+    为 None 表示未传，沿用配置值；新用户未传则用默认 p1/10/30。
     """
     cfg = json.loads(tf_path.read_text(encoding="utf-8"))
     if user_key in cfg:
@@ -76,12 +68,12 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
             updates["decision_thr_w"] = decision_thr
         if not updates:
             log(f"time_filters.json 已含 {user_key} → 沿用（target={cur.get('target_col')} on={cur.get('on_thr_w')} dec={cur.get('decision_thr_w')})")
-            return False
+            return tf_path
         old = {k: cur.get(k) for k in updates}
         cur.update(updates)
-        bak = _write_cfg_with_backup(tf_path, cfg)
-        log(f"time_filters.json 已含 {user_key} → 脚本参数覆盖（{old} → {updates}），原文件备份 {bak.name}", "WARN")
-        return True
+        overlay = _write_overlay(tf_path, cfg, user_key)
+        log(f"time_filters.json 已含 {user_key} → 脚本参数覆盖（{old} → {updates}），原文件未动，本次用 overlay {overlay.name}", "WARN")
+        return overlay
     cfg[user_key] = {
         "target_col": target_col if target_col is not None else "p1",
         "on_thr_w": on_thr if on_thr is not None else 10.0,
@@ -92,10 +84,10 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         "train": {"include": [["2025-07-10","2026-06-30"]]},
         "infer": {"include": [["2026-07-01","2026-07-31"]]}
     }
-    bak = _write_cfg_with_backup(tf_path, cfg)
-    log(f"已为新用户 {user_key} 补 time_filters.json（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} dec={cfg[user_key]['decision_thr_w']}），原文件备份 {bak.name}", "WARN")
-    log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）", "WARN")
-    return True
+    overlay = _write_overlay(tf_path, cfg, user_key)
+    log(f"新用户 {user_key} → 临时 overlay 补配置（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} dec={cfg[user_key]['decision_thr_w']}），原文件未动，用 {overlay.name}", "WARN")
+    log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）；需持久化请手动并入 time_filters.json", "WARN")
+    return overlay
 
 def step2_train(user_key, tf, base, data_root, out_root, force):
     cmd = [sys.executable, "scripts/run_batch_users.py",
@@ -188,9 +180,9 @@ def main(argv=None):
     ap.add_argument("--base-config", default=str(DEFAULT_BASE))
     ap.add_argument("--data-root", default="data")
     ap.add_argument("--output-root", default="outputs")
-    ap.add_argument("--target-col", default=None, help="目标通道；已传且与 time_filters.json 不同则覆盖写回，未传沿用配置（新用户默认 p1）")
-    ap.add_argument("--on-thr", type=float, default=None, help="on_thr_w；已传且与配置不同则覆盖，未传沿用（新用户默认 10.0）")
-    ap.add_argument("--decision-thr", type=float, default=None, help="decision_thr_w；已传且与配置不同则覆盖，未传沿用（新用户默认 30.0）")
+    ap.add_argument("--target-col", default=None, help="目标通道；已传且与 time_filters.json 不同则用 overlay 覆盖跑（不写回原文件），未传沿用（新用户默认 p1）")
+    ap.add_argument("--on-thr", type=float, default=None, help="on_thr_w；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 10.0）")
+    ap.add_argument("--decision-thr", type=float, default=None, help="decision_thr_w；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 30.0）")
     ap.add_argument("--stage", choices=["all","train","infer","threshold"], default="all", help="all=2+3+5+4 完整，threshold=仅 Step4")
     ap.add_argument("--force", action="store_true", help="--force 忽略 _DONE 重跑")
     ap.add_argument("--skip-train", action="store_true", help="跳过 Step2（已有训练）")
@@ -205,18 +197,19 @@ def main(argv=None):
 
     log(f"用户 {user_key}  Stage={args.stage}  TF={tf}  Base={base}  Data={data_root}  Out={out_root}")
 
-    if args.stage in ("all","train"):
-        ensure_user_config(user_key, tf, args.target_col, args.on_thr, args.decision_thr)
+    effective_tf = tf
+    if args.stage in ("all","train","infer"):
+        effective_tf = ensure_user_config(user_key, tf, args.target_col, args.on_thr, args.decision_thr)
 
     if args.stage in ("all","train") and not args.skip_train:
-        step2_train(user_key, tf, base, data_root, out_root, args.force)
+        step2_train(user_key, effective_tf, base, data_root, out_root, args.force)
     if args.stage in ("all","train"):
         try:
             step3_window_check(user_key, out_root)
         except Exception as e:
             log(f"Step3 异常: {e}", "WARN")
     if args.stage in ("all","infer") and not args.skip_infer:
-        step5_infer(user_key, tf, base, data_root, out_root, args.force)
+        step5_infer(user_key, effective_tf, base, data_root, out_root, args.force)
     if args.stage in ("all","threshold"):
         step4_threshold(user_key, out_root)
 
