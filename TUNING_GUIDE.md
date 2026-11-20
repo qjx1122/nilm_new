@@ -141,7 +141,7 @@ python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/420000
 ```
 
 * `target_col` 必填，`on_thr` 看铭牌（10/50/60 三档：`p2`低频10，`p1`高功率50），`decision` 先 30。
-* `pbus_mode` 默认 `"auto"`（推荐）：训练时仅用 `train` 集无泄漏统计量自动判定——高母线幅值（`P95(pbus)>800kW` 或 `std>150kW`）或低贡献率（`contribution_ratio<0.20`，如 733）自动走 `"scaled"`（`pbus` z-score + `proportional` 线性改学），中小母线主导负荷（如 856/2842）自动走 `"raw"`（`pbus` 未缩放 + 物理分摊，跨期抗漂移）；若前置初判 `"raw"` 但在验证集触发序列模型欠拟合信号，代码会自动重训切为 `"scaled"` 并输出**红色高亮日志**；推理自动继承训练产物模式。也可手工指定 `"raw"` 或 `"scaled"` 锁死（切换后须加 `--force` 重训重推）。
+* `pbus_mode` 默认 `"auto"`（推荐）：训练时仅用 `train` 集无泄漏统计量自动判定——超大母线幅值（`P95(pbus)>2500kW` 或 `std>800kW`）或大母线开机态低贡献率（`P95>800kW` 且 `on_contrib_ratio<0.25`，如 733）自动走 `"scaled"`（`pbus` z-score + `proportional` 线性改学）；中低压母线或间歇高功率主导负荷（如 856/2842）自动走 `"raw"`（`pbus` 未缩放 + 物理分摊，跨期抗零点漂移）；若前置初判 `"raw"` 但在验证集触发序列模型真实欠拟合信号（`R²` 与 `MAE` 同时劣于基线或预测坍缩），代码会自动重训切为 `"scaled"` 并输出**红色高亮日志**；推理自动继承训练产物模式。也可手工指定 `"raw"` 或 `"scaled"` 锁死（切换后须加 `--force` 重训重推）。
 * `post_min_on 1` 去 <1 窗的抖动（恒空操作，防短闪），`post_fill_short_off 3` 填 ≤45min 的短关断。
 * `day_gate true` 全局默认（优先级 `day > train_range > full`），`min_on_day_ratio 0.2` 防“无可学开机模式”（2844旧池 31%→71%已验）。
 * `train/include` 为闭区间，`YYYY-MM-DD` 自动扩到 00:00-23:59:59。

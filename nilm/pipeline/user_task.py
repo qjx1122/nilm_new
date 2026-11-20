@@ -68,16 +68,21 @@ def _non_scaled_cols(pbus_mode: str) -> set[str]:
     raise ValueError(f"未知物理 pbus_mode={pbus_mode!r}（仅支持 'raw' / 'scaled'）")
 
 
-def resolve_auto_pbus_mode(pbus_train: np.ndarray, y_train: np.ndarray) -> tuple[str, dict]:
-    """基于 train 集无泄漏物理统计量自动判定 pbus_mode（对应三步决策法第1、2步）。
+def resolve_auto_pbus_mode(pbus_train: np.ndarray,
+                           y_train: np.ndarray,
+                           on_thr_w: float = 10.0) -> tuple[str, dict]:
+    """基于 train 集无泄漏物理统计量自动判定 pbus_mode（对应三步决策法第1、2步，v2 校准版）。
 
-    严格仅使用 splits['train']（严禁接触 val/test，遵守 §11 零泄漏契约）：
-    - R1 幅值防淹没：P95(pbus) > 800kW 或 std(pbus) > 150kW -> scaled
-      （防大母线激活方差碾压 slot(0..95, std≈28) 与标准化特征致 LayerNorm 淹没欠拟合）；
-    - R2 低贡献率防背景淹没：contribution_ratio = mean(y)/mean(pbus) < 0.20 -> scaled
-      （母线均值 > 目标均值 5 倍，大厂局部产线/低占比求和，raw 下 proportional 必崩盘）；
-    - R3 灰区联合判定：500 < P95(pbus) <= 800 且 contribution_ratio < 0.33 -> scaled；
-    - 其余中小母线主导负荷（如 856/2842/2844）保持 raw，兼顾物理分摊与跨月抗漂移。
+    严格仅使用 splits['train']（严禁接触 val/test，遵守 §11 零泄漏契约）。
+    结合第3步单向后置熔断（raw 欠拟合可自动切回 scaled 重训，而 scaled 跨期漂移不可逆）的
+    不对称代价，前置初判仅对高置信度大母线/开机低占比用户直接选 scaled：
+    - R1 超大母线幅值防淹没：P95(pbus) > 2500kW 或 std(pbus) > 800kW -> scaled
+      （如 733：pt×ct=16000 一次侧 P95≈4005kW, std≈1311kW，防 LayerNorm 激活方差淹没；
+        放行 856 类 pt×ct=6000 中压专变 P95≈1545kW, std≈550kW）；
+    - R2 开机态条件低贡献率防背景淹没：P95(pbus) > 800kW 且 on_contrib_ratio < 0.25 -> scaled
+      （on_contrib_ratio = mean(y_on)/mean(pbus_on)，仅在 y >= on_thr_w 开机点计算，
+        消除 856 类低占空比间歇大负荷 82% 关机 0 值对全天均值比的稀释误判）；
+    - 其余用户前置默认走 raw（兼顾物理分摊与跨月抗零点漂移；若真触发欠拟合由第3步红色熔断兜底）。
     """
     pb_arr = np.asarray(pbus_train, dtype=np.float64).reshape(-1)
     yt_arr = np.asarray(y_train, dtype=np.float64).reshape(-1)
@@ -88,7 +93,9 @@ def resolve_auto_pbus_mode(pbus_train: np.ndarray, y_train: np.ndarray) -> tuple
             "configured_mode": "auto", "resolved_mode": "raw",
             "stage": "pre_rule", "train_pbus_p95": 0.0, "train_pbus_std": 0.0,
             "train_pbus_mean": 0.0, "train_target_mean": 0.0,
-            "train_contrib_ratio": 1.0, "reasons": ["EMPTY_TRAIN_FALLBACK_RAW"],
+            "train_contrib_ratio": 1.0, "train_on_contrib_ratio": 1.0,
+            "train_on_duty_ratio": 0.0, "on_thr_w": float(on_thr_w),
+            "reasons": ["EMPTY_TRAIN_FALLBACK_RAW"],
         }
 
     p95 = float(np.quantile(pb, 0.95))
@@ -97,13 +104,21 @@ def resolve_auto_pbus_mode(pbus_train: np.ndarray, y_train: np.ndarray) -> tuple
     mean_y = float(np.mean(yt))
     contrib = (mean_y / mean_pb) if mean_pb > 1e-9 else 1.0
 
+    on_mask = yt >= float(on_thr_w)
+    on_duty = float(np.mean(on_mask))
+    if np.any(on_mask):
+        mean_pb_on = float(np.mean(pb[on_mask]))
+        mean_y_on = float(np.mean(yt[on_mask]))
+        on_contrib = (mean_y_on / mean_pb_on) if mean_pb_on > 1e-9 else 1.0
+    else:
+        on_contrib = contrib
+
     reasons: list[str] = []
-    if p95 > 800.0 or pstd > 150.0:
-        reasons.append(f"HIGH_BUS_SCALE(p95={p95:.1f}>800 or std={pstd:.1f}>150)")
-    if contrib < 0.20:
-        reasons.append(f"LOW_CONTRIB_RATIO(contrib={contrib:.4f}<0.20)")
-    if 500.0 < p95 <= 800.0 and contrib < 0.33:
-        reasons.append(f"GRAY_ZONE_BUS(p95={p95:.1f}, contrib={contrib:.4f}<0.33)")
+    if p95 > 2500.0 or pstd > 800.0:
+        reasons.append(f"HIGH_BUS_SCALE(p95={p95:.1f}>2500 or std={pstd:.1f}>800)")
+    if p95 > 800.0 and on_contrib < 0.25:
+        reasons.append(
+            f"LOW_ON_CONTRIB_RATIO(p95={p95:.1f}>800, on_contrib={on_contrib:.4f}<0.25)")
 
     mode = "scaled" if reasons else "raw"
     return mode, {
@@ -115,7 +130,10 @@ def resolve_auto_pbus_mode(pbus_train: np.ndarray, y_train: np.ndarray) -> tuple
         "train_pbus_mean": round(mean_pb, 2),
         "train_target_mean": round(mean_y, 2),
         "train_contrib_ratio": round(contrib, 4),
-        "reasons": reasons or ["SMALL_DOMINANT_BUS_KEEP_RAW"],
+        "train_on_contrib_ratio": round(on_contrib, 4),
+        "train_on_duty_ratio": round(on_duty, 4),
+        "on_thr_w": float(on_thr_w),
+        "reasons": reasons or ["KEEP_RAW_BY_PRE_RULE"],
     }
 
 
@@ -126,8 +144,10 @@ def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
 
     当前置规则初判为 raw 时，检查深度序列模型是否因未缩放 pbus 条件数病态触发欠拟合/坍缩：
     1) 预测带宽坍缩（train 或 val 带宽 < on_thr_w）或 train R² < 0；
-    2) 序列模型在 train 与 val 上双双显著劣于非退化基线（history_profile / ridge）；
-    3) 序列模型在 val 上显著劣于纯静态槽位画像 history_profile 且 proportional 严重失配（R² < -1）。
+    2) 序列模型在 train 与 val 上 R² 双双显著劣于非退化基线（history_profile / ridge），
+       且 val MAE 亦劣于最优参考基线（防 ridge 因最小化 MSE 使 R² 虚高但 MAE 远差于
+       SmoothL1 序列模型如 856 时发生误熔断）；
+    3) 序列模型在 val 上 R² 与 MAE 均劣于纯静态槽位画像 history_profile 且 proportional 严重失配（R² < -1）。
     """
     reasons: list[str] = []
     ref_models = [b for b in ("history_profile", "ridge") if b in results_by_split]
@@ -140,6 +160,8 @@ def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
         by_sp = results_by_split[seq_name]
         tr_r2 = by_sp.get("train", {}).get("r2", {}).get("macro")
         val_r2 = by_sp.get("val", {}).get("r2", {}).get("macro")
+        tr_mae = by_sp.get("train", {}).get("mae", {}).get("macro")
+        val_mae = by_sp.get("val", {}).get("mae", {}).get("macro")
         bands = split_bands.get(seq_name, {})
         tr_band = bands.get("train")
         val_band = bands.get("val")
@@ -164,24 +186,46 @@ def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
                            for b in ref_models
                            if "val" in results_by_split[b] and "r2" in results_by_split[b]["val"]]
                 best_ref_val = max(ref_val) if ref_val else None
+                ref_val_maes = [results_by_split[b]["val"]["mae"]["macro"]
+                                for b in ref_models
+                                if "val" in results_by_split[b]
+                                and "mae" in results_by_split[b]["val"]]
+                best_ref_val_mae = min(ref_val_maes) if ref_val_maes else None
+                mae_worse = (val_mae is None or best_ref_val_mae is None
+                             or val_mae > best_ref_val_mae)
                 if (best_ref_tr is not None and best_ref_val is not None
-                        and tr_r2 < best_ref_tr - 0.03 and val_r2 < best_ref_val - 0.02):
+                        and tr_r2 < best_ref_tr - 0.03 and val_r2 < best_ref_val - 0.02
+                        and mae_worse):
+                    mae_tag = (f", val_mae={val_mae:.2f}>{best_ref_val_mae:.2f}"
+                               if (val_mae is not None and best_ref_val_mae is not None) else "")
                     reasons.append(
                         f"{seq_name}_UNDERFIT_VS_BASELINE("
                         f"train_r2={tr_r2:.4f}<{best_ref_tr:.4f}-0.03, "
-                        f"val_r2={val_r2:.4f}<{best_ref_val:.4f}-0.02)")
+                        f"val_r2={val_r2:.4f}<{best_ref_val:.4f}-0.02{mae_tag})")
                     continue
                 hp_val = (results_by_split.get("history_profile", {})
                           .get("val", {}).get("r2", {}).get("macro"))
-                if hp_val is not None and val_r2 < hp_val - 0.02 and prop_tr_r2 < -1.0:
+                hp_val_mae = (results_by_split.get("history_profile", {})
+                              .get("val", {}).get("mae", {}).get("macro"))
+                hp_mae_worse = (val_mae is None or hp_val_mae is None or val_mae > hp_val_mae)
+                if (hp_val is not None and val_r2 < hp_val - 0.02
+                        and hp_mae_worse and prop_tr_r2 < -1.0):
                     reasons.append(
                         f"{seq_name}_VAL_WORSE_THAN_PROFILE("
                         f"val_r2={val_r2:.4f}<{hp_val:.4f}-0.02, prop_train_r2={prop_tr_r2:.2f})")
                     continue
-            elif best_ref_tr is not None and tr_r2 < best_ref_tr - 0.05:
-                reasons.append(
-                    f"{seq_name}_TRAIN_UNDERFIT_VS_BASELINE("
-                    f"train_r2={tr_r2:.4f}<{best_ref_tr:.4f}-0.05)")
+            elif best_ref_tr is not None:
+                ref_tr_maes = [results_by_split[b]["train"]["mae"]["macro"]
+                               for b in ref_models
+                               if "train" in results_by_split[b]
+                               and "mae" in results_by_split[b]["train"]]
+                best_ref_tr_mae = min(ref_tr_maes) if ref_tr_maes else None
+                tr_mae_worse = (tr_mae is None or best_ref_tr_mae is None
+                                or tr_mae > best_ref_tr_mae)
+                if tr_r2 < best_ref_tr - 0.05 and tr_mae_worse:
+                    reasons.append(
+                        f"{seq_name}_TRAIN_UNDERFIT_VS_BASELINE("
+                        f"train_r2={tr_r2:.4f}<{best_ref_tr:.4f}-0.05)")
 
     return bool(reasons), reasons
 
@@ -514,15 +558,21 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                            qualified_detail=q_detail)  # 重写含双达标统计
 
         # Scaler 只由 Train 拟合（§11）；按用户级 pbus_mode 选择（默认 "auto" 自动判定+欠拟合熔断）
+        wmode = base_cfg.get("dataset", {}).get("mode", "seq2seq")
+        metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
+        on_thr = float(user_cfg["on_thr_w"])
         pbus_col = names.index("pbus")
         cfg_pbus_mode = str(user_cfg.get("pbus_mode") or "auto")
         if cfg_pbus_mode == "auto":
             pbus_mode, pbus_decision = resolve_auto_pbus_mode(
-                splits["train"][0][:, pbus_col], splits["train"][1][:, 0])
+                splits["train"][0][:, pbus_col], splits["train"][1][:, 0],
+                on_thr_w=on_thr)
             log.info("[%s] [auto] 前置判定 pbus_mode=%s（train_p95=%.1f, std=%.1f, "
-                     "contrib_ratio=%.4f, reasons=%s）",
+                     "on_contrib=%.4f, duty=%.1f%%, all_contrib=%.4f, reasons=%s）",
                      user_key, pbus_mode, pbus_decision["train_pbus_p95"],
                      pbus_decision["train_pbus_std"],
+                     pbus_decision["train_on_contrib_ratio"],
+                     pbus_decision["train_on_duty_ratio"] * 100.0,
                      pbus_decision["train_contrib_ratio"],
                      pbus_decision["reasons"])
         else:
@@ -534,9 +584,6 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 "reasons": ["EXPLICIT_USER_CONFIG"],
             }
 
-        wmode = base_cfg.get("dataset", {}).get("mode", "seq2seq")
-        metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
-        on_thr = float(user_cfg["on_thr_w"])
         dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
         post_min_on = int(user_cfg["post_min_on"])
         post_fill_off = int(user_cfg["post_fill_short_off"])

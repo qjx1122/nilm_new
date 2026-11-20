@@ -627,72 +627,99 @@ def test_proportional_legacy_pickle_and_mode_validation():
 
 
 def test_resolve_auto_pbus_mode_boundaries():
-    """前置无泄漏三规则边界单测：R1 幅值防淹没、R2 低贡献率、R3 灰区联合、中小主导负荷保 raw。"""
+    """前置无泄漏 v2 校准规则与后置单向熔断边界单测（覆盖 733 / 856 / 2842 真实分布）。"""
     import numpy as np
-    from nilm.pipeline.user_task import resolve_auto_pbus_mode
+    from nilm.pipeline.user_task import resolve_auto_pbus_mode, _should_fallback_raw_to_scaled
 
-    # 1) 856/2842 类中小母线主导单路（p95≈200<=500, std≈40<=150, contrib=0.50>=0.33）-> raw
+    # 1) 2842/2844 类低压中小母线主导单路（p95≈200<=2500, on_contrib=0.50>=0.25）-> raw
     pb_small = np.linspace(100.0, 210.0, 200)
-    y_dom = 0.5 * pb_small
-    m1, d1 = resolve_auto_pbus_mode(pb_small, y_dom)
+    m1, d1 = resolve_auto_pbus_mode(pb_small, 0.5 * pb_small, on_thr_w=10.0)
     assert m1 == "raw" and d1["stage"] == "pre_rule"
 
-    # 2) R1 大母线（p95 > 800 或 std > 150，即使贡献率高也必须防 LayerNorm 淹没）-> scaled
-    pb_large = np.linspace(1000.0, 2500.0, 200)
-    m2, d2 = resolve_auto_pbus_mode(pb_large, 0.4 * pb_large)
-    assert m2 == "scaled" and any("HIGH_BUS_SCALE" in r for r in d2["reasons"])
+    # 2) 复现 856 真实分布（pt*ct=6000 中压专变 p95≈1545<=2500, std≈550<=800；
+    #    开机占空比仅 18% 致全时段 all_contrib≈0.19<0.20，但开机态 on_contrib≈0.36>=0.25）-> 必须保 raw！
+    rng = np.random.default_rng(42)
+    n_tot, n_on = 955, 173
+    y_856 = np.zeros(n_tot)
+    y_856[:n_on] = rng.uniform(480.0, 610.0, size=n_on)
+    pb_856 = np.where(y_856 >= 10.0,
+                      y_856 + rng.uniform(850.0, 1050.0, size=n_tot),
+                      rng.uniform(220.0, 460.0, size=n_tot))
+    m_856, d_856 = resolve_auto_pbus_mode(pb_856, y_856, on_thr_w=10.0)
+    assert d_856["train_contrib_ratio"] < 0.22       # 全时段比被 82% 关机 0 值稀释
+    assert d_856["train_on_contrib_ratio"] >= 0.30   # 开机态真实占比显著 >= 0.25
+    assert m_856 == "raw" and d_856["reasons"] == ["KEEP_RAW_BY_PRE_RULE"]
 
-    # 3) R2 低贡献率（母线不大 300kW，但分路仅 30kW -> contrib=0.10 < 0.20）-> scaled
-    pb_mid = np.linspace(250.0, 350.0, 200)
-    m3, d3 = resolve_auto_pbus_mode(pb_mid, 0.10 * pb_mid)
-    assert m3 == "scaled" and any("LOW_CONTRIB_RATIO" in r for r in d3["reasons"])
+    # 3) R1 超大母线（如 733：p95≈4005>2500, std≈1310>800）-> scaled
+    pb_733 = np.linspace(1200.0, 4200.0, 300)
+    m2, d2 = resolve_auto_pbus_mode(pb_733, 0.20 * pb_733, on_thr_w=10.0)
+    assert m2 == "scaled"
+    assert any("HIGH_BUS_SCALE" in r for r in d2["reasons"])
+    assert any("LOW_ON_CONTRIB_RATIO" in r for r in d2["reasons"])
 
-    # 4) R3 灰区联合（p95∈(500, 800] 且 contrib < 0.33 -> scaled；contrib >= 0.33 -> raw）
-    pb_gray = np.linspace(450.0, 680.0, 200)
-    m4a, d4a = resolve_auto_pbus_mode(pb_gray, 0.25 * pb_gray)
-    assert m4a == "scaled" and any("GRAY_ZONE_BUS" in r for r in d4a["reasons"])
-    m4b, _ = resolve_auto_pbus_mode(pb_gray, 0.45 * pb_gray)
+    # 4) R2 中大母线（p95∈(800, 2500]）下微弱支路 vs 主导支路分流
+    pb_mid = np.linspace(900.0, 1600.0, 200)
+    m4a, d4a = resolve_auto_pbus_mode(pb_mid, 0.15 * pb_mid, on_thr_w=10.0)
+    assert m4a == "scaled" and any("LOW_ON_CONTRIB_RATIO" in r for r in d4a["reasons"])
+    m4b, _ = resolve_auto_pbus_mode(pb_mid, 0.40 * pb_mid, on_thr_w=10.0)
     assert m4b == "raw"
 
-    # 5) 后置单向熔断单测：坍缩与欠拟合均命中，正常领先基线不命中
-    from nilm.pipeline.user_task import _should_fallback_raw_to_scaled
+    # 5) 后置单向熔断单测：
+    # 5a) 正常领先基线 -> 不熔断
     res_ok = {
-        "history_profile": {"train": {"r2": {"macro": 0.80}}, "val": {"r2": {"macro": 0.72}}},
-        "ridge": {"train": {"r2": {"macro": 0.91}}, "val": {"r2": {"macro": 0.82}}},
-        "transformer": {"train": {"r2": {"macro": 0.96}}, "val": {"r2": {"macro": 0.80}}},
+        "history_profile": {"train": {"r2": {"macro": 0.80}, "mae": {"macro": 62.0}},
+                            "val": {"r2": {"macro": 0.72}, "mae": {"macro": 75.0}}},
+        "ridge": {"train": {"r2": {"macro": 0.91}, "mae": {"macro": 61.0}},
+                  "val": {"r2": {"macro": 0.82}, "mae": {"macro": 73.0}}},
+        "transformer": {"train": {"r2": {"macro": 0.96}, "mae": {"macro": 33.0}},
+                        "val": {"r2": {"macro": 0.80}, "mae": {"macro": 63.0}}},
     }
     bands_ok = {"transformer": {"train": 500.0, "val": 500.0}}
     assert _should_fallback_raw_to_scaled(res_ok, bands_ok, 10.0) == (False, [])
 
-    # 复现 733 raw 指标（transformer train 0.8297 < ridge 0.9137, val 0.7673 < ridge 0.8199）
+    # 5b) 防误熔断保护（856 SmoothL1 vs MSE 场景）：ridge R² 略高但 val MAE (42.9) 远差于 transformer (29.5) -> 不熔断！
+    res_856_like = {
+        "history_profile": {"train": {"r2": {"macro": 0.507}, "mae": {"macro": 51.3}},
+                            "val": {"r2": {"macro": 0.292}, "mae": {"macro": 52.5}}},
+        "ridge": {"train": {"r2": {"macro": 0.918}, "mae": {"macro": 25.8}},
+                  "val": {"r2": {"macro": 0.804}, "mae": {"macro": 42.9}}},
+        "transformer": {"train": {"r2": {"macro": 0.875}, "mae": {"macro": 28.0}},
+                        "val": {"r2": {"macro": 0.775}, "mae": {"macro": 29.5}}},
+    }
+    assert _should_fallback_raw_to_scaled(res_856_like, bands_ok, 10.0) == (False, [])
+
+    # 5c) 复现 733 raw 真欠拟合（R² 与 val MAE 双双劣于 ridge）-> 触发熔断！
     res_733_raw = {
-        "history_profile": {"train": {"r2": {"macro": 0.7979}}, "val": {"r2": {"macro": 0.7197}}},
-        "ridge": {"train": {"r2": {"macro": 0.9137}}, "val": {"r2": {"macro": 0.8199}}},
-        "transformer": {"train": {"r2": {"macro": 0.8297}}, "val": {"r2": {"macro": 0.7673}}},
+        "history_profile": {"train": {"r2": {"macro": 0.7979}, "mae": {"macro": 62.9}},
+                            "val": {"r2": {"macro": 0.7197}, "mae": {"macro": 75.7}}},
+        "ridge": {"train": {"r2": {"macro": 0.9137}, "mae": {"macro": 61.1}},
+                  "val": {"r2": {"macro": 0.8199}, "mae": {"macro": 73.4}}},
+        "transformer": {"train": {"r2": {"macro": 0.8297}, "mae": {"macro": 68.5}},
+                        "val": {"r2": {"macro": 0.7673}, "mae": {"macro": 81.2}}},
     }
     fb, fb_r = _should_fallback_raw_to_scaled(res_733_raw, bands_ok, 10.0)
     assert fb is True and any("UNDERFIT_VS_BASELINE" in r for r in fb_r)
 
-    # 坍缩触发
+    # 5d) 坍缩触发
     fb_c, fb_cr = _should_fallback_raw_to_scaled(
         res_ok, {"transformer": {"train": 3.0, "val": 3.0}}, 10.0)
     assert fb_c is True and any("TRAIN_COLLAPSED" in r for r in fb_cr)
 
 
 def test_pbus_mode_auto_pre_rule_selects_scaled_for_large_bus(tmp_path, base_cfg_file, caplog):
-    """全局默认 pbus_mode='auto'：733 类大变比小占比用户无需手写 pbus_mode，
+    """全局默认 pbus_mode='auto'：733 类大变比（pt=16）小占比用户无需手写 pbus_mode，
     前置规则自动选 scaled，且 infer 默认 auto 自动继承不触发混版告警。"""
     import logging
 
     data_root = tmp_path / "data"
     write_user_dir(data_root, USER_KEY, days=21)
     write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
-    # 不写 pbus_mode（走全局默认 "auto"），模拟 733 大变比 pt=15 -> pbus≈1800kW, p1+p2≈96kW
+    # 不写 pbus_mode（走全局默认 "auto"），模拟 733 大变比 pt=16 -> pbus_p95≈2650kW>2500, on_contrib≈0.03<0.25
     tf_cfg = {
         USER_KEY: {
             "target_col": "p1+p2",
             "on_thr_w": 10.0,
-            "pt_ratio": 15.0,
+            "pt_ratio": 16.0,
             "ct_ratio": 1.0,
             "infer_model": "proportional",
             "split_ratios": [0.7, 0.15, 0.15],
