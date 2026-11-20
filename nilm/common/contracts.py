@@ -133,7 +133,7 @@ class Status:
 SPLIT_STRATEGIES = ("stratified_day", "stratified", "time", "global_stratified",
                     "stratified_by_state")
 # pbus_mode（按户选/自动判定双路径）：
-#   auto（全局默认）：训练时仅基于 train 集无泄漏统计量（一次侧 pbus 的 P95>2500kW / std>800kW +
+#   auto（全局默认）：训练时仅基于 train 集无泄漏统计量（一次侧 pbus 的 P95>3500kW / std>1200kW +
 #     开机态条件贡献率 on_contrib_ratio<0.25 且 P95>800kW）前置判定 raw 或 scaled；
 #     若前置初判 raw 但验证集检测到序列模型真实欠拟合（R² 与 MAE 双双劣于基线，或预测坍缩），
 #     自动重训切换 scaled 并输出红色日志提示；推理自动继承训练产物。

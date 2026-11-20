@@ -627,16 +627,16 @@ def test_proportional_legacy_pickle_and_mode_validation():
 
 
 def test_resolve_auto_pbus_mode_boundaries():
-    """前置无泄漏 v2 校准规则与后置单向熔断边界单测（覆盖 733 / 856 / 2842 真实分布）。"""
+    """前置无泄漏 v3 收敛规则与后置单向熔断边界单测（覆盖 733 / 856 / 870 / 2842 真实分布）。"""
     import numpy as np
     from nilm.pipeline.user_task import resolve_auto_pbus_mode, _should_fallback_raw_to_scaled
 
-    # 1) 2842/2844 类低压中小母线主导单路（p95≈200<=2500, on_contrib=0.50>=0.25）-> raw
+    # 1) 2842/2844 类低压中小母线主导单路（p95≈200<=3500, on_contrib=0.50>=0.25）-> raw
     pb_small = np.linspace(100.0, 210.0, 200)
     m1, d1 = resolve_auto_pbus_mode(pb_small, 0.5 * pb_small, on_thr_w=10.0)
     assert m1 == "raw" and d1["stage"] == "pre_rule"
 
-    # 2) 复现 856 真实分布（pt*ct=6000 中压专变 p95≈1545<=2500, std≈550<=800；
+    # 2) 复现 856 真实分布（pt*ct=6000 中压专变 p95≈1545<=3500, std≈550<=1200；
     #    开机占空比仅 18% 致全时段 all_contrib≈0.19<0.20，但开机态 on_contrib≈0.36>=0.25）-> 必须保 raw！
     rng = np.random.default_rng(42)
     n_tot, n_on = 955, 173
@@ -650,18 +650,32 @@ def test_resolve_auto_pbus_mode_boundaries():
     assert d_856["train_on_contrib_ratio"] >= 0.30   # 开机态真实占比显著 >= 0.25
     assert m_856 == "raw" and d_856["reasons"] == ["KEEP_RAW_BY_PRE_RULE"]
 
-    # 3) R1 超大母线（如 733：p95≈4005>2500, std≈1310>800）-> scaled
-    pb_733 = np.linspace(1200.0, 4200.0, 300)
+    # 2b) 复现 870 真实分布（pt*ct=4000 双峰同步启停大负荷：duty≈38.7%, p95≈2081<=3500,
+    #     因全厂夜间归零双峰切换 std≈883∈(800, 1200]，on_contrib≈0.335>=0.25）-> 必须保 raw！
+    n_870, on_870 = 2489, 964
+    y_870 = np.zeros(n_870)
+    y_870[:on_870] = rng.uniform(560.0, 720.0, size=on_870)
+    pb_870 = np.where(y_870 >= 10.0,
+                      rng.uniform(1700.0, 2150.0, size=n_870),
+                      rng.uniform(10.0, 80.0, size=n_870))
+    m_870, d_870 = resolve_auto_pbus_mode(pb_870, y_870, on_thr_w=10.0)
+    assert 1900.0 < d_870["train_pbus_p95"] < 2300.0
+    assert 820.0 < d_870["train_pbus_std"] < 1050.0
+    assert d_870["train_on_contrib_ratio"] >= 0.30
+    assert m_870 == "raw" and d_870["reasons"] == ["KEEP_RAW_BY_PRE_RULE"]
+
+    # 3) R1 超巨型母线（如 733：p95≈4005>3500, std≈1310>1200）-> scaled
+    pb_733 = np.linspace(500.0, 4250.0, 300)
     m2, d2 = resolve_auto_pbus_mode(pb_733, 0.20 * pb_733, on_thr_w=10.0)
     assert m2 == "scaled"
     assert any("HIGH_BUS_SCALE" in r for r in d2["reasons"])
     assert any("LOW_ON_CONTRIB_RATIO" in r for r in d2["reasons"])
 
-    # 4) R2 中大母线（p95∈(800, 2500]）下微弱支路 vs 主导支路分流
-    pb_mid = np.linspace(900.0, 1600.0, 200)
+    # 4) R2 中大母线（p95∈(800, 3500]）下微弱支路 vs 主导支路分流
+    pb_mid = np.linspace(900.0, 2100.0, 200)
     m4a, d4a = resolve_auto_pbus_mode(pb_mid, 0.15 * pb_mid, on_thr_w=10.0)
     assert m4a == "scaled" and any("LOW_ON_CONTRIB_RATIO" in r for r in d4a["reasons"])
-    m4b, _ = resolve_auto_pbus_mode(pb_mid, 0.40 * pb_mid, on_thr_w=10.0)
+    m4b, _ = resolve_auto_pbus_mode(pb_mid, 0.33 * pb_mid, on_thr_w=10.0)
     assert m4b == "raw"
 
     # 5) 后置单向熔断单测：

@@ -71,18 +71,18 @@ def _non_scaled_cols(pbus_mode: str) -> set[str]:
 def resolve_auto_pbus_mode(pbus_train: np.ndarray,
                            y_train: np.ndarray,
                            on_thr_w: float = 10.0) -> tuple[str, dict]:
-    """基于 train 集无泄漏物理统计量自动判定 pbus_mode（对应三步决策法第1、2步，v2 校准版）。
+    """基于 train 集无泄漏物理统计量自动判定 pbus_mode（对应三步决策法第1、2步，v3 收敛版）。
 
     严格仅使用 splits['train']（严禁接触 val/test，遵守 §11 零泄漏契约）。
-    结合第3步单向后置熔断（raw 欠拟合可自动切回 scaled 重训，而 scaled 跨期漂移不可逆）的
-    不对称代价，前置初判仅对高置信度大母线/开机低占比用户直接选 scaled：
-    - R1 超大母线幅值防淹没：P95(pbus) > 2500kW 或 std(pbus) > 800kW -> scaled
-      （如 733：pt×ct=16000 一次侧 P95≈4005kW, std≈1311kW，防 LayerNorm 激活方差淹没；
-        放行 856 类 pt×ct=6000 中压专变 P95≈1545kW, std≈550kW）；
-    - R2 开机态条件低贡献率防背景淹没：P95(pbus) > 800kW 且 on_contrib_ratio < 0.25 -> scaled
+    结合第3步单向后置熔断（raw 欠拟合可自动切回 scaled 重训，而 scaled 跨期漂移/槽位过拟合不可逆）的
+    不对称代价，前置初判仅对高置信度超巨型母线或大母线开机低占比支路直接选 scaled：
+    - R1 超巨型母线幅值防淹没：P95(pbus) > 3500kW 或 std(pbus) > 1200kW -> scaled
+      （如 733：pt×ct=16000 一次侧 P95≈4005kW, std≈1311kW，防首层激活方差淹没；
+        放行 856 P95≈1545kW/std≈550kW 与 870 双峰同步大负荷 P95≈2081kW/std≈883kW）；
+    - R2 大母线开机态低贡献率防背景淹没：P95(pbus) > 800kW 且 on_contrib_ratio < 0.25 -> scaled
       （on_contrib_ratio = mean(y_on)/mean(pbus_on)，仅在 y >= on_thr_w 开机点计算，
-        消除 856 类低占空比间歇大负荷 82% 关机 0 值对全天均值比的稀释误判）；
-    - 其余用户前置默认走 raw（兼顾物理分摊与跨月抗零点漂移；若真触发欠拟合由第3步红色熔断兜底）。
+        消除 856 类低占空比间歇大负荷关机 0 值稀释误判，同时保护 870 on_contrib≈0.335 主导负荷走 raw）；
+    - 其余用户前置默认走 raw（兼顾物理零点锚定与跨月抗漂移；若真触发欠拟合由第3步红色熔断兜底）。
     """
     pb_arr = np.asarray(pbus_train, dtype=np.float64).reshape(-1)
     yt_arr = np.asarray(y_train, dtype=np.float64).reshape(-1)
@@ -114,8 +114,8 @@ def resolve_auto_pbus_mode(pbus_train: np.ndarray,
         on_contrib = contrib
 
     reasons: list[str] = []
-    if p95 > 2500.0 or pstd > 800.0:
-        reasons.append(f"HIGH_BUS_SCALE(p95={p95:.1f}>2500 or std={pstd:.1f}>800)")
+    if p95 > 3500.0 or pstd > 1200.0:
+        reasons.append(f"HIGH_BUS_SCALE(p95={p95:.1f}>3500 or std={pstd:.1f}>1200)")
     if p95 > 800.0 and on_contrib < 0.25:
         reasons.append(
             f"LOW_ON_CONTRIB_RATIO(p95={p95:.1f}>800, on_contrib={on_contrib:.4f}<0.25)")
