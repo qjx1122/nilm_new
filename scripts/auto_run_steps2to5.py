@@ -25,10 +25,12 @@ Windows PowerShell (test_gpu)：
       outputs/<user>/infer/<ts>/{inference_result,offline_metrics,metrics_daily_chain}
 """
 from __future__ import annotations
-import argparse, json, subprocess, sys, glob
+import argparse, json, logging, subprocess, sys, glob
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_TF = ROOT / "configs/time_filters.json"
 DEFAULT_BASE = ROOT / "configs/base_optimal.yaml"
 
@@ -187,18 +189,143 @@ def step5_infer(user_key, tf, base, data_root, out_root, force):
     else:
         log("Step5 未产出 infer/_DONE（可能无 infer 数据或被跳过，查 batch_status.csv）", "WARN")
 
-def step4_threshold(user_key, out_root, pred_col_train="pred_transformer", state_col_train="pred_state_transformer"):
+def _ensure_nilm_console_logger():
+    if not logging.getLogger("nilm").handlers and "pytest" not in sys.modules:
+        from nilm.common.logging import setup_logging
+        setup_logging()
+
+
+def step_sync_decision_thr(
+    user_key: str,
+    out_root: Path,
+    effective_tf: Path,
+    orig_tf: Path,
+    stage: str,
+    explicit_dec_arg=None,
+    target_col_arg=None,
+    pbus_mode_arg=None,
+    save_config: bool = False,
+) -> dict | None:
+    """零重训收口同步 train 与 infer 的 decision_thr_w（支持 auto 双链联合寻优与显式数值同步）。"""
+    from nilm.common.logging import get_logger, yellow_text
+    from nilm.pipeline.auto_thresholds import (
+        calibrate_and_sync_joint_decision_thr,
+        sync_decision_thr_artifacts,
+    )
+    from nilm.pipeline.user_config import load_time_filter_config, resolve_user_config
+    from nilm.pipeline.user_task import latest_done_dir
+
+    _ensure_nilm_console_logger()
+    ulog = get_logger("cli.auto_run")
+
+    tr_dir = latest_done_dir(out_root / user_key / "train")
+    inf_dir = latest_done_dir(out_root / user_key / "infer")
+
+    eff_dec_cfg = explicit_dec_arg
+    if eff_dec_cfg is None and effective_tf.exists():
+        raw_cfg = load_time_filter_config(effective_tf)
+        eff_dec_cfg = resolve_user_config(user_key, raw_cfg).get("decision_thr_w", "auto")
+
+    sync_out: dict | None = None
+    if stage == "sync-thr" and isinstance(explicit_dec_arg, (int, float)) and not isinstance(explicit_dec_arg, bool):
+        if tr_dir is None and inf_dir is None:
+            log(f"sync-thr 跳过：未找到 {user_key} 的已完成 train/infer 产物", "WARN")
+            return None
+        sync_out = sync_decision_thr_artifacts(
+            user_key=user_key,
+            train_dir=tr_dir,
+            infer_dir=inf_dir,
+            new_dec_thr=float(explicit_dec_arg),
+            reason="explicit_sync",
+        )
+        ulog.warning("%s", yellow_text(
+            f"[{user_key}] [DEC-THR-SYNC] 已按显式参数零重训同步刷新双侧产物 -> "
+            f"decision_thr_w={float(explicit_dec_arg):.4g} "
+            f"(train: {sync_out.get('previous_train_decision_thr_w')}->{float(explicit_dec_arg):.4g}, "
+            f"infer: {sync_out.get('previous_infer_decision_thr_w')}->{float(explicit_dec_arg):.4g})"
+        ))
+    elif eff_dec_cfg == "auto":
+        if tr_dir is not None and inf_dir is not None:
+            sync_out = calibrate_and_sync_joint_decision_thr(user_key, tr_dir, inf_dir)
+        elif stage == "sync-thr":
+            log(f"sync-thr(auto) 需同时具备 train 与 infer 已完成产物（当前 train={tr_dir}, infer={inf_dir}）", "WARN")
+
+    if save_config and orig_tf.exists():
+        cfg_disk = json.loads(orig_tf.read_text(encoding="utf-8"))
+        entry = dict(cfg_disk.get(user_key) or {})
+        tr_meta = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8")) if (tr_dir and (tr_dir / "meta.json").exists()) else {}
+        inf_meta = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8")) if (inf_dir and (inf_dir / "meta.json").exists()) else {}
+        if target_col_arg is not None:
+            entry["target_col"] = target_col_arg
+        elif tr_meta.get("target_cols") and "target_col" not in entry:
+            entry["target_col"] = "+".join(tr_meta["target_cols"])
+        if isinstance(tr_meta.get("on_thr_w"), (int, float)):
+            entry["on_thr_w"] = float(tr_meta["on_thr_w"])
+        final_dec = inf_meta.get("decision_thr_w", tr_meta.get("decision_thr_w"))
+        if isinstance(explicit_dec_arg, (int, float)) and not isinstance(explicit_dec_arg, bool):
+            final_dec = float(explicit_dec_arg)
+        if isinstance(final_dec, (int, float)):
+            entry["decision_thr_w"] = float(final_dec)
+        if pbus_mode_arg is not None:
+            entry["pbus_mode"] = pbus_mode_arg
+        elif tr_meta.get("pbus_mode") and "pbus_mode" not in entry:
+            entry["pbus_mode"] = tr_meta["pbus_mode"]
+        cfg_disk[user_key] = entry
+        bak = _write_cfg_with_backup(orig_tf, cfg_disk)
+        ulog.warning("%s", yellow_text(
+            f"[{user_key}] [AUTO-SAVE-CONFIG] 已固化阈值至 {orig_tf.name} "
+            f"(on_thr_w={entry.get('on_thr_w')}, decision_thr_w={entry.get('decision_thr_w')}, "
+            f"pbus_mode={entry.get('pbus_mode')}；原配置已备份至 {bak.name})"
+        ))
+
+    return sync_out
+
+
+def _detect_sweep_model_cols(out_root: Path, user_key: str, csv_train: str) -> tuple[str, str, str, str]:
+    """按 infer/meta.json -> train/meta.json 自动匹配 Step4 扫描模型列与游程参数。"""
+    import pandas as _pd
+    from nilm.pipeline.user_task import latest_done_dir
+
+    model = "transformer"
+    min_on, fill_off = "1", "3"
+    tr_dir = latest_done_dir(out_root / user_key / "train")
+    inf_dir = latest_done_dir(out_root / user_key / "infer")
+    if inf_dir and (inf_dir / "meta.json").exists():
+        im = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8"))
+        model = str(im.get("model") or model)
+        min_on = str(im.get("post_min_on", min_on))
+        fill_off = str(im.get("post_fill_short_off", fill_off))
+    elif tr_dir and (tr_dir / "meta.json").exists():
+        tm = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+        model = str(tm.get("best_model") or model)
+        min_on = str(tm.get("post_min_on", min_on))
+        fill_off = str(tm.get("post_fill_short_off", fill_off))
+
+    cols = set(_pd.read_csv(csv_train, nrows=1).columns)
+    if f"pred_{model}" not in cols:
+        avail = [c[len("pred_"):] for c in cols if c.startswith("pred_") and not c.startswith("pred_state_")]
+        if avail:
+            model = avail[0]
+    return f"pred_{model}", f"pred_state_{model}", min_on, fill_off
+
+
+def step4_threshold(user_key, out_root, pred_col_train=None, state_col_train=None):
+    sweep_grid = "10,30,50,100,150,200,250,300,350,400,500"
     pat_train = str(out_root / user_key / "train" / "*" / "predictions" / "train_predictions.csv")
     files = sorted(glob.glob(pat_train))
+    min_on, fill_off = "1", "3"
     if files:
         csv_train = files[-1]
-        log(f"Step4 test链阈值扫描: {csv_train}")
+        auto_p, auto_s, min_on, fill_off = _detect_sweep_model_cols(out_root, user_key, csv_train)
+        p_col = pred_col_train or auto_p
+        s_col = state_col_train or auto_s
+        log(f"Step4 test链阈值扫描: {csv_train} ({p_col})")
         sh([sys.executable, "scripts/threshold_sweep.py",
             "--csv", csv_train,
-            "--pred-col", pred_col_train, "--state-col", state_col_train,
+            "--pred-col", p_col, "--state-col", s_col,
             "--split", "test",
-            "--thresholds", "10,30,50,100,150,200,300,400,500",
-            "--min-on", "1", "--fill-off", "3"])
+            "--thresholds", sweep_grid,
+            "--min-on", min_on, "--fill-off", fill_off])
     else:
         log(f"Step4 test链跳过：未找到 {pat_train}", "WARN")
     pat_infer = str(out_root / user_key / "infer" / "*" / "predictions" / "inference_result.csv")
@@ -209,12 +336,13 @@ def step4_threshold(user_key, out_root, pred_col_train="pred_transformer", state
         sh([sys.executable, "scripts/threshold_sweep.py",
             "--csv", csv_infer,
             "--pred-col", "pred", "--state-col", "pred_state",
-            "--thresholds", "10,30,50,100,150,200,300,400,500"])
+            "--thresholds", sweep_grid,
+            "--min-on", min_on, "--fill-off", fill_off])
     else:
         log(f"Step4 infer链跳过：未找到 {pat_infer}（先完成 Step5 推理）", "WARN")
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="一键执行 TUNING_GUIDE Step2-5（ train → 窗口 → infer → 阈值）")
+    ap = argparse.ArgumentParser(description="一键执行 TUNING_GUIDE Step2-5（ train → 窗口 → infer → 双链阈值收口 → 扫描）")
     ap.add_argument("--user-key", default="800080270733_4206673297219", help="用户键 <device>_<user>（默认新户733）")
     ap.add_argument("--time-filter-config", default=str(DEFAULT_TF))
     ap.add_argument("--base-config", default=str(DEFAULT_BASE))
@@ -227,7 +355,10 @@ def main(argv=None):
                     help="decision_thr_w（支持正数、'auto' 或 'on_thr'）；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 auto）")
     ap.add_argument("--pbus-mode", choices=["auto", "raw", "scaled"], default=None,
                     help="pbus_mode（auto=默认先试raw+欠拟合经val双向验收后红色熔断切scaled，默认；raw=锁死未缩放+分摊；scaled=锁死z-score+改学）")
-    ap.add_argument("--stage", choices=["all","train","infer","threshold"], default="all", help="all=2+3+5+4 完整，threshold=仅 Step4")
+    ap.add_argument("--stage", choices=["all","train","infer","threshold","sync-thr"], default="all",
+                    help="all=2+3+5+双链收口+4 完整；threshold=仅 Step4；sync-thr=零重训同步刷新 train+infer 的 decision_thr_w")
+    ap.add_argument("--save-config", action="store_true",
+                    help="将最终定稿的阈值写回原 time_filters.json（自动备份 .bak.auto），消除 overlay 与原配置差异")
     ap.add_argument("--force", action="store_true", help="--force 忽略 _DONE 重跑")
     ap.add_argument("--skip-train", action="store_true", help="跳过 Step2（已有训练）")
     ap.add_argument("--skip-infer", action="store_true", help="跳过 Step5")
@@ -255,6 +386,33 @@ def main(argv=None):
             log(f"Step3 异常: {e}", "WARN")
     if args.stage in ("all","infer") and not args.skip_infer:
         step5_infer(user_key, effective_tf, base, data_root, out_root, args.force)
+
+    # 双链联合阈值收口 / 零重训同步刷新（Step5 之后、Step4 扫描之前执行，确保 train 与 infer 100% 一致）
+    if args.stage in ("all", "infer", "sync-thr"):
+        step_sync_decision_thr(
+            user_key=user_key,
+            out_root=out_root,
+            effective_tf=effective_tf,
+            orig_tf=tf,
+            stage=args.stage,
+            explicit_dec_arg=args.decision_thr,
+            target_col_arg=args.target_col,
+            pbus_mode_arg=args.pbus_mode,
+            save_config=args.save_config,
+        )
+    elif args.save_config and args.stage == "train":
+        step_sync_decision_thr(
+            user_key=user_key,
+            out_root=out_root,
+            effective_tf=effective_tf,
+            orig_tf=tf,
+            stage=args.stage,
+            explicit_dec_arg=args.decision_thr,
+            target_col_arg=args.target_col,
+            pbus_mode_arg=args.pbus_mode,
+            save_config=True,
+        )
+
     if args.stage in ("all","threshold"):
         step4_threshold(user_key, out_root)
 

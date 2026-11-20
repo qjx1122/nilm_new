@@ -13,12 +13,15 @@ import pytest
 from nilm.common.contracts import INFERENCE_RESULT_REL, Status
 from nilm.common.logging import _PlainFormatter, red_text, yellow_text
 from nilm.pipeline.auto_thresholds import (
+    calibrate_and_sync_joint_decision_thr,
     check_offline_decision_drift,
     log_auto_decision_thr_train,
     resolve_auto_decision_thr_w,
     resolve_auto_on_thr_w,
     resolve_infer_thresholds,
+    resolve_joint_val_infer_decision_thr_w,
     resolve_train_on_thr_w,
+    sync_decision_thr_artifacts,
 )
 from nilm.pipeline.batch import run_batch
 from nilm.pipeline.user_task import latest_done_dir
@@ -197,16 +200,41 @@ def test_resolve_auto_decision_thr_w_guardrails_and_logs(caplog):
         log_auto_decision_thr_train(USER_KEY, info1)
     assert any("\033[93m" in r.message and "[AUTO-DEC-THR]" in r.message for r in caplog.records)
 
-    # (b) 护栏 ②（上限 <= 0.55 * P10(y_on) = 330W）与护栏 ①（recall >= 0.95）：绝不盲冲 500W 悬崖
-    y_tr_600 = np.where(y_train >= 10.0, 600.0, 0.0)
-    pred_high_fp = np.where(y_val >= 10.0, 580.0, 380.0)  # 关态虚报高达 380W > 330W 上限
+    # (b) 护栏 ②（上限 <= 0.80 * P10(y_on) 兼容多路求和局部启停）：
+    #     对 733 原型 P10(y_on)=555W -> 上限 444W，放行 400W 最优档，同时拦住 510W 断崖虚报
+    y_tr_555 = np.where(y_train >= 10.0, 555.0, 0.0)
+    pred_high_fp = np.where(y_val >= 10.0, 580.0, 510.0)  # 关态虚报高达 510W > 444W 上限
     dec2, info2 = resolve_auto_decision_thr_w(
-        y_train=y_tr_600, y_val=y_val, pred_val=pred_high_fp, val_index=idx,
+        y_train=y_tr_555, y_val=y_val, pred_val=pred_high_fp, val_index=idx,
         on_thr_w=10.0, post_min_on=1, post_fill_off=3, calibrated_model="ridge",
     )
-    assert dec2 <= 330.0 + 1e-6
-    assert info2["upper_guard_w"] == pytest.approx(330.0)
+    assert dec2 <= 444.0 + 1e-6
+    assert info2["upper_guard_w"] == pytest.approx(444.0)
     assert info2["val_recall_selected"] >= 0.95
+
+    #     验证 733 原型关态虚报 360W 时，0.80 * P10(555W)=444W 能顺利放行 ~380-400W 档位消除全部虚报
+    pred_733_like = np.where(y_val >= 10.0, 620.0, 360.0)
+    dec_733, info_733 = resolve_auto_decision_thr_w(
+        y_train=y_tr_555, y_val=y_val, pred_val=pred_733_like, val_index=idx,
+        on_thr_w=60.0, post_min_on=1, post_fill_off=3, calibrated_model="transformer",
+    )
+    assert 360.0 < dec_733 <= 444.0
+    assert info_733["val_off_fp_selected"] == 0
+
+    # (b2) pbus_mode="scaled" 平台期抗漂移裕度：val 在 250~350W 同分满分时，scaled 自动向安全上沿偏移
+    pred_plateau = np.where(y_val >= 10.0, 650.0, 240.0)
+    dec_raw, _ = resolve_auto_decision_thr_w(
+        y_train=y_tr_555, y_val=y_val, pred_val=pred_plateau, val_index=idx,
+        on_thr_w=60.0, post_min_on=1, post_fill_off=3, calibrated_model="transformer",
+        pbus_mode="raw",
+    )
+    dec_scaled, info_scaled = resolve_auto_decision_thr_w(
+        y_train=y_tr_555, y_val=y_val, pred_val=pred_plateau, val_index=idx,
+        on_thr_w=60.0, post_min_on=1, post_fill_off=3, calibrated_model="transformer",
+        pbus_mode="scaled",
+    )
+    assert dec_scaled > dec_raw
+    assert any("SCALED_ANTI_DRIFT_MARGIN" in r for r in info_scaled["reasons"])
 
     # (c) 护栏 ③（最小增益门 < 0.003）：当基准 on_thr_w 已近满分，保持保守值 on_thr_w 不乱动
     pred_clean = np.where(y_val >= 10.0, 690.0, 1.0)
@@ -254,7 +282,8 @@ def test_infer_threshold_inheritance_priority_and_drift_alert(caplog):
     yellow_msgs = [r.message for r in caplog.records if "\033[93m" in r.message]
     assert len(yellow_msgs) == 2
 
-    # (b) 显式优先：用户显式指定 decision_thr_w=35.0 覆盖 meta，且显式 on_thr_w=20.0 触发红字不一致提示
+    # (b) 显式优先：用户显式指定 decision_thr_w=35.0 覆盖 meta 触发黄字 [DEC-THR-OVERRIDE]，
+    #     且显式 on_thr_w=20.0 触发红字 [ON-THR-MISMATCH]
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="nilm"):
         on_b, dec_b, _ = resolve_infer_thresholds(
@@ -266,6 +295,7 @@ def test_infer_threshold_inheritance_priority_and_drift_alert(caplog):
         )
     assert on_b == 20.0 and dec_b == 35.0
     assert any("\033[91m" in r.message and "[ON-THR-MISMATCH]" in r.message for r in caplog.records)
+    assert any("\033[93m" in r.message and "[DEC-THR-OVERRIDE]" in r.message for r in caplog.records)
 
     # (c) 旧版历史 meta.json 向后兼容（无 decision_thr_w 字段时平滑回退至 on_thr_w）
     on_c, dec_c, info_c = resolve_infer_thresholds(
@@ -299,6 +329,33 @@ def test_infer_threshold_inheritance_priority_and_drift_alert(caplog):
         )
     assert advice is not None and advice["drift_detected"] is True
     assert advice["recommended_decision_thr_w"] >= 145.0
+    assert any("\033[91m" in r.message and "[AUTO-DEC-THR-DRIFT]" in r.message for r in caplog.records)
+
+    # (e) 高占空比场景漂移检测（类 733：@250W F1 已高达 0.97+，但存在 24 个 320W 盛夏漂移 FP；
+    #     抬至 400W 砍掉 >80% FP 且 F1 提升 >=0.004）-> 同样触发红字 [AUTO-DEC-THR-DRIFT]
+    idx_hd = pd.date_range("2026-08-01", periods=96 * 12, freq="15min")
+    y_hd = np.full(len(idx_hd), 720.0, dtype=np.float64)
+    # 留出 60 个真关态点，其中 24 个因盛夏基荷抬升预测为 330W
+    y_hd[:60] = 0.0
+    pred_hd = np.where(y_hd >= 60.0, 700.0, 20.0)
+    pred_hd[:24] = 330.0
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        adv_hd = check_offline_decision_drift(
+            user_key=USER_KEY,
+            y_infer_true=y_hd,
+            pred_infer=pred_hd,
+            infer_index=idx_hd,
+            on_thr_w=60.0,
+            current_dec_thr_w=250.0,
+            post_min_on=1,
+            post_fill_off=3,
+            model_name="transformer",
+        )
+    assert adv_hd is not None and adv_hd["drift_detected"] is True
+    assert adv_hd["current_infer_chain_f1"] >= 0.95  # 旧门限漏网的高占空比高 F1 场景
+    assert adv_hd["current_infer_fp"] >= 15 and adv_hd["recommended_infer_fp"] == 0
+    assert adv_hd["recommended_decision_thr_w"] >= 335.0
     assert any("\033[91m" in r.message and "[AUTO-DEC-THR-DRIFT]" in r.message for r in caplog.records)
 
 
@@ -448,4 +505,128 @@ def test_pooled_train_and_infer_auto_thresholds(tmp_path: Path, base_cfg: dict, 
 
     assert any("\033[93m" in r.message and "[AUTO-ON-THR]" in r.message for r in caplog.records)
     assert any("\033[93m" in r.message and "[AUTO-DEC-THR-INFER]" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------- 8. 双链 (val + infer) 联合收口、零重训同步器与 --save-config / --stage sync-thr
+def test_joint_val_infer_calibration_and_zero_retrain_sync_closed_loop(tmp_path: Path, base_cfg: dict, caplog):
+    """复现 733 原型跨季节漂移（train 期定低阈 -> infer 期基荷右移 -> 双链收口同步刷新双侧产物且 audit 全绿）。"""
+    import yaml
+
+    full_base = dict(base_cfg)
+    full_base["metrics"] = [
+        "mae", "rmse", "r2", "sae",
+        "f1", "accuracy", "precision", "recall", "tp", "fp", "fn", "tn",
+    ]
+    base_file = tmp_path / "base_sync.yaml"
+    base_file.write_text(yaml.safe_dump(full_base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "outputs"
+    _write_bimodal_user_dir(data_root, USER_KEY, "trains", days=16, start="2026-04-01",
+                            standby_w=20.0, working_w=700.0, bg_bus_kw=200.0, seed=31)
+    _write_bimodal_user_dir(data_root, USER_KEY, "infers", days=8, start="2026-08-01",
+                            standby_w=20.0, working_w=700.0, bg_bus_kw=200.0, seed=32)
+
+    tf_file = tmp_path / "time_filters.json"
+    tf_file.write_text(json.dumps({
+        USER_KEY: {
+            "target_col": "p1",
+            "on_thr_w": "auto",
+            "decision_thr_w": "auto",
+            "pbus_mode": "raw",
+            "split_ratios": [0.6, 0.2, 0.2],
+            "split_strategy": "stratified_day",
+            "post_min_on": 1,
+            "post_fill_short_off": 3,
+        }
+    }), encoding="utf-8")
+
+    run_batch(
+        tf_file,
+        base_config_path=base_file,
+        data_root=data_root,
+        output_root=out_root,
+        stages=("train", "infer"),
+        force=True,
+    )
+    tr_dir = latest_done_dir(out_root / USER_KEY / "train")
+    inf_dir = latest_done_dir(out_root / USER_KEY / "infer")
+    assert tr_dir is not None and inf_dir is not None
+
+    # 模拟 8 月盛夏基荷漂移：将 infer 关态预测抬升至 355W（验证 0.80*P10 放行 ~400W 且双链联合校准生效）
+    inf_csv = inf_dir / INFERENCE_RESULT_REL
+    inf_df = pd.read_csv(inf_csv)
+    off_mask = inf_df["target_state"].to_numpy(dtype=int) == 0
+    inf_df.loc[off_mask, "pred"] = 355.0
+    inf_df.to_csv(inf_csv, index=False)
+
+    # 1) 直接校验 resolve_joint_val_infer_decision_thr_w 只读计算（不碰 test 折）
+    j_thr, j_info = resolve_joint_val_infer_decision_thr_w(tr_dir, inf_dir)
+    assert j_thr is not None and 355.0 < j_thr <= j_info["upper_guard_w"]
+    assert j_info["infer_after"]["fp"] == 0
+    assert j_info["infer_after"]["recall"] >= 0.95
+    assert j_info["val_after"]["recall"] >= 0.95
+
+    # 2) 执行 calibrate_and_sync_joint_decision_thr 原子同步 + 红字告警 + audit 全绿
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        sync_res = calibrate_and_sync_joint_decision_thr(USER_KEY, tr_dir, inf_dir)
+
+    assert sync_res is not None and sync_res["synced"] is True
+    synced_thr = sync_res["resolved_decision_thr_w"]
+    assert synced_thr == pytest.approx(j_thr)
+    assert synced_thr > 355.0
+    # 大跨度偏移触发红字 [AUTO-DEC-THR-SYNC]
+    assert any("\033[91m" in r.message and "[AUTO-DEC-THR-SYNC]" in r.message for r in caplog.records)
+
+    # 双侧 meta.json 与 CSV 的 decision_thr_w 完全一致，且保留 val 初值留痕
+    tr_meta = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    inf_meta = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8"))
+    assert tr_meta["decision_thr_w"] == pytest.approx(synced_thr)
+    assert inf_meta["decision_thr_w"] == pytest.approx(synced_thr)
+    assert "decision_thr_w_val_initial" in tr_meta
+    inf_after = pd.read_csv(inf_csv)
+    assert float(inf_after["decision_thr_w"].iloc[0]) == pytest.approx(synced_thr)
+
+    # 零重训同步后必须 100% 通过 audit_user_run（含 T1~T4, I1~I10 逐位重放与 sigmoid 恒等校验）
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+    # 再次执行双链同步（阈值已收敛一致）-> 输出黄字 [AUTO-DEC-THR-SYNC]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        sync_res_2 = calibrate_and_sync_joint_decision_thr(USER_KEY, tr_dir, inf_dir)
+    assert sync_res_2 is not None and sync_res_2["resolved_decision_thr_w"] == pytest.approx(synced_thr)
+    assert any("\033[93m" in r.message and "[AUTO-DEC-THR-SYNC]" in r.message for r in caplog.records)
+
+    # 3) 测试无分路真值（纯盲推）场景：双链校准优雅跳过，保持原 train 阈值一致
+    inf_blind = inf_after.copy()
+    inf_blind["target"] = np.nan
+    inf_blind["target_state"] = np.nan
+    inf_blind.to_csv(inf_csv, index=False)
+    blind_thr, blind_info = resolve_joint_val_infer_decision_thr_w(tr_dir, inf_dir)
+    assert blind_thr is None and blind_info.get("skipped") == "NO_INFER_GROUND_TRUTH"
+    # 恢复真值表继续测 CLI
+    inf_after.to_csv(inf_csv, index=False)
+
+    # 4) 测试 CLI --stage sync-thr --decision-thr 320 --save-config：零重训显式改阈 + 自动备份写回 time_filters.json
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        rc_cli = auto_run_main([
+            "--user-key", USER_KEY,
+            "--time-filter-config", str(tf_file),
+            "--output-root", str(out_root),
+            "--stage", "sync-thr",
+            "--decision-thr", "320",
+            "--save-config",
+        ])
+    assert rc_cli == 0
+    assert any("\033[93m" in r.message and "[DEC-THR-SYNC]" in r.message for r in caplog.records)
+    assert any("\033[93m" in r.message and "[AUTO-SAVE-CONFIG]" in r.message for r in caplog.records)
+
+    saved_tf = json.loads(tf_file.read_text(encoding="utf-8"))
+    assert saved_tf[USER_KEY]["decision_thr_w"] == pytest.approx(320.0)
+    assert isinstance(saved_tf[USER_KEY]["on_thr_w"], float)
+    assert any(p.name.startswith("time_filters.bak.auto") for p in tmp_path.iterdir())
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
 

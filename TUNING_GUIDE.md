@@ -142,7 +142,9 @@ python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/420000
 
 * `target_col` 必填；`on_thr_w` 与 `decision_thr_w` 均遵循**完全向后兼容、显式优先、全程留痕**：
   * **显式数值 100% 优先**：已确认数值（如 `"on_thr_w": 50.0, "decision_thr_w": 30.0`）原样生效，绝不被自动改写；`on_thr_w` 未写时保持历史硬编码默认 `10.0` 向后兼容；
-  * **`"decision_thr_w": "auto"`（默认）**：训练阶段在选定推理模型的 `val` 验证集（零测试集泄漏）执行带三重物理护栏（`val_recall ≥ 0.95`、`≤ 0.55 × P10(y_on)`、最小增益门 `0.003` + 全关日 FP 优先）的判决链寻优，全量候选表写入 `train/meta.json`，推理自动按所选模型继承；常规输出**黄色提示日志**，召回退化或推理跨期基线漂移时输出**红色告警日志**（也可配 `"on_thr"` 显式锁定沿用 `on_thr_w`）。
+  * **`"decision_thr_w": "auto"`（默认，双阶段收口保证 `train` 与 `infer` 100% 一致）**：
+    1. 训练阶段在选定推理模型的 `val` 验证集（零测试集泄漏）执行带物理护栏（`val_recall ≥ 0.95`、`≤ 0.80 × P10(y_on)` 兼容多路求和局部启停、最小增益门 `0.003` + 全关日 FP 优先；`pbus_mode="scaled"` 另设高分平台期抗漂移裕度）的判决链寻优，全量候选表写入 `train/meta.json`；
+    2. 一键脚本 `auto_run_steps2to5.py` 完成 Step 5 推理后，若 `infer` 含分路真值（离线验收场景），自动执行 `(val + infer)` 双链联合寻优并**零重训原子同步刷新** `train` 与 `infer` 双侧全部状态列、日表、策略表与 `meta.json`（保留 `decision_thr_w_val_initial` 留痕，不触碰 `test` 折），确保双侧 `decision_thr_w` 完全一致且通过 `audit_user_run.py` 全绿门禁；也可随时用 `--stage sync-thr [--decision-thr 400]` 毫秒级零重训同步，或加 `--save-config` 自动备份并写回 `configs/time_filters.json`；常规输出**黄色提示日志**，大跨度跨期偏移、显式覆盖或召回退化时输出**红色/黄色高亮日志**（也可配 `"on_thr"` 显式锁定沿用 `on_thr_w`）。
 * `pbus_mode` 默认 `"auto"`（推荐）：采用**零泄漏三步验证闭环**——① 不依赖易误伤的静态千瓦阈值盲跳，所有用户默认统一先跑抗漂移基态 `"raw"`（`pbus` 未缩放 + 物理零点锚定，绝大多数用户如 `2842/2844/856/870/778` 一遍即完稳留 `"raw"`）；② 仅当 `train + val` 检测到序列模型真实欠拟合信号（`R²` 与 `val MAE` 双双显著劣于 `ridge/history_profile` 基线，或预测坍缩，如 `733`）时，才启动候选 `"scaled"` 重训；③ 候选 `"scaled"` 在 `val` 验证集（严禁看 `test`）与刚跑完的 `"raw"` 正面对决，**必须同时满足「`val MAE` 实质改善（相对下降 ≥5%）」与「`val F1` 不退化（跌幅 ≤0.015）」才打印红色高亮日志切换为 `"scaled"`**（若像 `778` 出现关机虚报激增、`val F1` 下跌超限，则自动拒绝切换并保留抗漂移的 `"raw"`）；推理自动继承训练产物模式。也可手工指定 `"raw"` 或 `"scaled"` 锁死（切换后须加 `--force` 重训重推）。
 * `post_min_on 1` 去 <1 窗的抖动（恒空操作，防短闪），`post_fill_short_off 3` 填 ≤45min 的短关断。
 * `day_gate true` 全局默认（优先级 `day > train_range > full`），`min_on_day_ratio 0.2` 防“无可学开机模式”（2844旧池 31%→71%已验）。
