@@ -35,6 +35,14 @@ from nilm.evaluation import (METRIC_REGISTRY, build_comparison_table,
 from nilm.models import MODEL_REGISTRY
 from nilm.models.base import BaseModel
 from nilm.models.constraints import apply_constraints
+from nilm.pipeline.auto_thresholds import (
+    check_offline_decision_drift,
+    log_auto_decision_thr_train,
+    resolve_auto_decision_thr_w,
+    resolve_infer_thresholds,
+    resolve_train_on_thr_w,
+    select_calibration_model_zero_leakage,
+)
 from nilm.postprocess.state import postprocess_state, state_probability
 from nilm.preprocess.align import align_frames, estimate_time_offset, resample_bus
 from nilm.preprocess.clean import Cleaner
@@ -500,8 +508,18 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
         target = build_target(branch_c, target_cols)
 
+        # —— 解析 on_thr_w（显式数值优先；配置为 "auto" 时基于训练时间窗分路分布对数双峰寻谷，黄/红日志提示）
+        cfg_on_thr_raw = user_cfg.get("on_thr_w", 10.0)
+        tspec_pre = user_cfg.get("train") or {}
+        target_for_on_thr = target
+        if tspec_pre.get("include") or tspec_pre.get("exclude"):
+            _br_tr = filter_dataframe(branch_c, tspec_pre.get("include"), tspec_pre.get("exclude"))
+            if len(_br_tr) > 0:
+                target_for_on_thr = build_target(_br_tr, target_cols)
+        on_thr, on_thr_decision = resolve_train_on_thr_w(user_key, user_cfg, target_for_on_thr)
+
         # —— 训练前分路开机情况分析（有效通道=目标通道，逐天开机段/时长/功率/电量）
-        sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]),
+        sessions = analyze_branch_sessions(branch_c, on_thr,
                                            columns=target_cols)
         sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
 
@@ -517,10 +535,10 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
               estimate_time_offset(bus_total(bus_al), target))
 
         q_bus = quality_report(bus_al, "bus", 96, allow_negative,
-                               on_thr_w=float(user_cfg["on_thr_w"]))
+                               on_thr_w=on_thr)
         # branch 报告=有效通道（目标通道）口径：无效通道已在清洗后丢弃
         q_br = quality_report(branch_al, "branch", 96, allow_negative,
-                              on_thr_w=float(user_cfg["on_thr_w"]))
+                              on_thr_w=on_thr)
         q_br["target_cols"] = target_cols
         # 逐天质量表（总线/分路得分、阈值、当天合格）+ 双达标统计 + 训练建议
         min_score = float(qcfg.get("min_score", 50))
@@ -571,9 +589,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         #    判「缩窗后实际参与训练的范围」；总线离线段已被时间过滤剔除，全范围门禁不适用
         if gate_scope == "train_range" and not day_gate:
             q_bus_tr = quality_report(bus_al, "bus(训练范围)", 96, allow_negative,
-                                      on_thr_w=float(user_cfg["on_thr_w"]))
+                                      on_thr_w=on_thr)
             q_br_tr = quality_report(branch_al, "branch(训练范围)", 96, allow_negative,
-                                     on_thr_w=float(user_cfg["on_thr_w"]))
+                                     on_thr_w=on_thr)
             q_bus["train_range_quality"] = q_bus_tr      # 随 result JSON 留痕
             q_br["train_range_quality"] = q_br_tr
             log.info("[%s] 训练范围质量门禁（gate_scope=train_range）: bus %.2f / branch %.2f"
@@ -624,8 +642,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             t_d = target.dropna()
             day_max = (t_d.groupby(t_d.index.normalize()).max()
                        if len(t_d) else pd.Series(dtype=float))
-            off_n = int((day_max < float(user_cfg["on_thr_w"])).sum())
-            on_n = int((day_max >= float(user_cfg["on_thr_w"])).sum())
+            off_n = int((day_max < on_thr).sum())
+            on_n = int((day_max >= on_thr).sum())
             n_both = on_n + off_n
             ratio = (on_n / n_both) if n_both else 0.0
             gate_line = f"双达标天 {n_both}（开机日 {on_n} / 全关日 {off_n}，开机日占比 {ratio:.1%}）"
@@ -654,7 +672,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                  user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
 
         # —— §9 可辨识性分析（训练前强制执行）
-        ident = identifiability_report(bus_al, target, on_thr_w=float(user_cfg["on_thr_w"]))
+        ident = identifiability_report(bus_al, target, on_thr_w=on_thr)
         _dump(out / "identifiability_report.json", ident)
         if not ident.get("identifiable", True):
             log.warning("[%s] %s: %s", user_key, Status.IDENTIFIABILITY_LOW, ident.get("risk"))
@@ -672,7 +690,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         masks = build_split_masks(f.index, user_cfg["split_ratios"],
                                   user_cfg["split_strategy"], user_cfg.get("splits"),
-                                  target=target, on_thr_w=float(user_cfg["on_thr_w"]))
+                                  target=target, on_thr_w=on_thr)
         names = [str(c) for c in f.columns]
         X_all = f.to_numpy(np.float64)
         y_all = y.to_numpy(np.float64)[:, None]  # 统一 (n, 1) 多输出矩阵接口
@@ -685,7 +703,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         # —— 双达标天清洗后统计：总/全关/训练/验证/测试天数 + 每天明细（全关/阈值/所属集）
         q_detail = qualified_days_detail(
-            daily_q, target, float(user_cfg["on_thr_w"]),
+            daily_q, target, on_thr,
             split_index={k: splits[k][2] for k in ("train", "val", "test")
                          if split_sizes.get(k, 0) > 0})
         q_detail.to_csv(out / "qualified_days_detail.csv", index=False, encoding="utf-8")
@@ -699,7 +717,6 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         # Scaler 只由 Train 拟合（§11）；按用户级 pbus_mode 选择（默认 "auto" 自动判定+欠拟合熔断）
         wmode = base_cfg.get("dataset", {}).get("mode", "seq2seq")
         metric_names = base_cfg.get("metrics", ["mae", "rmse", "r2", "sae"])
-        on_thr = float(user_cfg["on_thr_w"])
         pbus_col = names.index("pbus")
         cfg_pbus_mode = str(user_cfg.get("pbus_mode") or "auto")
         if cfg_pbus_mode == "auto":
@@ -723,7 +740,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 "reasons": ["EXPLICIT_USER_CONFIG"],
             }
 
-        dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
+        cfg_dec_thr_raw = user_cfg.get("decision_thr_w", "auto")
         post_min_on = int(user_cfg["post_min_on"])
         post_fill_off = int(user_cfg["post_fill_short_off"])
         mp_override = user_cfg.get("model_params") or {}
@@ -745,13 +762,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             test_preds_local: dict[str, np.ndarray] = {}
             collapsed_local: list[dict] = []
             split_bands_local: dict[str, dict[str, float]] = {}
-            pred_frames_local: dict[str, pd.DataFrame] = {
-                s: pd.DataFrame({"timestamp": splits[s][2]
-                                 .strftime("%Y-%m-%d %H:%M:%S"),
-                                 "split": s, "target": splits[s][1][:, 0],
-                                 "target_state": (splits[s][1][:, 0] >= on_thr).astype(int),
-                                 "on_thr_w": on_thr, "decision_thr_w": dec_thr})
-                for s in ("train", "val", "test") if split_sizes.get(s, 0) > 0}
+            raw_preds_by_sp_local: dict[str, dict[str, np.ndarray]] = {}
 
             for spec in base_cfg.get("models", []):
                 name, params = spec["name"], dict(spec.get("params", {}))
@@ -778,6 +789,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
                 res_by_sp_local[name] = {}
                 split_bands_local[name] = {}
+                raw_preds_by_sp_local[name] = {}
                 for split in ("train", "val", "test"):
                     if len(sc_splits[split][0]) == 0:
                         continue
@@ -785,33 +797,20 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     y_hat = apply_constraints(y_hat, splits[split][0][:, pbus_col],
                                               nonnegative=not allow_negative,
                                               sum_consistency=False)
+                    raw_preds_by_sp_local[name][split] = y_hat
                     metrics = evaluate_all(sc_splits[split][1], y_hat, metric_names,
                                            on_thr_w=on_thr)
                     res_by_sp_local[name][split] = metrics
                     band_sp = float(y_hat[:, 0].max() - y_hat[:, 0].min())
                     split_bands_local[name][split] = band_sp
-                    pred_state_arr = postprocess_state(
-                        y_hat[:, 0], dec_thr, post_min_on, post_fill_off).astype(int)
                     daily = evaluate_daily(sc_splits[split][1], y_hat, splits[split][2],
                                            metric_names, on_thr_w=on_thr)
                     daily.insert(0, "split", split)
                     daily.insert(0, "model", name)
                     daily["state_thr_w"] = on_thr
                     daily_local.append(daily)
-                    daily_chain = evaluate_daily_chain(
-                        sc_splits[split][1], y_hat, pred_state_arr, splits[split][2],
-                        metric_names, on_thr_w=on_thr)
-                    daily_chain.insert(0, "split", split)
-                    daily_chain.insert(0, "model", name)
-                    daily_chain["state_thr_w"] = on_thr
-                    daily_chain["decision_thr_w"] = dec_thr
-                    daily_chain["post_min_on"] = post_min_on
-                    daily_chain["post_fill_short_off"] = post_fill_off
-                    daily_chain_local.append(daily_chain)
                     log.info("[%s] 模型 %s %s 指标: %s", user_key, name, split,
                              {m: round(v["macro"], 4) for m, v in metrics.items()})
-                    pred_frames_local[split][f"pred_{name}"] = y_hat[:, 0]
-                    pred_frames_local[split][f"pred_state_{name}"] = pred_state_arr
                     if split == "test":
                         test_preds_local[name] = y_hat[:, 0]
                         if band_sp < on_thr:
@@ -823,14 +822,112 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                                 "on_thr_w %.0fW——预测坍缩（疑似欠训练），该模型无法识别"
                                 "任何开机点，勿用于推理", user_key, name, band_sp, on_thr)
                 res_local[name] = res_by_sp_local[name]["test"]
+
+            # 零泄漏解析本趟 decision_thr_w：显式数值优先；auto 时仅在 val（空则 train）上校准
+            prov_dec = (user_cfg.get("_provenance") or {}).get("decision_thr_w", "default(硬编码)")
+            if isinstance(cfg_dec_thr_raw, (int, float)) and not isinstance(cfg_dec_thr_raw, bool):
+                dec_thr_local = float(cfg_dec_thr_raw)
+                model_dec_map_local = {m: dec_thr_local for m in fitted_models_local}
+                dec_decision_local = {
+                    "configured": dec_thr_local,
+                    "resolved_decision_thr_w": dec_thr_local,
+                    "stage": "explicit",
+                    "confidence": "explicit",
+                    "provenance": prov_dec,
+                    "reasons": ["EXPLICIT_USER_CONFIG"],
+                }
+            elif isinstance(cfg_dec_thr_raw, str) and cfg_dec_thr_raw.strip().lower() == "on_thr":
+                dec_thr_local = float(on_thr)
+                model_dec_map_local = {m: dec_thr_local for m in fitted_models_local}
+                dec_decision_local = {
+                    "configured": "on_thr",
+                    "resolved_decision_thr_w": dec_thr_local,
+                    "stage": "explicit_on_thr",
+                    "confidence": "explicit",
+                    "provenance": prov_dec,
+                    "reasons": ["EXPLICIT_LOCK_ON_THR"],
+                }
+            else:
+                cal_model = select_calibration_model_zero_leakage(
+                    user_cfg, base_cfg, res_by_sp_local, split_bands_local, on_thr
+                )
+                model_dec_map_local = {}
+                per_model_dec_info: dict[str, dict] = {}
+                y_tr_1d = sc_splits["train"][1][:, 0]
+                y_va_1d = sc_splits["val"][1][:, 0] if len(sc_splits["val"][0]) > 0 else np.array([], dtype=np.float64)
+                idx_va = splits["val"][2] if len(sc_splits["val"][0]) > 0 else None
+                idx_tr = splits["train"][2]
+                for mname in fitted_models_local:
+                    p_va_1d = (raw_preds_by_sp_local[mname]["val"][:, 0]
+                               if "val" in raw_preds_by_sp_local[mname]
+                               else np.array([], dtype=np.float64))
+                    p_tr_1d = (raw_preds_by_sp_local[mname]["train"][:, 0]
+                               if "train" in raw_preds_by_sp_local[mname]
+                               else None)
+                    m_thr, m_info = resolve_auto_decision_thr_w(
+                        y_train=y_tr_1d,
+                        y_val=y_va_1d,
+                        pred_val=p_va_1d,
+                        val_index=idx_va,
+                        on_thr_w=on_thr,
+                        post_min_on=post_min_on,
+                        post_fill_off=post_fill_off,
+                        pred_train=p_tr_1d,
+                        train_index=idx_tr,
+                        calibrated_model=mname,
+                    )
+                    model_dec_map_local[mname] = m_thr
+                    per_model_dec_info[mname] = m_info
+                dec_thr_local = float(model_dec_map_local.get(cal_model, on_thr))
+                dec_decision_local = dict(per_model_dec_info.get(cal_model, {
+                    "configured": "auto",
+                    "resolved_decision_thr_w": dec_thr_local,
+                    "stage": "auto_fallback_on_thr",
+                    "confidence": "low",
+                    "calibrated_model": cal_model,
+                    "reasons": ["NO_MODEL_AVAILABLE"],
+                }))
+                dec_decision_local["provenance"] = prov_dec
+                dec_decision_local["model_decision_thr_w"] = model_dec_map_local
+
+            # 统一使用本趟最终敲定的单值 dec_thr_local 生成判决链（保证 T3/T4 跨产物逐位一致）
+            pred_frames_local: dict[str, pd.DataFrame] = {
+                s: pd.DataFrame({"timestamp": splits[s][2]
+                                 .strftime("%Y-%m-%d %H:%M:%S"),
+                                 "split": s, "target": splits[s][1][:, 0],
+                                 "target_state": (splits[s][1][:, 0] >= on_thr).astype(int),
+                                 "on_thr_w": on_thr, "decision_thr_w": dec_thr_local})
+                for s in ("train", "val", "test") if split_sizes.get(s, 0) > 0}
+            for name in fitted_models_local:
+                for split in ("train", "val", "test"):
+                    if split not in raw_preds_by_sp_local[name]:
+                        continue
+                    y_hat = raw_preds_by_sp_local[name][split]
+                    pred_state_arr = postprocess_state(
+                        y_hat[:, 0], dec_thr_local, post_min_on, post_fill_off).astype(int)
+                    daily_chain = evaluate_daily_chain(
+                        sc_splits[split][1], y_hat, pred_state_arr, splits[split][2],
+                        metric_names, on_thr_w=on_thr)
+                    daily_chain.insert(0, "split", split)
+                    daily_chain.insert(0, "model", name)
+                    daily_chain["state_thr_w"] = on_thr
+                    daily_chain["decision_thr_w"] = dec_thr_local
+                    daily_chain["post_min_on"] = post_min_on
+                    daily_chain["post_fill_short_off"] = post_fill_off
+                    daily_chain_local.append(daily_chain)
+                    pred_frames_local[split][f"pred_{name}"] = y_hat[:, 0]
+                    pred_frames_local[split][f"pred_state_{name}"] = pred_state_arr
+
             return (sc_cols, sc, sc_splits, fitted_models_local, res_local,
                     res_by_sp_local, daily_local, daily_chain_local,
                     test_preds_local, collapsed_local, pred_frames_local,
-                    split_bands_local)
+                    split_bands_local, dec_thr_local, dec_decision_local,
+                    model_dec_map_local)
 
         (scale_cols, scaler, scaled, fitted_models, results, results_by_split,
          daily_rows, daily_chain_rows, test_preds, collapsed_models,
-         pred_frames, split_bands) = _run_pbus_mode_pass(pbus_mode)
+         pred_frames, split_bands, dec_thr, dec_decision,
+         model_dec_map) = _run_pbus_mode_pass(pbus_mode)
 
         # 第2–3步闭环（仅 auto 模式）：默认跑完 raw 后，若 train/val 检测到真实欠拟合，
         # 启动候选 scaled 重训并执行验证集双向验收（MAE 实质改善 + F1 不退化，零泄漏禁看 test）：
@@ -846,7 +943,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 cand_bundle = _run_pbus_mode_pass("scaled")
                 (c_sc_cols, c_scaler, c_scaled, c_models, c_results, c_res_by_sp,
                  c_daily, c_daily_chain, c_test_preds, c_collapsed,
-                 c_pred_frames, c_split_bands) = cand_bundle
+                 c_pred_frames, c_split_bands, c_dec_thr, c_dec_decision,
+                 c_model_dec_map) = cand_bundle
                 accepted, gate_notes = _accept_scaled_candidate(
                     results_by_split, split_bands,
                     c_res_by_sp, c_split_bands,
@@ -870,7 +968,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     pbus_decision["stage"] = "post_fallback"
                     (scale_cols, scaler, scaled, fitted_models, results, results_by_split,
                      daily_rows, daily_chain_rows, test_preds, collapsed_models,
-                     pred_frames, split_bands) = cand_bundle
+                     pred_frames, split_bands, dec_thr, dec_decision,
+                     model_dec_map) = cand_bundle
                 else:
                     log.warning(
                         "[%s] [AUTO-REJECT-SCALED] 候选 pbus_mode=scaled 未通过验证集双向验收"
@@ -878,6 +977,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                         user_key, "; ".join(gate_notes), "; ".join(fb_reasons))
                     pbus_decision["resolved_mode"] = "raw"
                     pbus_decision["stage"] = "post_fallback_rejected"
+
+        # 最终胜出 pbus_mode 确定后，若 decision_thr_w 配置为 auto，输出一次黄/红提示日志
+        log_auto_decision_thr_train(user_key, dec_decision)
 
         # 最终选定模式落盘：窗口样本索引（§10）与各模型权重
         if split_sizes["train"] >= window:
@@ -950,10 +1052,15 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         pbus_note = (f"pbus_mode={pbus_mode} (configured={cfg_pbus_mode}, "
                      f"stage={pbus_decision.get('stage')})"
                      if cfg_pbus_mode == "auto" else f"pbus_mode={pbus_mode}")
+        on_thr_note = (f"on_thr_w={on_thr} (configured={cfg_on_thr_raw})"
+                       if cfg_on_thr_raw == "auto" else f"on_thr_w={on_thr}")
+        dec_thr_note = (f"decision_thr_w={dec_thr} (configured={cfg_dec_thr_raw}, "
+                        f"model={dec_decision.get('calibrated_model')})"
+                        if cfg_dec_thr_raw == "auto" else f"decision_thr_w={dec_thr}")
         write_markdown_report(out, f"{user_key}/train", table, summary,
                               notes=[f"target_col={'+'.join(target_cols)}",
                                      f"split_strategy={user_cfg['split_strategy']}",
-                                     pbus_note])
+                                     pbus_note, on_thr_note, dec_thr_note])
         best = summary.get("overall_best")
 
         _dump(out / "meta.json", {
@@ -966,7 +1073,13 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "split_sizes": split_sizes, "split_strategy": user_cfg["split_strategy"],
             "best_model": best, "models": [s["name"] for s in base_cfg.get("models", [])],
             "collapsed_models": [c["model"] for c in collapsed_models],
-            "on_thr_w": user_cfg["on_thr_w"],
+            "on_thr_w": on_thr,
+            "on_thr_w_configured": cfg_on_thr_raw,
+            "on_thr_w_decision": on_thr_decision,
+            "decision_thr_w": dec_thr,
+            "decision_thr_w_configured": cfg_dec_thr_raw,
+            "decision_thr_w_decision": dec_decision,
+            "model_decision_thr_w": model_dec_map,
             "quality": {"bus": q_bus, "branch": q_br},
             "identifiable": ident.get("identifiable"),
             "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -999,6 +1112,11 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         if train_dir is None:
             raise UserTaskError(Status.MODEL_NOT_FOUND, f"找不到 {user_key} 的已完成训练产物")
         meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+        planned_model = (user_cfg.get("infer_model") or base_cfg.get("infer_model")
+                         or meta.get("best_model") or (meta.get("models") or [None])[0])
+        on_thr, dec_thr, infer_thr_info = resolve_infer_thresholds(
+            user_key, user_cfg, meta, model_name=planned_model
+        )
 
         field_map = base_cfg.get("bus_field_map") or user_cfg.get("bus_field_map") or {}
         dcfg = base_cfg.get("data", {})
@@ -1045,14 +1163,14 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                          user_key, invalid_ch, tcols_i)
                 branch_c = branch_c[tcols_i]
             _save_cleaned_csv(out, "branch", branch_c, save_cleaned)
-            sessions = analyze_branch_sessions(branch_c, float(user_cfg["on_thr_w"]),
+            sessions = analyze_branch_sessions(branch_c, on_thr,
                                                columns=tcols_i)
             sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
             # 数据质量报告（与训练阶段同构：bus+branch 有效通道口径；只报告不设门禁）
             q_bus_i = quality_report(bus15, "bus", 96, allow_negative,
-                                     on_thr_w=float(user_cfg["on_thr_w"]))
+                                     on_thr_w=on_thr)
             q_br_i = quality_report(branch_c, "branch", 96, allow_negative,
-                                    on_thr_w=float(user_cfg["on_thr_w"]))
+                                    on_thr_w=on_thr)
             q_br_i["target_cols"] = tcols_i
             # 逐天质量表 + 双达标统计 + 建议（推理侧建议主要看数据可用性）
             min_score_i = float(base_cfg.get("quality", {}).get("min_score", 50))
@@ -1157,13 +1275,13 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 pred_on_have = pd.Series(pred, index=valid.index).loc[have.index]
                 offline_metrics = evaluate_all(
                     have.to_numpy()[:, None], pred_on_have.to_numpy()[:, None],
-                    metric_names, on_thr_w=float(user_cfg["on_thr_w"]))
+                    metric_names, on_thr_w=on_thr)
                 _dump(out / "offline_metrics.json", offline_metrics)
                 # 质量报告补充双达标天明细（推理评估段=推理集）
                 if infer_quality is not None:
                     infer_days = set(have.index.normalize().strftime("%Y-%m-%d"))
                     q_detail_i = qualified_days_detail(
-                        daily_q_i, t, float(user_cfg["on_thr_w"]),
+                        daily_q_i, t, on_thr,
                         infer_days=infer_days)
                     q_detail_i.to_csv(out / "qualified_days_detail.csv",
                                       index=False, encoding="utf-8")
@@ -1179,15 +1297,12 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 daily = evaluate_daily(have.to_numpy()[:, None],
                                        pred_on_have.to_numpy()[:, None],
                                        have.index, metric_names,
-                                       on_thr_w=float(user_cfg["on_thr_w"]))
+                                       on_thr_w=on_thr)
                 daily.insert(0, "model", model_name)
                 # 状态判定阈值自描述（同训练日级：on_thr_w 口径，非判决链口径）
-                daily["state_thr_w"] = float(user_cfg["on_thr_w"])
+                daily["state_thr_w"] = on_thr
                 daily.to_csv(out / "metrics_daily.csv", index=False, encoding="utf-8")
 
-        on_thr = float(user_cfg["on_thr_w"])
-        # 决策阈值（§12.3 扩展）：仅作用于预测→状态判决；缺省沿用 on_thr_w
-        dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
         post_min_on = int(user_cfg["post_min_on"])
         post_fill_off = int(user_cfg["post_fill_short_off"])
         pred_state = postprocess_state(pred, dec_thr, post_min_on, post_fill_off)
@@ -1243,10 +1358,32 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             except Exception as e:  # noqa: BLE001 —— 链表为新增诊断产物，失败不阻断推理
                 log.warning("[%s] metrics_daily_chain 生成跳过: %s", user_key, e)
 
+        # 只读离线跨期漂移诊断（不修改 inference_result.csv，仅在跨月基荷显著偏移时给出红字校准建议）
+        drift_advice = None
+        if branch_c is not None and "have" in locals() and have is not None and len(have) > 0:
+            try:
+                drift_advice = check_offline_decision_drift(
+                    user_key=user_key,
+                    y_infer_true=have.to_numpy(dtype=float),
+                    pred_infer=pred_on_have.to_numpy(dtype=float),
+                    infer_index=have.index,
+                    on_thr_w=on_thr,
+                    current_dec_thr_w=dec_thr,
+                    post_min_on=post_min_on,
+                    post_fill_off=post_fill_off,
+                    model_name=model_name,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] 离线漂移诊断跳过: %s", user_key, e)
+
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "model": model_name,
             "pbus_mode": trained_pbus_mode,
             "pbus_mode_configured": cfg_pbus_mode,
+            "on_thr_w": on_thr,
+            "decision_thr_w": dec_thr,
+            "thresholds": infer_thr_info,
+            "offline_drift_advice": drift_advice,
             "train_dir": str(train_dir), "n_points": len(valid),
             "quality": infer_quality,
             "finished_at": datetime.now().isoformat(timespec="seconds"),

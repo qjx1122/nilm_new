@@ -11,13 +11,19 @@ from pathlib import Path
 _FMT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 _ROOT_NAME = "nilm"
 _ANSI_RED = "\033[91m"
+_ANSI_YELLOW = "\033[93m"
 _ANSI_RESET = "\033[0m"
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def red_text(msg: str) -> str:
-    """包装红色高亮文本（控制台 ANSI 亮红，供关键自动熔断/回退提示使用）。"""
+    """包装红色高亮文本（控制台 ANSI 亮红，供关键自动熔断/回退/告警提示使用）。"""
     return f"{_ANSI_RED}{msg}{_ANSI_RESET}"
+
+
+def yellow_text(msg: str) -> str:
+    """包装黄色高亮文本（控制台 ANSI 亮黄，供 auto 阈值生效/继承提示使用）。"""
+    return f"{_ANSI_YELLOW}{msg}{_ANSI_RESET}"
 
 
 def _enable_windows_ansi() -> None:

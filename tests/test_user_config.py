@@ -146,3 +146,58 @@ def test_pbus_mode_default_and_override():
         with pytest.raises(UserConfigError, match="pbus_mode"):
             resolve_user_config(UK, c_bad)
 
+
+# ---------------------------------------------------------------- on_thr_w / decision_thr_w auto 与显式优先
+def test_on_thr_and_decision_thr_auto_contract():
+    """验证 on_thr_w 与 decision_thr_w 支持 'auto'、向后兼容默认值及显式优先覆盖。"""
+    # 1) 硬编码默认：完全缺省时 on_thr_w=10.0（向后兼容），decision_thr_w='auto'
+    m0 = resolve_user_config(UK, {UK: {}})
+    assert m0["on_thr_w"] == 10.0
+    assert m0["decision_thr_w"] == "auto"
+
+    # 2) 支持大小写无关的 "auto" 与 decision_thr_w="on_thr"
+    c1 = _cfg()
+    c1[UK]["on_thr_w"] = "AUTO"
+    c1[UK]["decision_thr_w"] = "Auto"
+    m1 = resolve_user_config(UK, c1)
+    assert m1["on_thr_w"] == "auto"
+    assert m1["decision_thr_w"] == "auto"
+
+    c1b = _cfg()
+    c1b[UK]["decision_thr_w"] = "ON_THR"
+    assert resolve_user_config(UK, c1b)["decision_thr_w"] == "on_thr"
+
+    # 3) 显式数值优先于 _default 的 "auto"，且归一化为 float
+    c2 = _cfg()
+    c2["_default"]["on_thr_w"] = "auto"
+    c2["_default"]["decision_thr_w"] = "auto"
+    c2[UK]["on_thr_w"] = 50
+    c2[UK]["decision_thr_w"] = 30
+    m2 = resolve_user_config(UK, c2)
+    assert m2["on_thr_w"] == 50.0 and isinstance(m2["on_thr_w"], float)
+    assert m2["decision_thr_w"] == 30.0 and isinstance(m2["decision_thr_w"], float)
+    assert m2["_provenance"]["on_thr_w"] == UK
+    assert m2["_provenance"]["decision_thr_w"] == UK
+
+    # 4) 显式写 null 回退硬编码默认
+    c3 = _cfg()
+    c3[UK]["on_thr_w"] = None
+    c3[UK]["decision_thr_w"] = None
+    m3 = resolve_user_config(UK, c3)
+    assert m3["on_thr_w"] == 10.0
+    assert m3["decision_thr_w"] == "auto"
+
+    # 5) 非法取值拒绝（含布尔、非法字符串、越界数值）
+    for bad_on in ("invalid", "on_thr", 0, -5.0, 9999.0, True, False):
+        cb = _cfg()
+        cb[UK]["on_thr_w"] = bad_on
+        with pytest.raises(UserConfigError, match="on_thr_w"):
+            resolve_user_config(UK, cb)
+
+    for bad_dec in ("invalid", "raw", 0, -1.0, 6000.0, True, False):
+        cb = _cfg()
+        cb[UK]["decision_thr_w"] = bad_dec
+        with pytest.raises(UserConfigError, match="decision_thr_w"):
+            resolve_user_config(UK, cb)
+
+

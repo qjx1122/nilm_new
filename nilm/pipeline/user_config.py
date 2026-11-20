@@ -57,7 +57,17 @@ def _validate_value(field: str, value):
     rule = CONFIG_RULES[field]
     if "choices" in rule and value not in rule["choices"]:
         raise UserConfigError(f"{field}={value!r} 不在允许集合 {rule['choices']}")
+    special_modes = rule.get("special_modes")
+    if special_modes and isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in special_modes:
+            return norm
+        raise UserConfigError(
+            f"{field}={value!r} 非法：必须为 [{rule.get('min')}, {rule.get('max')}] 内数值"
+            f"或特殊模式 {special_modes}")
     if isinstance(value, bool):
+        if "min" in rule or "max" in rule:
+            raise UserConfigError(f"{field} 必须为数值，不能为布尔值: {value!r}")
         return value
     if "min" in rule or "max" in rule:
         if not isinstance(value, (int, float)):
@@ -66,6 +76,7 @@ def _validate_value(field: str, value):
             raise UserConfigError(f"{field}={value} 低于下限 {rule['min']}")
         if "max" in rule and value > rule["max"]:
             raise UserConfigError(f"{field}={value} 高于上限 {rule['max']}")
+        return float(value)
     return value
 
 
@@ -113,9 +124,10 @@ def resolve_user_config(user_key: str, cfg: dict) -> dict:
             merged[k] = v
             provenance[k] = layer_name
 
-    # pbus_mode 显式写 null 时回退硬编码默认 "auto"
-    if merged.get("pbus_mode") is None:
-        merged["pbus_mode"] = CONFIG_RULES["pbus_mode"]["default"]
+    # pbus_mode / on_thr_w / decision_thr_w 显式写 null 时回退硬编码默认值
+    for _null_fallback_key in ("pbus_mode", "on_thr_w", "decision_thr_w"):
+        if merged.get(_null_fallback_key) is None:
+            merged[_null_fallback_key] = CONFIG_RULES[_null_fallback_key]["default"]
 
     # 字段校验（§12.3）
     for field in CONFIG_RULES:

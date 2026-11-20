@@ -144,12 +144,17 @@ SPLIT_STRATEGIES = ("stratified_day", "stratified", "time", "global_stratified",
 #   scaled（方向2/学比例）：pbus 做 z-score 标准化，proportional 改学最小二乘
 #     线性映射（y ≈ a·pbus_z + b）；适用于 raw 真欠拟合且验证集双向改善的用户（如 733）。
 PBUS_MODES = ("auto", "raw", "scaled")
+ON_THR_MODES = ("auto",)
+DECISION_THR_MODES = ("auto", "on_thr")
 
 CONFIG_RULES: dict[str, dict] = {
     # field: default, validator 说明（具体校验见 pipeline/user_config.py）
     "target_col":            {"default": None},
     # 阈值口径 kW（全链路功率 kW）：总线一次侧 kW、分路一次侧 kW、阈值 kW。
-    "on_thr_w":              {"default": 10.0, "min": 0.001, "max": 5000.0},
+    # 支持显式正数或 "auto"（基于训练范围分路功率对数域双峰寻谷自动定阈，黄色/红色日志提示；
+    # 硬编码缺省保持 10.0 完全向后兼容，显式配置 100% 优先）。
+    "on_thr_w":              {"default": 10.0, "min": 0.001, "max": 5000.0,
+                              "special_modes": ON_THR_MODES},
     # PT/CT 变比（与 on_thr_w 同级，用户级）：总线二次侧->一次侧 kW。
     # pt_ratio 缩电压（ua/ub/uc，V），ct_ratio 缩电流（ia/ib/ic，A），
     # 有功（pa/pb/pc/ptotal）缩 pt*ct/1000 转 kW；默认 1.0=仅 W->kW（/1000）。
@@ -165,8 +170,11 @@ CONFIG_RULES: dict[str, dict] = {
     "post_min_on":           {"default": 1, "min": 0},
     "post_fill_short_off":   {"default": 3, "min": 0},
     # 决策阈值（kW）：仅作用于预测功率→开机状态的判决（pred_state/状态策略评估）；
-    # 缺省 None = 沿用 on_thr_w。真值判态（target_state/分类指标）恒用 on_thr_w。
-    "decision_thr_w":        {"default": None, "min": 0.001, "max": 5000.0},
+    # 支持显式正数、"auto"（默认：训练阶段在 val 验证集带护栏零泄漏寻优并落盘 meta.json，
+    # 推理阶段自动继承，全程输出黄色/红色提示日志；显式数值 100% 优先）或 "on_thr"（锁定沿用 on_thr_w）。
+    # 真值判态（target_state/分类指标）恒用 on_thr_w。
+    "decision_thr_w":        {"default": "auto", "min": 0.001, "max": 5000.0,
+                              "special_modes": DECISION_THR_MODES},
     # 推理模型（用户级）：显式指定该用户推理用的模型名；缺省 None = 走
     # base_cfg.infer_model（全局）→ 训练综合最优 best_model 的既有链路。
     # 用途：综合最优被退化指标（如 recall=1 的全漏报基线）带偏时人工锁定。

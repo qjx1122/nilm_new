@@ -64,13 +64,33 @@ def _write_cfg_with_backup(tf_path: Path, cfg: dict) -> Path:
     tf_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     return bak
 
+def _parse_on_thr_arg(val: str):
+    norm = val.strip().lower()
+    if norm == "auto":
+        return "auto"
+    try:
+        return float(val)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"--on-thr 须为正数或 'auto': {val!r}") from e
+
+
+def _parse_decision_thr_arg(val: str):
+    norm = val.strip().lower()
+    if norm in ("auto", "on_thr"):
+        return norm
+    try:
+        return float(val)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"--decision-thr 须为正数、'auto' 或 'on_thr': {val!r}") from e
+
+
 def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None,
                        decision_thr=None, pbus_mode=None) -> Path:
     """已有用户：脚本参数优先但不写回（overlay）；新用户：补原文件（带备份）。
 
     返回本次运行实际使用的配置路径：已有用户无覆盖返回原文件，有覆盖返回
     overlay；新用户写回原文件后返回原文件。target_col/on_thr/decision_thr/pbus_mode
-    为 None 表示未传，沿用配置值；新用户未传则用默认 p1/10/30/auto。
+    为 None 表示未传，沿用配置值；新用户未传则默认 p1 / auto / auto / auto。
     """
     cfg = json.loads(tf_path.read_text(encoding="utf-8"))
     if user_key in cfg:
@@ -95,8 +115,8 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         return overlay
     cfg[user_key] = {
         "target_col": target_col if target_col is not None else "p1",
-        "on_thr_w": on_thr if on_thr is not None else 10.0,
-        "decision_thr_w": decision_thr if decision_thr is not None else 30.0,
+        "on_thr_w": on_thr if on_thr is not None else "auto",
+        "decision_thr_w": decision_thr if decision_thr is not None else "auto",
         "pbus_mode": pbus_mode if pbus_mode is not None else "auto",
         "post_min_on": 1,
         "post_fill_short_off": 3,
@@ -201,8 +221,10 @@ def main(argv=None):
     ap.add_argument("--data-root", default="data")
     ap.add_argument("--output-root", default="outputs")
     ap.add_argument("--target-col", default=None, help="目标通道；已传且与 time_filters.json 不同则用 overlay 覆盖跑（不写回原文件），未传沿用（新用户默认 p1）")
-    ap.add_argument("--on-thr", type=float, default=None, help="on_thr_w；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 10.0）")
-    ap.add_argument("--decision-thr", type=float, default=None, help="decision_thr_w；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 30.0）")
+    ap.add_argument("--on-thr", type=_parse_on_thr_arg, default=None,
+                    help="on_thr_w（支持正数或 'auto'）；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 auto）")
+    ap.add_argument("--decision-thr", type=_parse_decision_thr_arg, default=None,
+                    help="decision_thr_w（支持正数、'auto' 或 'on_thr'）；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 auto）")
     ap.add_argument("--pbus-mode", choices=["auto", "raw", "scaled"], default=None,
                     help="pbus_mode（auto=默认先试raw+欠拟合经val双向验收后红色熔断切scaled，默认；raw=锁死未缩放+分摊；scaled=锁死z-score+改学）")
     ap.add_argument("--stage", choices=["all","train","infer","threshold"], default="all", help="all=2+3+5+4 完整，threshold=仅 Step4")

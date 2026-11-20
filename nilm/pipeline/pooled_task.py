@@ -33,6 +33,10 @@ from nilm.evaluation import evaluate_all, evaluate_daily
 from nilm.models import MODEL_REGISTRY
 from nilm.models.base import BaseModel
 from nilm.models.constraints import apply_constraints
+from nilm.pipeline.auto_thresholds import (
+    resolve_infer_thresholds,
+    resolve_train_on_thr_w,
+)
 from nilm.postprocess.state import postprocess_state, state_probability
 from nilm.preprocess.align import align_frames, resample_bus
 from nilm.preprocess.clean import Cleaner
@@ -226,10 +230,18 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g，功率转 kW）",
              user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
 
+    if isinstance(user_cfg.get("on_thr_w"), str) and user_cfg["on_thr_w"].strip().lower() == "auto":
+        if target is not None and need_branch:
+            eff_on_thr, _ = resolve_train_on_thr_w(user_key, user_cfg, target)
+        else:
+            eff_on_thr = 10.0
+    else:
+        eff_on_thr = float(user_cfg["on_thr_w"])
+
     ident = {}
     if target is not None:
         try:
-            ident = identifiability_report(bus_al, target, on_thr_w=float(user_cfg["on_thr_w"]))
+            ident = identifiability_report(bus_al, target, on_thr_w=eff_on_thr)
         except Exception as e:
             log.warning("[%s] 可辨识性分析跳过: %s", user_key, e)
 
@@ -252,7 +264,7 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                               f"[{user_key}] 有效样本 {len(f)} 不足")
     return {
         "user_key": user_key, "feat": f, "y_phys": y_phys, "y_norm": y_norm,
-        "index": f.index, "cap": cap, "on_thr_w": float(user_cfg["on_thr_w"]),
+        "index": f.index, "cap": cap, "on_thr_w": eff_on_thr,
         "pt_ratio": pt_ratio, "ct_ratio": ct_ratio, "branch_scale": branch_scale,
         "feature_names": [str(c) for c in f.columns],
         "bus_al": bus_al, "branch_al": branch_al, "target_cols": target_cols,
@@ -529,8 +541,13 @@ def run_pooled_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         pred = apply_constraints(pred[:, None], valid["pbus"].to_numpy() * pre["cap"],
                                  nonnegative=not allow_negative, sum_consistency=False)[:, 0]
 
-        on_thr = float(user_cfg["on_thr_w"])
-        dec_thr = float(user_cfg.get("decision_thr_w") or on_thr)
+        user_meta_proxy = {
+            "on_thr_w": (meta.get("on_thr_map") or {}).get(user_key, pre["on_thr_w"]),
+            "decision_thr_w": (meta.get("decision_thr_map") or {}).get(user_key),
+        }
+        on_thr, dec_thr, _ = resolve_infer_thresholds(
+            user_key, user_cfg, user_meta_proxy, model_name=model_name
+        )
         post_min_on = int(user_cfg.get("post_min_on", 1))
         post_fill_off = int(user_cfg.get("post_fill_short_off", 3))
         pred_state = postprocess_state(pred, dec_thr, post_min_on, post_fill_off)

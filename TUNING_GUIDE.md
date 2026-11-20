@@ -121,16 +121,16 @@ python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/420000
 | 复合和 `p1+p2` / `p1+…p6` | **60W / 10×N** | 和的最小档 | `789 p1+p2 60W`；`p1+…p6` 先看和的直方图 |
 
 * **取法**：`待机带上沿+余量` 且 `≤ 最小开机功率×0.3`。例 `非零中位709W / 待机0-8W →10W`；`待机0-35W→50W`。
+* **自动模式（`"on_thr_w": "auto"`）**：新户不确定铭牌/待机幅值时，可配 `"auto"`（`auto_run_steps2to5.py` 新户默认），训练前自动在对数功率域做 Otsu 双峰寻谷并输出**黄色高亮日志**（双峰清晰）或**红色告警日志**（多档辅机/低分离度，提示人工按台账复核），显式数值配置 100% 优先。
 * **冻结**：定后即入 `Step1b`，后续 `Step4` 只扫 `decision`，勿为追 `F1` 再动 `on_thr`。
-* **一键快速通道**：`auto_run_steps2to5.py --target-col p1 --on-thr 10` 默认 `10W`，`Step1a` 为其人工复核。
 
 ### Step 1b 写配置（唯一可信源 `configs/time_filters.json`，优先级 `user_key > _default`）
 
 ```json
 "900080270900_4200000000001": {
   "target_col": "p2",
-  "on_thr_w": 10.0,
-  "decision_thr_w": 30.0,
+  "on_thr_w": "auto",
+  "decision_thr_w": "auto",
   "pbus_mode": "auto",
   "post_min_on": 1,
   "post_fill_short_off": 3,
@@ -140,7 +140,9 @@ python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/420000
 }
 ```
 
-* `target_col` 必填，`on_thr` 看铭牌（10/50/60 三档：`p2`低频10，`p1`高功率50），`decision` 先 30。
+* `target_col` 必填；`on_thr_w` 与 `decision_thr_w` 均遵循**完全向后兼容、显式优先、全程留痕**：
+  * **显式数值 100% 优先**：已确认数值（如 `"on_thr_w": 50.0, "decision_thr_w": 30.0`）原样生效，绝不被自动改写；`on_thr_w` 未写时保持历史硬编码默认 `10.0` 向后兼容；
+  * **`"decision_thr_w": "auto"`（默认）**：训练阶段在选定推理模型的 `val` 验证集（零测试集泄漏）执行带三重物理护栏（`val_recall ≥ 0.95`、`≤ 0.55 × P10(y_on)`、最小增益门 `0.003` + 全关日 FP 优先）的判决链寻优，全量候选表写入 `train/meta.json`，推理自动按所选模型继承；常规输出**黄色提示日志**，召回退化或推理跨期基线漂移时输出**红色告警日志**（也可配 `"on_thr"` 显式锁定沿用 `on_thr_w`）。
 * `pbus_mode` 默认 `"auto"`（推荐）：采用**零泄漏三步验证闭环**——① 不依赖易误伤的静态千瓦阈值盲跳，所有用户默认统一先跑抗漂移基态 `"raw"`（`pbus` 未缩放 + 物理零点锚定，绝大多数用户如 `2842/2844/856/870/778` 一遍即完稳留 `"raw"`）；② 仅当 `train + val` 检测到序列模型真实欠拟合信号（`R²` 与 `val MAE` 双双显著劣于 `ridge/history_profile` 基线，或预测坍缩，如 `733`）时，才启动候选 `"scaled"` 重训；③ 候选 `"scaled"` 在 `val` 验证集（严禁看 `test`）与刚跑完的 `"raw"` 正面对决，**必须同时满足「`val MAE` 实质改善（相对下降 ≥5%）」与「`val F1` 不退化（跌幅 ≤0.015）」才打印红色高亮日志切换为 `"scaled"`**（若像 `778` 出现关机虚报激增、`val F1` 下跌超限，则自动拒绝切换并保留抗漂移的 `"raw"`）；推理自动继承训练产物模式。也可手工指定 `"raw"` 或 `"scaled"` 锁死（切换后须加 `--force` 重训重推）。
 * `post_min_on 1` 去 <1 窗的抖动（恒空操作，防短闪），`post_fill_short_off 3` 填 ≤45min 的短关断。
 * `day_gate true` 全局默认（优先级 `day > train_range > full`），`min_on_day_ratio 0.2` 防“无可学开机模式”（2844旧池 31%→71%已验）。
