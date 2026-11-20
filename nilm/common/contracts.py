@@ -133,15 +133,16 @@ class Status:
 SPLIT_STRATEGIES = ("stratified_day", "stratified", "time", "global_stratified",
                     "stratified_by_state")
 # pbus_mode（按户选/自动判定双路径）：
-#   auto（全局默认）：训练时仅基于 train 集无泄漏统计量（一次侧 pbus 的 P95>3500kW / std>1200kW +
-#     开机态条件贡献率 on_contrib_ratio<0.25 且 P95>800kW）前置判定 raw 或 scaled；
-#     若前置初判 raw 但验证集检测到序列模型真实欠拟合（R² 与 MAE 双双劣于基线，或预测坍缩），
-#     自动重训切换 scaled 并输出红色日志提示；推理自动继承训练产物。
+#   auto（全局默认）：三步零泄漏验证闭环——① 取消静态千瓦阈值盲跳，默认统一先跑抗漂移基态 raw
+#     （仅统计 train 集物理量留痕）；② 若 train/val 检测到序列模型真实欠拟合（R² 与 MAE 双双劣于基线，
+#     或预测坍缩），启动候选 scaled 重训；③ 在 val 验证集（严禁看 test）执行双向验收，仅当同时满足
+#     「val MAE 实质改善（>=5%）」与「val F1 不退化（跌幅<=0.015）」时输出红色日志切换为 scaled，
+#     否则拒绝切换并自动保留抗漂移的 raw（如 778）；推理自动继承训练产物模式。
 #   raw（退回/忽略电平）：pbus 保留在 NON_SCALED_COLS 不做 z-score 缩放，
-#     proportional 按物理占比分摊（pred = pbus × share）；适用于大占比单分路、
-#     跨期基线易漂移用户（如 856）。
+#     proportional 按物理占比分摊（pred = pbus × share）；适用于主导单分路、双峰同步负荷或
+#     跨期背景基荷易漂移的规律负荷（如 2842/2844/856/870/778）。
 #   scaled（方向2/学比例）：pbus 做 z-score 标准化，proportional 改学最小二乘
-#     线性映射（y ≈ a·pbus_z + b）；适用于大厂小占比或多分路求和目标（如 733）。
+#     线性映射（y ≈ a·pbus_z + b）；适用于 raw 真欠拟合且验证集双向改善的用户（如 733）。
 PBUS_MODES = ("auto", "raw", "scaled")
 
 CONFIG_RULES: dict[str, dict] = {

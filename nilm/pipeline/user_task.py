@@ -29,8 +29,9 @@ from nilm.data_io.validator import (QualityError, assert_quality,
                                     quality_advice, quality_report,
                                     split_coverage_advice, write_quality_html,
                                     write_schema_report)
-from nilm.evaluation import (build_comparison_table, evaluate_all,
-                             evaluate_daily, evaluate_daily_chain, summarize)
+from nilm.evaluation import (METRIC_REGISTRY, build_comparison_table,
+                             evaluate_all, evaluate_daily,
+                             evaluate_daily_chain, summarize)
 from nilm.models import MODEL_REGISTRY
 from nilm.models.base import BaseModel
 from nilm.models.constraints import apply_constraints
@@ -57,6 +58,8 @@ NON_SCALED_COLS = {"slot", "hour", "minute", "day_of_week", "is_weekend",
                    "pbus"}
 NON_SCALED_COLS_SCALED = NON_SCALED_COLS - {"pbus"}
 SEQ_MODEL_NAMES = ("transformer", "lstm", "cnn1d")
+VAL_MAE_MIN_REL_GAIN = 0.05   # 候选 scaled 相对 raw 的验证集 MAE 最小改善率（5%，过滤随机微扰）
+VAL_F1_MAX_DROP = 0.015       # 候选 scaled 相对 raw 允许的验证集 F1 最大退化容忍度（防 778 类关机虚报激增）
 
 
 def _non_scaled_cols(pbus_mode: str) -> set[str]:
@@ -71,18 +74,15 @@ def _non_scaled_cols(pbus_mode: str) -> set[str]:
 def resolve_auto_pbus_mode(pbus_train: np.ndarray,
                            y_train: np.ndarray,
                            on_thr_w: float = 10.0) -> tuple[str, dict]:
-    """基于 train 集无泄漏物理统计量自动判定 pbus_mode（对应三步决策法第1、2步，v3 收敛版）。
+    """统计 train 集无泄漏物理特征并返回稳健默认基态 'raw'（三步闭环第1步，v4 根治版）。
 
-    严格仅使用 splits['train']（严禁接触 val/test，遵守 §11 零泄漏契约）。
-    结合第3步单向后置熔断（raw 欠拟合可自动切回 scaled 重训，而 scaled 跨期漂移/槽位过拟合不可逆）的
-    不对称代价，前置初判仅对高置信度超巨型母线或大母线开机低占比支路直接选 scaled：
-    - R1 超巨型母线幅值防淹没：P95(pbus) > 3500kW 或 std(pbus) > 1200kW -> scaled
-      （如 733：pt×ct=16000 一次侧 P95≈4005kW, std≈1311kW，防首层激活方差淹没；
-        放行 856 P95≈1545kW/std≈550kW 与 870 双峰同步大负荷 P95≈2081kW/std≈883kW）；
-    - R2 大母线开机态低贡献率防背景淹没：P95(pbus) > 800kW 且 on_contrib_ratio < 0.25 -> scaled
-      （on_contrib_ratio = mean(y_on)/mean(pbus_on)，仅在 y >= on_thr_w 开机点计算，
-        消除 856 类低占空比间歇大负荷关机 0 值稀释误判，同时保护 870 on_contrib≈0.335 主导负荷走 raw）；
-    - 其余用户前置默认走 raw（兼顾物理零点锚定与跨月抗漂移；若真触发欠拟合由第3步红色熔断兜底）。
+    严格仅读取 splits['train']（严禁接触 val/test，遵守 §11 零泄漏契约）。
+    物理定论（733 vs 778 对比实证）：778 的母线规模（P95=5442kW, std=2252kW）与开机贡献率
+    （on_contrib=0.127）在所有静态维度上均比 733（P95=4005kW, std=1311kW, on_contrib=0.207）
+    更极端，但 778 因跨月背景基荷剧烈漂移必须走 raw（scaled 下 infer F1 崩至 0.7216 vs raw 0.9776）。
+    因此单靠训练前静态阈值无法分离“真欠拟合需缩放”与“高背景漂移规律负荷需抗漂移”，第1步统一先跑
+    抗漂移的默认基态 raw，仅在检测到真实欠拟合（第2步）且候选 scaled 通过验证集 MAE+F1 双向验收
+    （第3步）时才切换为 scaled。
     """
     pb_arr = np.asarray(pbus_train, dtype=np.float64).reshape(-1)
     yt_arr = np.asarray(y_train, dtype=np.float64).reshape(-1)
@@ -91,7 +91,7 @@ def resolve_auto_pbus_mode(pbus_train: np.ndarray,
     if len(pb) == 0:
         return "raw", {
             "configured_mode": "auto", "resolved_mode": "raw",
-            "stage": "pre_rule", "train_pbus_p95": 0.0, "train_pbus_std": 0.0,
+            "stage": "default_raw", "train_pbus_p95": 0.0, "train_pbus_std": 0.0,
             "train_pbus_mean": 0.0, "train_target_mean": 0.0,
             "train_contrib_ratio": 1.0, "train_on_contrib_ratio": 1.0,
             "train_on_duty_ratio": 0.0, "on_thr_w": float(on_thr_w),
@@ -113,18 +113,10 @@ def resolve_auto_pbus_mode(pbus_train: np.ndarray,
     else:
         on_contrib = contrib
 
-    reasons: list[str] = []
-    if p95 > 3500.0 or pstd > 1200.0:
-        reasons.append(f"HIGH_BUS_SCALE(p95={p95:.1f}>3500 or std={pstd:.1f}>1200)")
-    if p95 > 800.0 and on_contrib < 0.25:
-        reasons.append(
-            f"LOW_ON_CONTRIB_RATIO(p95={p95:.1f}>800, on_contrib={on_contrib:.4f}<0.25)")
-
-    mode = "scaled" if reasons else "raw"
-    return mode, {
+    return "raw", {
         "configured_mode": "auto",
-        "resolved_mode": mode,
-        "stage": "pre_rule",
+        "resolved_mode": "raw",
+        "stage": "default_raw",
         "train_pbus_p95": round(p95, 2),
         "train_pbus_std": round(pstd, 2),
         "train_pbus_mean": round(mean_pb, 2),
@@ -133,20 +125,20 @@ def resolve_auto_pbus_mode(pbus_train: np.ndarray,
         "train_on_contrib_ratio": round(on_contrib, 4),
         "train_on_duty_ratio": round(on_duty, 4),
         "on_thr_w": float(on_thr_w),
-        "reasons": reasons or ["KEEP_RAW_BY_PRE_RULE"],
+        "reasons": ["DEFAULT_RAW_BEFORE_VAL_CHECK"],
     }
 
 
 def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
                                    split_bands: dict[str, dict[str, float]],
                                    on_thr: float) -> tuple[bool, list[str]]:
-    """后置单向熔断检测（对应三步决策法第3步，仅检视 train/val 严禁看 test）：
+    """第2步候选重训触发检测（仅检视 train/val 严禁看 test，遵守 §11 零泄漏契约）：
 
-    当前置规则初判为 raw 时，检查深度序列模型是否因未缩放 pbus 条件数病态触发欠拟合/坍缩：
+    首轮默认跑完 raw 后，检查深度序列模型是否因未缩放 pbus 条件数病态触发真实欠拟合/坍缩：
     1) 预测带宽坍缩（train 或 val 带宽 < on_thr_w）或 train R² < 0；
     2) 序列模型在 train 与 val 上 R² 双双显著劣于非退化基线（history_profile / ridge），
        且 val MAE 亦劣于最优参考基线（防 ridge 因最小化 MSE 使 R² 虚高但 MAE 远差于
-       SmoothL1 序列模型如 856 时发生误熔断）；
+       SmoothL1 序列模型如 856 时误触发）；
     3) 序列模型在 val 上 R² 与 MAE 均劣于纯静态槽位画像 history_profile 且 proportional 严重失配（R² < -1）。
     """
     reasons: list[str] = []
@@ -228,6 +220,153 @@ def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
                         f"train_r2={tr_r2:.4f}<{best_ref_tr:.4f}-0.05)")
 
     return bool(reasons), reasons
+
+
+def _extract_split_mae_f1(results_by_split: dict[str, dict],
+                          pred_frames: dict[str, pd.DataFrame] | None,
+                          model_name: str,
+                          split: str,
+                          on_thr: float) -> tuple[float | None, float | None]:
+    """提取指定模型在给定划分（仅限 val/train，严禁传 test）上的 (MAE, F1@on_thr)。
+
+    若 base_cfg.metrics 未显式包含 f1/mae（如精简单测配置），自动从同划分 pred_frames 补算，
+    确保验证集双向验收门禁在任何指标配置下均具备一致的确定性口径。
+    """
+    by_sp = results_by_split.get(model_name, {}).get(split, {})
+    mae_v = by_sp.get("mae", {}).get("macro")
+    f1_v = by_sp.get("f1", {}).get("macro")
+    if (mae_v is None or f1_v is None) and pred_frames and split in pred_frames:
+        df_sp = pred_frames[split]
+        p_col = f"pred_{model_name}"
+        if not df_sp.empty and "target" in df_sp.columns and p_col in df_sp.columns:
+            yt = df_sp["target"].to_numpy(dtype=np.float64)[:, None]
+            yp = df_sp[p_col].to_numpy(dtype=np.float64)[:, None]
+            if mae_v is None:
+                mae_v = float(METRIC_REGISTRY.get("mae")(yt, yp)["macro"])
+            if f1_v is None:
+                f1_v = float(METRIC_REGISTRY.get("f1")(yt, yp, on_thr_w=on_thr)["macro"])
+    return (float(mae_v) if mae_v is not None else None,
+            float(f1_v) if f1_v is not None else None)
+
+
+def _accept_scaled_candidate(raw_results_by_split: dict[str, dict],
+                             raw_split_bands: dict[str, dict[str, float]],
+                             scaled_results_by_split: dict[str, dict],
+                             scaled_split_bands: dict[str, dict[str, float]],
+                             on_thr: float,
+                             raw_pred_frames: dict[str, pd.DataFrame] | None = None,
+                             scaled_pred_frames: dict[str, pd.DataFrame] | None = None,
+                             triggered_reasons: list[str] | None = None,
+                             mae_min_rel_gain: float = VAL_MAE_MIN_REL_GAIN,
+                             f1_max_drop: float = VAL_F1_MAX_DROP) -> tuple[bool, list[str]]:
+    """第3步验证集双向验收门禁（仅用 val，无 val 时回退 train；严禁看 test 零泄漏）：
+
+    候选 scaled 重训完成后，在验证集上与首轮 raw 正面对决，必须同时满足：
+    1) 候选 scaled 自身未坍缩（train/val 带宽 >= on_thr）且 train/val R² 非负；
+    2) 触发重训的序列模型在验证集上 MAE 实质改善：
+       val_mae_scaled <= val_mae_raw * (1 - mae_min_rel_gain)（若首轮 raw 发生带宽坍缩致全 0 伪低 MAE，
+       则凭非坍缩与 F1 唤醒放行）；
+    3) 所有序列模型在验证集上 F1 不退化：val_f1_scaled >= val_f1_raw - f1_max_drop
+       （如 778：scaled 虽降低波峰 MAE，但关机零点随 z(pbus) 漂移虚报激增，val F1 从 0.9743 跌至
+        0.9366，跌幅 0.0377 > 0.015，本门禁自动拒绝切换并保留抗漂移的 raw）。
+    """
+    seq_models = [m for m in SEQ_MODEL_NAMES
+                  if m in raw_results_by_split and m in scaled_results_by_split]
+    if not seq_models:
+        return False, ["NO_SEQ_MODEL_FOR_ACCEPTANCE"]
+
+    triggered_set = {r.split("_", 1)[0] for r in (triggered_reasons or [])
+                     if r.split("_", 1)[0] in SEQ_MODEL_NAMES}
+    if not triggered_set:
+        triggered_set = set(seq_models)
+
+    accept_notes: list[str] = []
+    reject_notes: list[str] = []
+    for seq_name in seq_models:
+        raw_by = raw_results_by_split[seq_name]
+        sc_by = scaled_results_by_split[seq_name]
+        eval_split = "val" if ("val" in raw_by and "val" in sc_by) else "train"
+
+        sc_bands = scaled_split_bands.get(seq_name, {})
+        sc_tr_band = sc_bands.get("train")
+        sc_ev_band = sc_bands.get(eval_split)
+        sc_tr_r2 = sc_by.get("train", {}).get("r2", {}).get("macro")
+        sc_ev_r2 = sc_by.get(eval_split, {}).get("r2", {}).get("macro")
+
+        if sc_tr_band is not None and sc_tr_band < on_thr:
+            reject_notes.append(
+                f"{seq_name}_SCALED_TRAIN_COLLAPSED(band={sc_tr_band:.2f}<{on_thr:.2f})")
+            continue
+        if sc_ev_band is not None and sc_ev_band < on_thr:
+            reject_notes.append(
+                f"{seq_name}_SCALED_{eval_split.upper()}_COLLAPSED("
+                f"band={sc_ev_band:.2f}<{on_thr:.2f})")
+            continue
+        if sc_tr_r2 is not None and sc_tr_r2 < 0.0:
+            reject_notes.append(
+                f"{seq_name}_SCALED_TRAIN_NEG_R2(r2={sc_tr_r2:.4f}<0)")
+            continue
+        if sc_ev_r2 is not None and sc_ev_r2 < 0.0:
+            reject_notes.append(
+                f"{seq_name}_SCALED_{eval_split.upper()}_NEG_R2(r2={sc_ev_r2:.4f}<0)")
+            continue
+
+        raw_bands = raw_split_bands.get(seq_name, {})
+        raw_tr_band = raw_bands.get("train")
+        raw_ev_band = raw_bands.get(eval_split)
+        raw_tr_r2 = raw_by.get("train", {}).get("r2", {}).get("macro")
+        raw_ev_r2 = raw_by.get(eval_split, {}).get("r2", {}).get("macro")
+        raw_collapsed = ((raw_tr_band is not None and raw_tr_band < on_thr)
+                         or (raw_ev_band is not None and raw_ev_band < on_thr))
+        raw_neg_r2 = ((raw_tr_r2 is not None and raw_tr_r2 < 0.0)
+                      or (raw_ev_r2 is not None and raw_ev_r2 < 0.0))
+
+        raw_mae, raw_f1 = _extract_split_mae_f1(
+            raw_results_by_split, raw_pred_frames, seq_name, eval_split, on_thr)
+        sc_mae, sc_f1 = _extract_split_mae_f1(
+            scaled_results_by_split, scaled_pred_frames, seq_name, eval_split, on_thr)
+
+        if raw_collapsed:
+            if raw_f1 is not None and sc_f1 is not None and sc_f1 + 1e-9 < raw_f1:
+                reject_notes.append(
+                    f"{seq_name}_{eval_split.upper()}_F1_NOT_RECOVERED("
+                    f"raw={raw_f1:.4f}->scaled={sc_f1:.4f})")
+                continue
+            mae_s = (f"{eval_split}_mae:{raw_mae:.2f}->{sc_mae:.2f}"
+                     if (raw_mae is not None and sc_mae is not None) else f"{eval_split}_mae:n/a")
+            f1_s = (f"{eval_split}_f1:{raw_f1:.4f}->{sc_f1:.4f}"
+                    if (raw_f1 is not None and sc_f1 is not None) else f"{eval_split}_f1:n/a")
+            accept_notes.append(f"{seq_name}_RECOVERED_FROM_COLLAPSE({mae_s}, {f1_s})")
+            continue
+
+        rel_gain = (((raw_mae - sc_mae) / raw_mae)
+                    if (raw_mae is not None and sc_mae is not None and raw_mae > 1e-9) else 0.0)
+        if seq_name in triggered_set and raw_mae is not None and sc_mae is not None:
+            if sc_mae > raw_mae * (1.0 - mae_min_rel_gain) + 1e-9:
+                reject_notes.append(
+                    f"{seq_name}_{eval_split.upper()}_MAE_GAIN_INSUFFICIENT("
+                    f"raw={raw_mae:.2f}->scaled={sc_mae:.2f}, "
+                    f"gain={rel_gain:.1%}<{mae_min_rel_gain:.1%})")
+                continue
+
+        if not raw_neg_r2 and raw_f1 is not None and sc_f1 is not None:
+            f1_drop = raw_f1 - sc_f1
+            if f1_drop > f1_max_drop + 1e-9:
+                reject_notes.append(
+                    f"{seq_name}_{eval_split.upper()}_F1_DEGRADED("
+                    f"raw={raw_f1:.4f}->scaled={sc_f1:.4f}, "
+                    f"drop={f1_drop:.4f}>{f1_max_drop:.4f})")
+                continue
+
+        mae_str = (f"{eval_split}_mae:{raw_mae:.2f}->{sc_mae:.2f}({rel_gain:+.1%})"
+                   if (raw_mae is not None and sc_mae is not None) else f"{eval_split}_mae:n/a")
+        f1_str = (f"{eval_split}_f1:{raw_f1:.4f}->{sc_f1:.4f}"
+                  if (raw_f1 is not None and sc_f1 is not None) else f"{eval_split}_f1:n/a")
+        accept_notes.append(f"{seq_name}_VAL_DUAL_GATE_PASS({mae_str}, {f1_str})")
+
+    if reject_notes:
+        return False, reject_notes
+    return bool(accept_notes), accept_notes
 
 
 def _infer_trained_pbus_mode(meta: dict) -> str:
@@ -567,7 +706,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             pbus_mode, pbus_decision = resolve_auto_pbus_mode(
                 splits["train"][0][:, pbus_col], splits["train"][1][:, 0],
                 on_thr_w=on_thr)
-            log.info("[%s] [auto] 前置判定 pbus_mode=%s（train_p95=%.1f, std=%.1f, "
+            log.info("[%s] [auto] 默认先试 pbus_mode=%s（train_p95=%.1f, std=%.1f, "
                      "on_contrib=%.4f, duty=%.1f%%, all_contrib=%.4f, reasons=%s）",
                      user_key, pbus_mode, pbus_decision["train_pbus_p95"],
                      pbus_decision["train_pbus_std"],
@@ -693,23 +832,52 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
          daily_rows, daily_chain_rows, test_preds, collapsed_models,
          pred_frames, split_bands) = _run_pbus_mode_pass(pbus_mode)
 
-        # 后置单向熔断（仅 auto 且前置初判 raw 时）：若 train/val 检测到序列模型欠拟合，
-        # 红色高亮告警并自动切换 scaled 重新训练
+        # 第2–3步闭环（仅 auto 模式）：默认跑完 raw 后，若 train/val 检测到真实欠拟合，
+        # 启动候选 scaled 重训并执行验证集双向验收（MAE 实质改善 + F1 不退化，零泄漏禁看 test）：
+        # 通过则红色高亮切换为 scaled；未通过则拒绝切换、自动保留抗漂移的 raw。
         if cfg_pbus_mode == "auto" and pbus_mode == "raw":
             need_fb, fb_reasons = _should_fallback_raw_to_scaled(
                 results_by_split, split_bands, on_thr)
             if need_fb:
-                log.warning("%s", red_text(
-                    f"[{user_key}] [AUTO-FALLBACK] 前置初判 pbus_mode=raw 触发欠拟合熔断"
-                    f"（{'; '.join(fb_reasons)}），自动重训切换为 pbus_mode=scaled！"
-                ))
-                pbus_mode = "scaled"
-                pbus_decision["resolved_mode"] = "scaled"
-                pbus_decision["stage"] = "post_fallback"
+                log.info(
+                    "[%s] [auto] 首轮 pbus_mode=raw 触发候选重训条件（%s），"
+                    "启动候选 pbus_mode=scaled 重训并执行验证集双向验收...",
+                    user_key, "; ".join(fb_reasons))
+                cand_bundle = _run_pbus_mode_pass("scaled")
+                (c_sc_cols, c_scaler, c_scaled, c_models, c_results, c_res_by_sp,
+                 c_daily, c_daily_chain, c_test_preds, c_collapsed,
+                 c_pred_frames, c_split_bands) = cand_bundle
+                accepted, gate_notes = _accept_scaled_candidate(
+                    results_by_split, split_bands,
+                    c_res_by_sp, c_split_bands,
+                    on_thr=on_thr,
+                    raw_pred_frames=pred_frames,
+                    scaled_pred_frames=c_pred_frames,
+                    triggered_reasons=fb_reasons)
                 pbus_decision["fallback_reasons"] = fb_reasons
-                (scale_cols, scaler, scaled, fitted_models, results, results_by_split,
-                 daily_rows, daily_chain_rows, test_preds, collapsed_models,
-                 pred_frames, split_bands) = _run_pbus_mode_pass(pbus_mode)
+                pbus_decision["val_acceptance"] = {
+                    "accepted": accepted,
+                    "details": gate_notes,
+                }
+                if accepted:
+                    log.warning("%s", red_text(
+                        f"[{user_key}] [AUTO-FALLBACK] 首轮 pbus_mode=raw 触发欠拟合"
+                        f"（{'; '.join(fb_reasons)}），且候选 scaled 通过验证集双向验收"
+                        f"（{'; '.join(gate_notes)}），自动重训切换为 pbus_mode=scaled！"
+                    ))
+                    pbus_mode = "scaled"
+                    pbus_decision["resolved_mode"] = "scaled"
+                    pbus_decision["stage"] = "post_fallback"
+                    (scale_cols, scaler, scaled, fitted_models, results, results_by_split,
+                     daily_rows, daily_chain_rows, test_preds, collapsed_models,
+                     pred_frames, split_bands) = cand_bundle
+                else:
+                    log.warning(
+                        "[%s] [AUTO-REJECT-SCALED] 候选 pbus_mode=scaled 未通过验证集双向验收"
+                        "（%s；触发原因: %s），拒绝切换，自动保留抗漂移的 pbus_mode=raw！",
+                        user_key, "; ".join(gate_notes), "; ".join(fb_reasons))
+                    pbus_decision["resolved_mode"] = "raw"
+                    pbus_decision["stage"] = "post_fallback_rejected"
 
         # 最终选定模式落盘：窗口样本索引（§10）与各模型权重
         if split_sizes["train"] >= window:

@@ -514,10 +514,10 @@ def test_proportional_predicts_physical_scale(tmp_path, base_cfg_file,
               user_keys=[USER_KEY])
     train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
     meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
-    # 全局默认 auto：中小母线主导单路（p95≈175<=500, contrib≈0.50>=0.33）自动前置判为 raw
+    # 全局默认 auto：第1步统一先跑稳健基态 raw（pbus 不在缩放列）
     assert meta["pbus_mode_configured"] == "auto"
     assert meta["pbus_mode"] == "raw"
-    assert meta["pbus_mode_decision"]["stage"] == "pre_rule"
+    assert meta["pbus_mode_decision"]["stage"] == "default_raw"
     # raw 下 pbus 不在缩放列
     i = meta["feature_names"].index("pbus")
     assert i not in meta["scale_cols"], "pbus_mode=raw 下 pbus 不得被 z-score 标准化"
@@ -627,17 +627,20 @@ def test_proportional_legacy_pickle_and_mode_validation():
 
 
 def test_resolve_auto_pbus_mode_boundaries():
-    """前置无泄漏 v3 收敛规则与后置单向熔断边界单测（覆盖 733 / 856 / 870 / 2842 真实分布）。"""
+    """零泄漏三步验证闭环单测（覆盖 2842 / 856 / 870 / 778 / 733 真实分布与双向门禁边界）。"""
     import numpy as np
-    from nilm.pipeline.user_task import resolve_auto_pbus_mode, _should_fallback_raw_to_scaled
+    from nilm.pipeline.user_task import (
+        resolve_auto_pbus_mode,
+        _should_fallback_raw_to_scaled,
+        _accept_scaled_candidate,
+    )
 
-    # 1) 2842/2844 类低压中小母线主导单路（p95≈200<=3500, on_contrib=0.50>=0.25）-> raw
+    # ---- 第1步：取消静态千瓦阈值盲跳，所有母线规模统一默认先试抗漂移基态 raw（物理画像完整留痕）----
     pb_small = np.linspace(100.0, 210.0, 200)
     m1, d1 = resolve_auto_pbus_mode(pb_small, 0.5 * pb_small, on_thr_w=10.0)
-    assert m1 == "raw" and d1["stage"] == "pre_rule"
+    assert m1 == "raw" and d1["stage"] == "default_raw"
 
-    # 2) 复现 856 真实分布（pt*ct=6000 中压专变 p95≈1545<=3500, std≈550<=1200；
-    #    开机占空比仅 18% 致全时段 all_contrib≈0.19<0.20，但开机态 on_contrib≈0.36>=0.25）-> 必须保 raw！
+    # 856 真实分布（低占空比 18%）：留痕准确且默认先试 raw
     rng = np.random.default_rng(42)
     n_tot, n_on = 955, 173
     y_856 = np.zeros(n_tot)
@@ -646,40 +649,28 @@ def test_resolve_auto_pbus_mode_boundaries():
                       y_856 + rng.uniform(850.0, 1050.0, size=n_tot),
                       rng.uniform(220.0, 460.0, size=n_tot))
     m_856, d_856 = resolve_auto_pbus_mode(pb_856, y_856, on_thr_w=10.0)
-    assert d_856["train_contrib_ratio"] < 0.22       # 全时段比被 82% 关机 0 值稀释
-    assert d_856["train_on_contrib_ratio"] >= 0.30   # 开机态真实占比显著 >= 0.25
-    assert m_856 == "raw" and d_856["reasons"] == ["KEEP_RAW_BY_PRE_RULE"]
+    assert d_856["train_contrib_ratio"] < 0.22
+    assert d_856["train_on_contrib_ratio"] >= 0.30
+    assert m_856 == "raw" and d_856["reasons"] == ["DEFAULT_RAW_BEFORE_VAL_CHECK"]
 
-    # 2b) 复现 870 真实分布（pt*ct=4000 双峰同步启停大负荷：duty≈38.7%, p95≈2081<=3500,
-    #     因全厂夜间归零双峰切换 std≈883∈(800, 1200]，on_contrib≈0.335>=0.25）-> 必须保 raw！
-    n_870, on_870 = 2489, 964
-    y_870 = np.zeros(n_870)
-    y_870[:on_870] = rng.uniform(560.0, 720.0, size=on_870)
-    pb_870 = np.where(y_870 >= 10.0,
-                      rng.uniform(1700.0, 2150.0, size=n_870),
-                      rng.uniform(10.0, 80.0, size=n_870))
-    m_870, d_870 = resolve_auto_pbus_mode(pb_870, y_870, on_thr_w=10.0)
-    assert 1900.0 < d_870["train_pbus_p95"] < 2300.0
-    assert 820.0 < d_870["train_pbus_std"] < 1050.0
-    assert d_870["train_on_contrib_ratio"] >= 0.30
-    assert m_870 == "raw" and d_870["reasons"] == ["KEEP_RAW_BY_PRE_RULE"]
+    # 870 真实分布（双峰同步大负荷）与 778 极端超大母线（P95≈5442, std≈2252, on_contrib≈0.127）及 733：
+    # 第1步均统一先跑 raw，不再被静态 P95/std/on_contrib 误送进 scaled！
+    pb_778 = np.concatenate([rng.uniform(1200.0, 2800.0, 666),
+                             rng.uniform(3800.0, 5650.0, 671)])
+    y_778 = np.concatenate([np.zeros(666), rng.uniform(520.0, 680.0, 671)])
+    m_778, d_778 = resolve_auto_pbus_mode(pb_778, y_778, on_thr_w=50.0)
+    assert d_778["train_pbus_p95"] > 5000.0
+    assert d_778["train_on_contrib_ratio"] < 0.16
+    assert m_778 == "raw" and d_778["stage"] == "default_raw"
 
-    # 3) R1 超巨型母线（如 733：p95≈4005>3500, std≈1310>1200）-> scaled
     pb_733 = np.linspace(500.0, 4250.0, 300)
-    m2, d2 = resolve_auto_pbus_mode(pb_733, 0.20 * pb_733, on_thr_w=10.0)
-    assert m2 == "scaled"
-    assert any("HIGH_BUS_SCALE" in r for r in d2["reasons"])
-    assert any("LOW_ON_CONTRIB_RATIO" in r for r in d2["reasons"])
+    m_733, d_733 = resolve_auto_pbus_mode(pb_733, 0.20 * pb_733, on_thr_w=10.0)
+    assert m_733 == "raw" and d_733["stage"] == "default_raw"
 
-    # 4) R2 中大母线（p95∈(800, 3500]）下微弱支路 vs 主导支路分流
-    pb_mid = np.linspace(900.0, 2100.0, 200)
-    m4a, d4a = resolve_auto_pbus_mode(pb_mid, 0.15 * pb_mid, on_thr_w=10.0)
-    assert m4a == "scaled" and any("LOW_ON_CONTRIB_RATIO" in r for r in d4a["reasons"])
-    m4b, _ = resolve_auto_pbus_mode(pb_mid, 0.33 * pb_mid, on_thr_w=10.0)
-    assert m4b == "raw"
+    # ---- 第2步：候选重训触发检测（仅用 train + val，严禁看 test）----
+    bands_ok = {"transformer": {"train": 500.0, "val": 500.0}}
 
-    # 5) 后置单向熔断单测：
-    # 5a) 正常领先基线 -> 不熔断
+    # 2a) 2842/870 类正常领先基线 -> 不触发
     res_ok = {
         "history_profile": {"train": {"r2": {"macro": 0.80}, "mae": {"macro": 62.0}},
                             "val": {"r2": {"macro": 0.72}, "mae": {"macro": 75.0}}},
@@ -688,10 +679,9 @@ def test_resolve_auto_pbus_mode_boundaries():
         "transformer": {"train": {"r2": {"macro": 0.96}, "mae": {"macro": 33.0}},
                         "val": {"r2": {"macro": 0.80}, "mae": {"macro": 63.0}}},
     }
-    bands_ok = {"transformer": {"train": 500.0, "val": 500.0}}
     assert _should_fallback_raw_to_scaled(res_ok, bands_ok, 10.0) == (False, [])
 
-    # 5b) 防误熔断保护（856 SmoothL1 vs MSE 场景）：ridge R² 略高但 val MAE (42.9) 远差于 transformer (29.5) -> 不熔断！
+    # 2b) 856 SmoothL1 vs MSE 保护：ridge R² 略高但 val MAE (42.9) 远差于 transformer (29.5) -> 不触发
     res_856_like = {
         "history_profile": {"train": {"r2": {"macro": 0.507}, "mae": {"macro": 51.3}},
                             "val": {"r2": {"macro": 0.292}, "mae": {"macro": 52.5}}},
@@ -702,77 +692,80 @@ def test_resolve_auto_pbus_mode_boundaries():
     }
     assert _should_fallback_raw_to_scaled(res_856_like, bands_ok, 10.0) == (False, [])
 
-    # 5c) 复现 733 raw 真欠拟合（R² 与 val MAE 双双劣于 ridge）-> 触发熔断！
+    # 2c) 复现 778 实测 raw 日志（val R²=0.7736 与 ridge 0.7828 仅差 0.0092 < 0.02）-> 第2步即直接留用 raw！
+    res_778_raw = {
+        "history_profile": {"train": {"r2": {"macro": 0.8080}, "mae": {"macro": 76.9}, "f1": {"macro": 0.9933}},
+                            "val": {"r2": {"macro": 0.7790}, "mae": {"macro": 78.6}, "f1": {"macro": 0.9931}}},
+        "ridge": {"train": {"r2": {"macro": 0.9081}, "mae": {"macro": 68.9}, "f1": {"macro": 0.9850}},
+                  "val": {"r2": {"macro": 0.7828}, "mae": {"macro": 84.5}, "f1": {"macro": 0.9620}}},
+        "transformer": {"train": {"r2": {"macro": 0.7500}, "mae": {"macro": 112.8}, "f1": {"macro": 0.9778}},
+                        "val": {"r2": {"macro": 0.7736}, "mae": {"macro": 115.9}, "f1": {"macro": 0.9743}}},
+    }
+    assert _should_fallback_raw_to_scaled(res_778_raw, bands_ok, 50.0) == (False, [])
+
+    # 2d) 复现 733 实测 raw 真欠拟合（R² 与 val MAE 双双显著劣于 ridge）-> 触发候选 scaled 重训！
     res_733_raw = {
-        "history_profile": {"train": {"r2": {"macro": 0.7979}, "mae": {"macro": 62.9}},
-                            "val": {"r2": {"macro": 0.7197}, "mae": {"macro": 75.7}}},
-        "ridge": {"train": {"r2": {"macro": 0.9137}, "mae": {"macro": 61.1}},
-                  "val": {"r2": {"macro": 0.8199}, "mae": {"macro": 73.4}}},
-        "transformer": {"train": {"r2": {"macro": 0.8297}, "mae": {"macro": 68.5}},
-                        "val": {"r2": {"macro": 0.7673}, "mae": {"macro": 81.2}}},
+        "history_profile": {"train": {"r2": {"macro": 0.7979}, "mae": {"macro": 62.9}, "f1": {"macro": 0.9050}},
+                            "val": {"r2": {"macro": 0.7197}, "mae": {"macro": 75.7}, "f1": {"macro": 0.8920}}},
+        "ridge": {"train": {"r2": {"macro": 0.9137}, "mae": {"macro": 61.1}, "f1": {"macro": 0.9200}},
+                  "val": {"r2": {"macro": 0.8199}, "mae": {"macro": 73.4}, "f1": {"macro": 0.9100}}},
+        "transformer": {"train": {"r2": {"macro": 0.8297}, "mae": {"macro": 68.5}, "f1": {"macro": 0.9150}},
+                        "val": {"r2": {"macro": 0.7673}, "mae": {"macro": 81.2}, "f1": {"macro": 0.9120}}},
     }
     fb, fb_r = _should_fallback_raw_to_scaled(res_733_raw, bands_ok, 10.0)
     assert fb is True and any("UNDERFIT_VS_BASELINE" in r for r in fb_r)
 
-    # 5d) 坍缩触发
+    # 2e) 坍缩触发
     fb_c, fb_cr = _should_fallback_raw_to_scaled(
         res_ok, {"transformer": {"train": 3.0, "val": 3.0}}, 10.0)
     assert fb_c is True and any("TRAIN_COLLAPSED" in r for r in fb_cr)
 
-
-def test_pbus_mode_auto_pre_rule_selects_scaled_for_large_bus(tmp_path, base_cfg_file, caplog):
-    """全局默认 pbus_mode='auto'：733 类大变比（pt=16）小占比用户无需手写 pbus_mode，
-    前置规则自动选 scaled，且 infer 默认 auto 自动继承不触发混版告警。"""
-    import logging
-
-    data_root = tmp_path / "data"
-    write_user_dir(data_root, USER_KEY, days=21)
-    write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
-    # 不写 pbus_mode（走全局默认 "auto"），模拟 733 大变比 pt=16 -> pbus_p95≈2650kW>2500, on_contrib≈0.03<0.25
-    tf_cfg = {
-        USER_KEY: {
-            "target_col": "p1+p2",
-            "on_thr_w": 10.0,
-            "pt_ratio": 16.0,
-            "ct_ratio": 1.0,
-            "infer_model": "proportional",
-            "split_ratios": [0.7, 0.15, 0.15],
-            "split_strategy": "time",
-            "post_min_on": 1,
-            "post_fill_short_off": 3,
-        },
-        "_default": {"on_thr_w": 10.0},
+    # ---- 第3步：验证集 MAE + F1 双向验收门禁（严禁看 test 零泄漏）----
+    # 3a) 733 真改善：val MAE 81.2->56.4 (-30.5% >= 5%) 且 val F1 0.9120->0.9480 不退化 -> 验收通过！
+    res_733_scaled = {
+        "transformer": {"train": {"r2": {"macro": 0.9610}, "mae": {"macro": 33.2}, "f1": {"macro": 0.9650}},
+                        "val": {"r2": {"macro": 0.8750}, "mae": {"macro": 56.4}, "f1": {"macro": 0.9480}}},
     }
-    tf_file = tmp_path / "tf_auto_large.json"
-    tf_file.write_text(json.dumps(tf_cfg), encoding="utf-8")
+    ok_733, notes_733 = _accept_scaled_candidate(
+        res_733_raw, bands_ok, res_733_scaled, bands_ok, on_thr=10.0, triggered_reasons=fb_r)
+    assert ok_733 is True and any("VAL_DUAL_GATE_PASS" in n for n in notes_733)
 
-    out_root = tmp_path / "outputs"
-    with caplog.at_level(logging.WARNING):
-        run_batch(tf_file, base_config_path=base_cfg_file,
-                  data_root=data_root, output_root=out_root,
-                  stages=("train", "infer"), user_keys=[USER_KEY])
+    # 3b) 778 漂移陷阱拦截：即便假设触发了候选重训，scaled 虽将 val MAE 降为 33.4，
+    #     但关机虚报激增致 val F1 从 0.9743 跌至 0.9366（drop=0.0377 > 0.015）-> 坚决拒绝切换！
+    res_778_scaled = {
+        "transformer": {"train": {"r2": {"macro": 0.9710}, "mae": {"macro": 32.5}, "f1": {"macro": 0.9728}},
+                        "val": {"r2": {"macro": 0.9660}, "mae": {"macro": 33.4}, "f1": {"macro": 0.9366}}},
+    }
+    ok_778, notes_778 = _accept_scaled_candidate(
+        res_778_raw, bands_ok, res_778_scaled, bands_ok, on_thr=50.0)
+    assert ok_778 is False and any("VAL_F1_DEGRADED" in n for n in notes_778)
 
-    train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
-    meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
-    assert meta["pbus_mode_configured"] == "auto"
-    assert meta["pbus_mode"] == "scaled"
-    assert meta["pbus_mode_decision"]["stage"] == "pre_rule"
-    assert meta["feature_names"].index("pbus") in meta["scale_cols"]
+    # 3c) val MAE 改善不足 5%（如 81.2 -> 79.0 仅 -2.7%）-> 拒绝切换
+    res_tiny_gain = {
+        "transformer": {"train": {"r2": {"macro": 0.85}, "mae": {"macro": 65.0}, "f1": {"macro": 0.92}},
+                        "val": {"r2": {"macro": 0.78}, "mae": {"macro": 79.0}, "f1": {"macro": 0.92}}},
+    }
+    ok_tiny, notes_tiny = _accept_scaled_candidate(
+        res_733_raw, bands_ok, res_tiny_gain, bands_ok, on_thr=10.0, triggered_reasons=fb_r)
+    assert ok_tiny is False and any("MAE_GAIN_INSUFFICIENT" in n for n in notes_tiny)
 
-    infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
-    infer_meta = json.loads((infer_dir / "meta.json").read_text(encoding="utf-8"))
-    assert infer_meta["pbus_mode"] == "scaled"
-    assert infer_meta["pbus_mode_configured"] == "auto"
-    # 默认 auto 下 infer 自动继承 scaled，不应产生不一致告警
-    assert not any("pbus_mode" in r.message and "不一致" in r.message for r in caplog.records)
+    # 3d) 首轮 raw 发生坍缩（band=2.0<10, F1=0）-> scaled 唤醒（band=500, F1=0.93）放行
+    res_raw_col = {
+        "transformer": {"train": {"r2": {"macro": 0.0}, "mae": {"macro": 45.0}, "f1": {"macro": 0.0}},
+                        "val": {"r2": {"macro": 0.0}, "mae": {"macro": 48.0}, "f1": {"macro": 0.0}}},
+    }
+    ok_rec, notes_rec = _accept_scaled_candidate(
+        res_raw_col, {"transformer": {"train": 2.0, "val": 2.0}},
+        res_733_scaled, bands_ok, on_thr=10.0)
+    assert ok_rec is True and any("RECOVERED_FROM_COLLAPSE" in n for n in notes_rec)
 
 
 from nilm.models.base import BaseModel as _BaseModelForStub
 
 
 class _RawSensitiveTransformerStub(_BaseModelForStub):
-    """模块级可 pickle 桩模型：模拟序列模型在未缩放 pbus(std>5) 下病态欠拟合、
-    在 z-score pbus(std<=5) 下正常收敛，用于端到端验证后置红色熔断自动重训。"""
+    """模块级可 pickle 桩模型（模拟 733）：未缩放 pbus(std>5) 下病态欠拟合，
+    z-score pbus(std<=5) 下正常收敛且零点无漂移，用于端到端验证双向验收通过后红色熔断重训。"""
     name = "transformer"
 
     def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
@@ -789,7 +782,7 @@ class _RawSensitiveTransformerStub(_BaseModelForStub):
             self._a = 0.25
             self._b = self._y_mean - self._a * float(p.mean())
         else:
-            # z-score scaled pbus：正常最小二乘收敛 -> R²>0.99
+            # z-score scaled pbus：正常最小二乘收敛 -> R²>0.99，MAE 大幅下降且 F1 不退化
             self._underfit = False
             pc = p - p.mean()
             self._a = float((pc @ (yv - self._y_mean)) / (pc @ pc))
@@ -802,13 +795,140 @@ class _RawSensitiveTransformerStub(_BaseModelForStub):
         return np.repeat(out[:, None], self._k, axis=1)
 
 
+class _DriftProne778TransformerStub(_BaseModelForStub):
+    """模块级可 pickle 桩模型（模拟 778 大母线规律启停 + 背景基荷漂移陷阱）：
+    - raw 模式(p.std()>5)：按 slot 画像保守预测（关机段严格锁 0W -> val F1≈1.0，但波峰幅值欠拟合触发第2步）；
+    - scaled 模式(p.std()<=5)：紧耦合 z(pbus) 使波峰 MAE 下降，但关机段因母线背景偏高全部正漂至 25W(>on_thr 10W)，
+      导致 val F1 大幅退化（跌幅 > 0.015），验证第3步双向门禁自动拒绝切换并保住 raw！
+    """
+    name = "transformer"
+
+    def fit(self, X, y, feature_names=None, X_val=None, y_val=None,
+            index=None, val_index=None):
+        import numpy as np
+        fnames = list(feature_names)
+        self._p_idx = fnames.index("pbus")
+        self._s_idx = fnames.index("slot")
+        p = np.asarray(X[:, self._p_idx], dtype=np.float64)
+        s = np.asarray(X[:, self._s_idx], dtype=np.int64)
+        yv = np.asarray(y[:, 0], dtype=np.float64)
+        self._k = y.shape[1]
+        self._is_raw = float(p.std()) > 5.0
+        # 记录每个 slot 的开机稳态均值；raw 下幅值打 0.62 折（模拟波峰欠拟合触发第2步，但关机槽位严格为 0W！）
+        self._slot_map = {}
+        for sl in np.unique(s):
+            vals = yv[s == sl]
+            m = float(np.median(vals))
+            self._slot_map[int(sl)] = (0.62 * m if m >= 10.0 else 0.0)
+        # scaled 下波峰紧贴真值（val MAE 显著下降），但关机槽位因耦合母线背景正漂至 +25W (>on_thr=10W)
+        self._slot_map_scaled = {
+            int(sl): (float(np.mean(yv[s == sl])) if float(np.median(yv[s == sl])) >= 10.0 else 25.0)
+            for sl in np.unique(s)
+        }
+
+    def predict(self, X, index=None):
+        import numpy as np
+        s = np.asarray(X[:, self._s_idx], dtype=np.int64)
+        mp = self._slot_map if self._is_raw else self._slot_map_scaled
+        out = np.array([mp.get(int(v), 0.0) for v in s], dtype=np.float64)
+        return np.repeat(out[:, None], self._k, axis=1)
+
+
+def test_pbus_mode_auto_rejects_scaled_when_val_f1_degrades_like_778(
+        tmp_path, base_cfg, caplog):
+    """端到端验证 778 类大变比（pt=16）规律启停负荷防误切保护：
+    - 第1步：即便 pt=16 母线高达数千 kW，auto 仍默认先试 raw；
+    - 第2步：raw 因波峰欠拟合触发候选 scaled 重训；
+    - 第3步：候选 scaled 虽降低了 val MAE，但关机段正漂致 val F1 显著下跌（即使 base_cfg.metrics
+      未显式配 f1 亦自动从 pred_frames['val'] 补算拦截），打印 [AUTO-REJECT-SCALED] 拒绝切换，
+      保留 pbus_mode='raw'（不发红色 AUTO-FALLBACK，落盘与推理均为零点干净的 raw 模型）。
+    """
+    import logging
+    import numpy as np
+    import yaml
+    from nilm.models import MODEL_REGISTRY
+
+    data_root = tmp_path / "data"
+    d_tr = write_user_dir(data_root, USER_KEY, days=21)
+    d_inf = write_user_dir(data_root, USER_KEY, days=21, mode_dir="infers")
+    # 将合成数据改造成类似 778 的 50% 占空比规律启停分路（00:00~11:45 严格关机 0W，12:00~23:45 开机 ~120W）
+    for d in (d_tr, d_inf):
+        br_f = next(d.glob(f"{USER_KEY.split('_')[1]}-*.csv"))
+        bdf = pd.read_csv(br_f)
+        hrs = pd.to_datetime(bdf["time"]).dt.hour
+        bdf["p1"] = np.where(hrs >= 12, bdf["p1"] + 60.0, 0.0)
+        bdf.to_csv(br_f, index=False)
+
+    tf_cfg = {
+        USER_KEY: {
+            "target_col": "p1",
+            "on_thr_w": 10.0,
+            "pt_ratio": 16.0,
+            "ct_ratio": 1.0,
+            "infer_model": "transformer",
+            "split_ratios": [0.7, 0.15, 0.15],
+            "split_strategy": "time",
+            "post_min_on": 1,
+            "post_fill_short_off": 3,
+        },
+        "_default": {"on_thr_w": 10.0},
+    }
+    tf_file = tmp_path / "tf_778_like.json"
+    tf_file.write_text(json.dumps(tf_cfg), encoding="utf-8")
+
+    orig_cls = MODEL_REGISTRY._factories.get("transformer")
+    MODEL_REGISTRY._factories["transformer"] = _DriftProne778TransformerStub
+    try:
+        cfg_with_tf = dict(base_cfg)
+        cfg_with_tf["models"] = list(base_cfg["models"]) + [{"name": "transformer"}]
+        base_path = tmp_path / "base_778_like.yaml"
+        base_path.write_text(yaml.safe_dump(cfg_with_tf, allow_unicode=True, sort_keys=False),
+                             encoding="utf-8")
+
+        out_root = tmp_path / "outputs"
+        with caplog.at_level(logging.WARNING):
+            run_batch(tf_file, base_config_path=base_path,
+                      data_root=data_root, output_root=out_root,
+                      stages=("train", "infer"), user_keys=[USER_KEY])
+
+        # 1) 必须记录 [AUTO-REJECT-SCALED] 告警，且不得发出红色 [AUTO-FALLBACK] 切换
+        rej_logs = [r.message for r in caplog.records if "[AUTO-REJECT-SCALED]" in r.message]
+        fb_logs = [r.message for r in caplog.records if "[AUTO-FALLBACK]" in r.message]
+        assert len(rej_logs) == 1, f"应触发验证集 F1 退化拒切告警，实得: {rej_logs}"
+        assert len(fb_logs) == 0, f"拒切时严禁输出红色 AUTO-FALLBACK 切换日志: {fb_logs}"
+        assert "F1_DEGRADED" in rej_logs[0]
+
+        # 2) 最终训练产物稳留 raw（pbus 不进 scale_cols），决策轨迹完整留痕
+        train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
+        meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+        assert meta["pbus_mode_configured"] == "auto"
+        assert meta["pbus_mode"] == "raw"
+        assert meta["pbus_mode_decision"]["stage"] == "post_fallback_rejected"
+        assert meta["pbus_mode_decision"]["val_acceptance"]["accepted"] is False
+        assert meta["feature_names"].index("pbus") not in meta["scale_cols"]
+
+        # 3) 推理产物无缝沿用抗漂移的 raw，关机段预测严格锁 0W 零误报
+        infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
+        infer_meta = json.loads((infer_dir / "meta.json").read_text(encoding="utf-8"))
+        assert infer_meta["pbus_mode"] == "raw"
+        assert not any("pbus_mode" in r.message and "不一致" in r.message for r in caplog.records)
+        inf_df = pd.read_csv(infer_dir / "predictions" / "inference_result.csv")
+        off_rows = inf_df[inf_df["target_state"] == 0]
+        assert len(off_rows) > 0 and (off_rows["pred_state"] == 0).all()
+    finally:
+        if orig_cls is not None:
+            MODEL_REGISTRY._factories["transformer"] = orig_cls
+        else:
+            MODEL_REGISTRY._factories.pop("transformer", None)
+
+
 def test_pbus_mode_auto_post_fallback_retrains_scaled_with_red_warning(
         tmp_path, base_cfg, time_filter_file, caplog):
-    """端到端验证第3步后置熔断：
-    - 前置初判因中小母线选 raw；
-    - transformer 在 raw 下欠拟合输给 history_profile/ridge；
-    - 自动输出 ANSI 亮红色告警日志并重训切换为 pbus_mode='scaled'；
-    - 文件日志剥离 ANSI 转义符保持干净，落盘模型与推理均为重训后的 scaled 版本。
+    """端到端验证第2+3步闭环通过（733 类真欠拟合）：
+    - 第1步默认先跑 raw；
+    - 第2步 transformer 在 raw 下欠拟合输给 history_profile/ridge；
+    - 第3步候选 scaled 在验证集同时满足 MAE 实质改善且 F1 不退化，输出 ANSI 亮红色告警切换为 scaled；
+    - 文件日志剥离 ANSI 转义符保持干净，落盘模型与推理均为重训后的 scaled 版本且无混版告警。
     """
     import logging
     import yaml
@@ -848,12 +968,13 @@ def test_pbus_mode_auto_post_fallback_retrains_scaled_with_red_warning(
         assert "[AUTO-FALLBACK]" in file_text
         assert "\033[91m" not in file_text
 
-        # 3) 训练产物已切换为重训后的 scaled 版本，transformer 恢复正常高准度
+        # 3) 训练产物已切换为重训后的 scaled 版本，双向验收记录为 True
         train_dir = sorted((out_root / USER_KEY / "train").iterdir())[-1]
         meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
         assert meta["pbus_mode_configured"] == "auto"
         assert meta["pbus_mode"] == "scaled"
         assert meta["pbus_mode_decision"]["stage"] == "post_fallback"
+        assert meta["pbus_mode_decision"]["val_acceptance"]["accepted"] is True
         assert any("transformer_UNDERFIT" in r for r in meta["pbus_mode_decision"]["fallback_reasons"])
         assert meta["feature_names"].index("pbus") in meta["scale_cols"]
 
@@ -861,10 +982,12 @@ def test_pbus_mode_auto_post_fallback_retrains_scaled_with_red_warning(
         mae_tf = (pred_df["pred_transformer"] - pred_df["target"]).abs().mean()
         assert mae_tf < 5.0, f"重训切换 scaled 后 transformer 应收敛，实测 MAE={mae_tf}"
 
-        # 4) 推理产物无缝沿用 scaled
+        # 4) 推理产物无缝沿用 scaled 且无不一致告警
         infer_dir = sorted((out_root / USER_KEY / "infer").iterdir())[-1]
         infer_meta = json.loads((infer_dir / "meta.json").read_text(encoding="utf-8"))
         assert infer_meta["pbus_mode"] == "scaled"
+        assert infer_meta["pbus_mode_configured"] == "auto"
+        assert not any("pbus_mode" in r.message and "不一致" in r.message for r in caplog.records)
     finally:
         if orig_cls is not None:
             MODEL_REGISTRY._factories["transformer"] = orig_cls
