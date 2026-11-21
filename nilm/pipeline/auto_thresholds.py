@@ -25,7 +25,14 @@ import pandas as pd
 from nilm.common.contracts import INFER_RESULT_COLUMNS, INFERENCE_RESULT_REL
 from nilm.common.logging import get_logger, red_text, yellow_text
 from nilm.evaluation import build_comparison_table, evaluate_daily_chain, summarize
-from nilm.postprocess.state import postprocess_state, state_probability
+from nilm.postprocess.state import (
+    _run_lengths,
+    enforce_min_on,
+    fill_short_off,
+    postprocess_state,
+    power_to_state,
+    state_probability,
+)
 
 log = get_logger("pipeline.auto_thresholds")
 
@@ -39,6 +46,13 @@ STANDARD_DECISION_GRID: tuple[float, ...] = (
     60.0, 80.0, 100.0, 120.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 450.0, 500.0,
     600.0, 750.0, 1000.0,
 )
+
+MIN_ON_GRID: tuple[int, ...] = (1, 2, 3, 4, 6, 8)
+FILL_OFF_GRID: tuple[int, ...] = (0, 1, 2, 3, 4, 6)
+MAX_GT_ON_LOSS_RATIO = 0.005
+MAX_GT_BRIDGE_RATIO = 0.010
+MAX_GT_GAP_BRIDGED_RATE = 0.10
+INTRADAY_MAX_OFF_POINTS = 24
 
 MIN_VAL_RECALL = 0.95
 UPPER_ON_P10_RATIO = 0.80
@@ -599,6 +613,705 @@ def resolve_infer_thresholds(
     }
 
 
+def _split_contiguous_15m_blocks(
+    s_gt: np.ndarray,
+    index_pool: pd.DatetimeIndex | None = None,
+) -> list[np.ndarray]:
+    """按相邻点时间差 == 15min 切分为严格连续的时间片段，杜绝跳日抽样或停电缺测伪拼接游程。"""
+    arr = np.asarray(s_gt, dtype=bool).reshape(-1)
+    if len(arr) == 0:
+        return []
+    if index_pool is None or len(index_pool) != len(arr):
+        return [arr]
+
+    ts = pd.DatetimeIndex(pd.to_datetime(index_pool))
+    if not ts.is_monotonic_increasing:
+        order = np.argsort(ts.asi8, kind="mergesort")
+        ts = ts[order]
+        arr = arr[order]
+
+    if len(arr) == 1:
+        return [arr]
+
+    diffs = ts[1:] - ts[:-1]
+    breaks = np.flatnonzero(diffs != pd.Timedelta(minutes=15)) + 1
+    if len(breaks) == 0:
+        return [arr]
+    return [blk for blk in np.split(arr, breaks) if len(blk) > 0]
+
+
+def resolve_postprocess_physical_bounds(
+    y_pool: np.ndarray | pd.Series,
+    index_pool: pd.DatetimeIndex | None = None,
+    on_thr_w: float = 10.0,
+) -> dict:
+    """阶段一：基于训练全池有效真值序列提取无截断游程画像，锁定物理安全硬上界 (M_max, K_max)。
+
+    核心物理约束（零模型依赖、零泄漏）：
+    1. post_min_on 上界 M_max：
+       - 分位数安全裕度：完整开态段数 >=5 时取 clip(floor(0.75 * P10(L_on)), 1, 8)，
+         3~4 段时取 clip(floor(0.60 * min(L_on)), 1, 4)，<3 段时锁定 1；
+       - 真值自回放硬校验：在连续真值块上执行 enforce_min_on(s_gt, m) 的真开态折损率 <= 0.5%。
+    2. post_fill_short_off 上界 K_max：
+       - 真值防桥接校验：在连续真值块上执行 fill_short_off(s_gt, k) 被错误桥接的真关态膨胀率 <= 1.0%，
+         且当日内短停机间隙数 >=5 时，真实停机次数被桥接占比 <= 10%（保护间歇循环负荷与固定午休停机）。
+    """
+    y_arr = np.asarray(y_pool, dtype=np.float64).reshape(-1)
+    valid_m = np.isfinite(y_arr)
+    if index_pool is not None and len(index_pool) == len(y_arr):
+        idx_valid: pd.DatetimeIndex | None = pd.DatetimeIndex(index_pool)[valid_m]
+    else:
+        idx_valid = None
+    y_valid = y_arr[valid_m]
+    s_gt = y_valid >= float(on_thr_w)
+    blocks = _split_contiguous_15m_blocks(s_gt, idx_valid)
+
+    total_gt_on = int(sum(int(b.sum()) for b in blocks))
+    if total_gt_on == 0 or not blocks:
+        return {
+            "m_max": 1,
+            "k_max": 3,
+            "m_anchor": 1,
+            "k_anchor": 3,
+            "m_quant_bound": 1,
+            "confidence": "low",
+            "n_points": int(len(s_gt)),
+            "n_contiguous_blocks": len(blocks),
+            "total_gt_on_points": 0,
+            "n_complete_on_runs": 0,
+            "on_run_p10": None,
+            "on_run_median": None,
+            "n_inner_off_runs": 0,
+            "inner_off_min": None,
+            "inner_off_p10": None,
+            "gt_on_loss_by_m": {str(m): 0.0 for m in MIN_ON_GRID},
+            "gt_bridge_ratio_by_k": {str(k): 0.0 for k in FILL_OFF_GRID},
+            "gt_gap_bridged_rate_by_k": {str(k): 0.0 for k in FILL_OFF_GRID},
+            "gt_on_loss_at_m_max": 0.0,
+            "gt_bridge_ratio_at_k_max": 0.0,
+            "reasons": ["NO_POSITIVE_GT_FALLBACK_DEFAULT_BOUNDS"],
+        }
+
+    complete_on_runs: list[int] = []
+    all_on_runs: list[int] = []
+    inner_off_runs: list[int] = []
+    max_grid_m = max(MIN_ON_GRID)
+
+    for b in blocks:
+        runs = _run_lengths(b)
+        lb = len(b)
+        for r_idx, (s, e, val) in enumerate(runs):
+            r_len = int(e - s)
+            if val:
+                all_on_runs.append(r_len)
+                # 严格内部完整游程，或虽触碰断点边界但已知长度 >= max_grid_m（不会拉低短游程分位数）
+                if (s > 0 and e < lb) or r_len >= max_grid_m:
+                    complete_on_runs.append(r_len)
+            else:
+                if 0 < r_idx < len(runs) - 1 and runs[r_idx - 1][2] and runs[r_idx + 1][2]:
+                    if 1 <= r_len <= INTRADAY_MAX_OFF_POINTS:
+                        inner_off_runs.append(r_len)
+
+    eff_on_runs = complete_on_runs if len(complete_on_runs) > 0 else all_on_runs
+    n_on_runs = len(eff_on_runs)
+    l_on_p10: float | None = None
+    if n_on_runs >= 5:
+        l_on_p10 = float(np.quantile(eff_on_runs, 0.10))
+        m_quant = int(np.clip(np.floor(0.75 * l_on_p10), 1, max_grid_m))
+    elif n_on_runs >= 3:
+        l_on_p10 = float(np.min(eff_on_runs))
+        m_quant = int(np.clip(np.floor(0.60 * l_on_p10), 1, 4))
+    else:
+        l_on_p10 = float(np.min(eff_on_runs)) if n_on_runs > 0 else None
+        m_quant = 1
+
+    gt_on_loss_by_m: dict[int, float] = {}
+    for m in MIN_ON_GRID:
+        lost = sum(int((b & ~enforce_min_on(b, m)).sum()) for b in blocks)
+        gt_on_loss_by_m[m] = float(lost) / float(max(1, total_gt_on))
+
+    feas_m = [
+        m for m in MIN_ON_GRID
+        if m <= m_quant and gt_on_loss_by_m[m] <= MAX_GT_ON_LOSS_RATIO
+    ]
+    m_max = int(max(feas_m)) if feas_m else 1
+
+    gt_bridge_by_k: dict[int, float] = {}
+    gt_gap_rate_by_k: dict[int, float] = {}
+    for k in FILL_OFF_GRID:
+        bridged = sum(int((fill_short_off(b, k) & ~b).sum()) for b in blocks)
+        gt_bridge_by_k[k] = float(bridged) / float(max(1, total_gt_on))
+        if len(inner_off_runs) > 0:
+            gt_gap_rate_by_k[k] = float(sum(1 for g in inner_off_runs if g <= k)) / float(len(inner_off_runs))
+        else:
+            gt_gap_rate_by_k[k] = 0.0
+
+    feas_k = [0]
+    for k in FILL_OFF_GRID:
+        if k == 0:
+            continue
+        if gt_bridge_by_k[k] <= MAX_GT_BRIDGE_RATIO and (
+            len(inner_off_runs) < 5 or gt_gap_rate_by_k[k] <= MAX_GT_GAP_BRIDGED_RATE
+        ):
+            feas_k.append(k)
+    k_max = int(max(feas_k))
+    if n_on_runs < 3:
+        k_max = int(min(k_max, 3))
+    k_anchor = int(min(3, k_max))
+
+    bound_reasons: list[str] = [f"GT_BOUNDS_LOCKED(M_max={m_max},K_max={k_max})"]
+    if k_max < 3:
+        bound_reasons.append(f"PROTECT_SHORT_TRUE_OFF_CYCLES(K_max={k_max}<3)")
+    if m_max == 1 and n_on_runs >= 3:
+        bound_reasons.append("PROTECT_SHORT_TRUE_ON_BURSTS(M_max=1)")
+    if n_on_runs < 3:
+        bound_reasons.append(f"SPARSE_POSITIVE_ON_RUNS(n={n_on_runs}<3)")
+
+    return {
+        "m_max": m_max,
+        "k_max": k_max,
+        "m_anchor": 1,
+        "k_anchor": k_anchor,
+        "m_quant_bound": m_quant,
+        "confidence": "high" if n_on_runs >= 3 else "low",
+        "n_points": int(len(s_gt)),
+        "n_contiguous_blocks": len(blocks),
+        "total_gt_on_points": total_gt_on,
+        "n_complete_on_runs": n_on_runs,
+        "on_run_p10": round(l_on_p10, 2) if l_on_p10 is not None else None,
+        "on_run_median": round(float(np.median(eff_on_runs)), 2) if eff_on_runs else None,
+        "n_inner_off_runs": len(inner_off_runs),
+        "inner_off_min": int(min(inner_off_runs)) if inner_off_runs else None,
+        "inner_off_p10": round(float(np.quantile(inner_off_runs, 0.10)), 2) if inner_off_runs else None,
+        "gt_on_loss_by_m": {str(m): round(v, 5) for m, v in gt_on_loss_by_m.items()},
+        "gt_bridge_ratio_by_k": {str(k): round(v, 5) for k, v in gt_bridge_by_k.items()},
+        "gt_gap_bridged_rate_by_k": {str(k): round(v, 5) for k, v in gt_gap_rate_by_k.items()},
+        "gt_on_loss_at_m_max": round(gt_on_loss_by_m[m_max], 5),
+        "gt_bridge_ratio_at_k_max": round(gt_bridge_by_k[k_max], 5),
+        "reasons": bound_reasons,
+    }
+
+
+def _eval_3d_grid_fast(
+    y_true: np.ndarray,
+    pred: np.ndarray,
+    idx: pd.DatetimeIndex | None,
+    on_thr_w: float,
+    c_cands: list[float],
+    m_cands: list[int],
+    k_eval_cands: list[int],
+) -> tuple[dict[tuple[float, int, int], dict], int, bool]:
+    """高效批量评估三维候选网格 (decision_thr_w, post_min_on, post_fill_short_off)。"""
+    t_on = y_true >= float(on_thr_w)
+    has_off_days = False
+    off_day_mask: np.ndarray | None = None
+    n_off_pts = int((~t_on).sum())
+    unpad_pos: np.ndarray | None = None
+    padded_size = len(t_on)
+
+    if idx is not None and len(idx) == len(t_on) and len(idx) > 0:
+        d_idx = pd.DatetimeIndex(idx)
+        if not d_idx.is_monotonic_increasing:
+            order = np.argsort(d_idx.asi8, kind="mergesort")
+            d_idx = d_idx[order]
+            t_on = t_on[order]
+            pred = np.asarray(pred, dtype=np.float64)[order]
+        day_on = pd.Series(t_on, index=d_idx).groupby(d_idx.normalize()).transform("max").to_numpy()
+        off_day_mask = ~day_on
+        n_off_pts = int(off_day_mask.sum())
+        has_off_days = n_off_pts > 0
+        blocks = _split_contiguous_15m_blocks(t_on, d_idx)
+        if len(blocks) > 1:
+            pad_gap = max(max(k_eval_cands, default=0) + 2, 2)
+            pos_parts: list[np.ndarray] = []
+            offset = 0
+            for bi, blk in enumerate(blocks):
+                if bi > 0:
+                    offset += pad_gap
+                blen = len(blk)
+                pos_parts.append(np.arange(offset, offset + blen, dtype=np.int64))
+                offset += blen
+            unpad_pos = np.concatenate(pos_parts)
+            padded_size = offset
+
+    table: dict[tuple[float, int, int], dict] = {}
+    tot_pos = int(t_on.sum())
+    tot_neg = int((~t_on).sum())
+
+    for c in c_cands:
+        s0_raw = power_to_state(pred, c)
+        if unpad_pos is not None:
+            s0_in = np.zeros(padded_size, dtype=bool)
+            s0_in[unpad_pos] = s0_raw
+        else:
+            s0_in = s0_raw
+        for m in m_cands:
+            s1 = enforce_min_on(s0_in, m)
+            for k in k_eval_cands:
+                st_full = fill_short_off(s1, k)
+                st = st_full[unpad_pos] if unpad_pos is not None else st_full
+                tp = int((st & t_on).sum())
+                fp = int((st & ~t_on).sum())
+                fn = tot_pos - tp
+                tn = tot_neg - fp
+                prec = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if fn == 0 else 0.0)
+                rec = tp / tot_pos if tot_pos > 0 else 1.0
+                f1 = (2.0 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+                off_fp = int(st[off_day_mask].sum()) if off_day_mask is not None else fp
+                table[(c, m, k)] = {
+                    "thr": round(float(c), 4),
+                    "post_min_on": int(m),
+                    "post_fill_short_off": int(k),
+                    "f1": round(float(f1), 4),
+                    "precision": round(float(prec), 4),
+                    "recall": round(float(rec), 4),
+                    "tp": tp,
+                    "fp": fp,
+                    "fn": fn,
+                    "tn": tn,
+                    "off_day_fp": off_fp,
+                }
+    return table, max(1, n_off_pts), has_off_days
+
+
+def resolve_auto_postprocess_and_decision_thr(
+    y_train: np.ndarray,
+    y_val: np.ndarray,
+    pred_val: np.ndarray,
+    val_index: pd.DatetimeIndex | None,
+    on_thr_w: float,
+    cfg_decision_thr_w: float | str = "auto",
+    cfg_post_min_on: int | str = "auto",
+    cfg_post_fill_off: int | str = "auto",
+    bounds: dict | None = None,
+    pred_train: np.ndarray | None = None,
+    train_index: pd.DatetimeIndex | None = None,
+    calibrated_model: str = "",
+    pbus_mode: str = "raw",
+    upper_guard_override: float | None = None,
+) -> tuple[float, int, int, dict, dict]:
+    """阶段二：在阶段一锁定的物理安全框 (M_max, K_max) 内，按模型在验证集上协同寻优
+    (decision_thr_w, post_min_on, post_fill_short_off)。
+
+    三道验证集硬护栏 + 奥卡姆剃刀正则 + 惰性保持门：
+    1. 召回护栏：val_recall >= 0.95 且增大 m 相比 m_anchor 的同幅值召回折损 <= 0.03；
+    2. 全关日防桥接护栏：存在全关日且 k=auto 时，off_day_fp(c, m, k) <= off_day_fp(c, m, 0)；
+    3. 非退化护栏：val_F1 >= anchor_best_F1 - 0.005；
+    4. 正则化评分优先以「低幅值阈值 + 适度时间滤波」消除尖峰虚报，若无实质改善则锁定先验锚点 (m_anchor, k_anchor)。
+    """
+    base_thr = float(on_thr_w)
+    m_is_auto = isinstance(cfg_post_min_on, str) and cfg_post_min_on.strip().lower() == "auto"
+    k_is_auto = isinstance(cfg_post_fill_off, str) and cfg_post_fill_off.strip().lower() == "auto"
+    c_is_auto = isinstance(cfg_decision_thr_w, str) and cfg_decision_thr_w.strip().lower() == "auto"
+    c_is_on_thr = isinstance(cfg_decision_thr_w, str) and cfg_decision_thr_w.strip().lower() == "on_thr"
+
+    if bounds is None:
+        bounds = resolve_postprocess_physical_bounds(y_train, train_index, on_thr_w=base_thr)
+
+    m_max = int(bounds.get("m_max", 1))
+    k_max = int(bounds.get("k_max", 3))
+    m_anchor = 1 if m_is_auto else int(cfg_post_min_on)
+    k_anchor = int(min(3, k_max)) if k_is_auto else int(cfg_post_fill_off)
+
+    m_cands = sorted({m for m in MIN_ON_GRID if m <= m_max} | {m_anchor}) if m_is_auto else [m_anchor]
+    k_cands = sorted({k for k in FILL_OFF_GRID if k <= k_max} | {k_anchor}) if k_is_auto else [k_anchor]
+
+    y_tr = np.asarray(y_train, dtype=np.float64).reshape(-1)
+    y_va = np.asarray(y_val, dtype=np.float64).reshape(-1)
+    p_va = np.asarray(pred_val, dtype=np.float64).reshape(-1)
+
+    eval_split = "val"
+    eval_y, eval_p, eval_idx = y_va, p_va, val_index
+    fallback_reasons: list[str] = []
+
+    if len(eval_y) == 0 or (eval_y >= base_thr).sum() == 0:
+        if pred_train is not None and len(y_tr) > 0 and (y_tr >= base_thr).sum() > 0:
+            eval_split = "train_fallback"
+            eval_y = y_tr
+            eval_p = np.asarray(pred_train, dtype=np.float64).reshape(-1)
+            eval_idx = train_index
+            fallback_reasons.append("VAL_NO_POSITIVE_FALLBACK_TRAIN")
+        else:
+            fb_c = base_thr if (c_is_auto or c_is_on_thr) else float(cfg_decision_thr_w)
+            dec_fb = {
+                "configured": cfg_decision_thr_w,
+                "resolved_decision_thr_w": fb_c,
+                "stage": "auto_fallback_on_thr" if c_is_auto else "explicit",
+                "confidence": "low" if c_is_auto else "explicit",
+                "calibrated_model": calibrated_model,
+                "eval_split": eval_split,
+                "reasons": ["NO_POSITIVE_TARGET_FALLBACK_ON_THR"],
+            }
+            post_fb = {
+                "configured_post_min_on": cfg_post_min_on,
+                "configured_post_fill_short_off": cfg_post_fill_off,
+                "resolved_post_min_on": m_anchor,
+                "resolved_post_fill_short_off": k_anchor,
+                "stage": "auto_fallback_anchor",
+                "confidence": "low",
+                "calibrated_model": calibrated_model,
+                "eval_split": eval_split,
+                "m_max": m_max,
+                "k_max": k_max,
+                "m_anchor": m_anchor,
+                "k_anchor": k_anchor,
+                "gt_on_loss_at_selected_m": float(bounds.get("gt_on_loss_by_m", {}).get(str(m_anchor), 0.0)),
+                "gt_bridge_ratio_at_selected_k": float(bounds.get("gt_bridge_ratio_by_k", {}).get(str(k_anchor), 0.0)),
+                "reasons": ["NO_POSITIVE_TARGET_FALLBACK_ANCHOR"] + list(bounds.get("reasons", [])),
+            }
+            return fb_c, m_anchor, k_anchor, dec_fb, post_fb
+
+    # 先按锚点 (m_anchor, k_anchor) 计算纯幅值基准（确保不启用游程增益时与 resolve_auto_decision_thr_w 完全同构）
+    if c_is_auto:
+        c_best_anchor, anchor_dec_info = resolve_auto_decision_thr_w(
+            y_train=y_tr,
+            y_val=eval_y,
+            pred_val=eval_p,
+            val_index=eval_idx,
+            on_thr_w=base_thr,
+            post_min_on=m_anchor,
+            post_fill_off=k_anchor,
+            pred_train=pred_train,
+            train_index=train_index,
+            calibrated_model=calibrated_model,
+            pbus_mode=pbus_mode,
+            upper_guard_override=upper_guard_override,
+        )
+        upper_guard_w = float(anchor_dec_info.get("upper_guard_w", base_thr))
+        y_on_p10 = float(anchor_dec_info.get("y_on_p10", base_thr))
+        c_cands = sorted({round(float(r["thr"]), 4) for r in anchor_dec_info.get("candidates", [])} | {round(base_thr, 4), round(c_best_anchor, 4)})
+    elif c_is_on_thr:
+        c_best_anchor = round(base_thr, 4)
+        c_cands = [c_best_anchor]
+        y_on_ref = y_tr[y_tr >= base_thr]
+        if len(y_on_ref) == 0:
+            y_on_ref = eval_y[eval_y >= base_thr]
+        y_on_p10 = float(np.quantile(y_on_ref, 0.10))
+        upper_guard_w = max(base_thr, UPPER_ON_P10_RATIO * y_on_p10)
+    else:
+        c_best_anchor = round(float(cfg_decision_thr_w), 4)
+        c_cands = [c_best_anchor]
+        y_on_ref = y_tr[y_tr >= base_thr]
+        if len(y_on_ref) == 0:
+            y_on_ref = eval_y[eval_y >= base_thr]
+        y_on_p10 = float(np.quantile(y_on_ref, 0.10))
+        upper_guard_w = max(base_thr, c_best_anchor, UPPER_ON_P10_RATIO * y_on_p10)
+
+    k_eval_cands = sorted(set(k_cands) | ({0} if k_is_auto else set()))
+    table, n_off_pts, has_off_days = _eval_3d_grid_fast(
+        eval_y, eval_p, eval_idx, base_thr, c_cands, m_cands, k_eval_cands
+    )
+
+    c_ref_on = min(c_cands, key=lambda c: abs(c - base_thr))
+    on_anchor_row = table[(c_ref_on, m_anchor, k_anchor)]
+    anchor_best_row = table[(round(c_best_anchor, 4), m_anchor, k_anchor)]
+
+    # 三道验证集硬护栏过滤
+    feasible_keys: list[tuple[float, int, int]] = []
+    for c in c_cands:
+        for m in m_cands:
+            for k in k_cands:
+                row = table[(c, m, k)]
+                if row["recall"] < MIN_VAL_RECALL:
+                    continue
+                # 护栏 ①b：增大 m 相比同幅值锚点 m_anchor 的召回折损 <= 0.03（严防剃掉真实短开机）
+                if m > m_anchor and row["recall"] < table[(c, m_anchor, k)]["recall"] - 0.03 - 1e-9:
+                    continue
+                # 护栏 ②：全关日防桥接（k>0 不得比 k=0 在全关日凭空桥接放大虚报）
+                if k_is_auto and has_off_days and k > 0:
+                    if row["off_day_fp"] > table[(c, m, 0)]["off_day_fp"]:
+                        continue
+                # 护栏 ③：非退化门
+                if row["f1"] < anchor_best_row["f1"] - 0.005 - 1e-9:
+                    continue
+                feasible_keys.append((c, m, k))
+
+    reasons = list(fallback_reasons) + list(bounds.get("reasons", []))
+    confidence = "high" if not fallback_reasons else "low"
+    amp_span = max(upper_guard_w - base_thr, base_thr, 1.0)
+
+    def _occam_score(key: tuple[float, int, int]) -> tuple[float, int, int, float]:
+        c_v, m_v, k_v = key
+        r = table[key]
+        amp_ratio = max(0.0, c_v - base_thr) / amp_span if c_is_auto else 0.0
+        off_pen = (0.50 * r["off_day_fp"] / n_off_pts) if has_off_days else (0.15 * r["fp"] / max(1, len(eval_y)))
+        reg_score = (
+            r["f1"]
+            - off_pen
+            - 0.0006 * abs(m_v - m_anchor)
+            - 0.0006 * abs(k_v - k_anchor)
+            - 0.0080 * amp_ratio
+        )
+        return (round(reg_score, 6), -r["off_day_fp"], -r["fp"], -abs(c_v - base_thr))
+
+    if not feasible_keys:
+        confidence = "low"
+        reasons.append(f"RECALL_BELOW_{MIN_VAL_RECALL:.2f}_GUARD")
+        all_keys = [(c, m_anchor, k_anchor) for c in c_cands]
+        best_any_k = max(all_keys, key=lambda key: (table[key]["f1"], table[key]["recall"], -abs(key[0] - base_thr)))
+        sel_c, sel_m, sel_k = (
+            best_any_k
+            if table[best_any_k]["f1"] > on_anchor_row["f1"] + 1e-6
+            else (c_ref_on, m_anchor, k_anchor)
+        )
+    else:
+        cand_best_key = max(feasible_keys, key=_occam_score)
+        cand_row = table[cand_best_key]
+        cand_c, cand_m, cand_k = cand_best_key
+
+        # 惰性保持门（Keep-Anchor Gate）：仅当游程调整带来实质收益时偏离 (m_anchor, k_anchor)
+        off_fp_saved = anchor_best_row["off_day_fp"] - cand_row["off_day_fp"]
+        off_fp_cleared = anchor_best_row["off_day_fp"] > 0 and cand_row["off_day_fp"] == 0
+        f1_gain_vs_anchor = cand_row["f1"] - anchor_best_row["f1"]
+        thr_lowered_substantially = (
+            c_is_auto
+            and cand_c <= 0.80 * c_best_anchor
+            and (c_best_anchor - cand_c) >= max(10.0, 0.20 * base_thr)
+            and cand_row["f1"] >= anchor_best_row["f1"] - 0.002
+            and cand_row["off_day_fp"] <= anchor_best_row["off_day_fp"]
+        )
+
+        if (cand_m, cand_k) != (m_anchor, k_anchor) and (
+            off_fp_saved >= 2 or off_fp_cleared or f1_gain_vs_anchor >= 0.003 or thr_lowered_substantially
+        ):
+            sel_c, sel_m, sel_k = cand_c, cand_m, cand_k
+            if thr_lowered_substantially and f1_gain_vs_anchor < 0.003:
+                reasons.append(
+                    f"POSTPROC_REPLACED_HIGH_THR(thr:{c_best_anchor:.4g}->{sel_c:.4g},m={sel_m},k={sel_k})"
+                )
+            else:
+                reasons.append(f"VAL_POSTPROC_SYNERGY_OPTIMIZED(m={sel_m},k={sel_k})")
+        else:
+            sel_c, sel_m, sel_k = round(c_best_anchor, 4), m_anchor, k_anchor
+            reasons.append(f"KEEP_POSTPROC_ANCHOR(m={sel_m},k={sel_k})")
+
+        # 若为 scaled 模式且幅值阈值 auto，在选定的 (sel_m, sel_k) 上保留平台期抗漂移裕度
+        if c_is_auto and pbus_mode == "scaled":
+            off_preds = eval_p[(eval_y < base_thr) & np.isfinite(eval_p) & (eval_p > 0)]
+            if len(off_preds) > 0:
+                sel_row_cur = table[(sel_c, sel_m, sel_k)]
+                fixed_mk_feas = [
+                    table[(c, sel_m, sel_k)]
+                    for c in c_cands
+                    if table[(c, sel_m, sel_k)]["recall"] >= MIN_VAL_RECALL
+                ]
+                best_f1_mk = max((r["f1"] for r in fixed_mk_feas), default=sel_row_cur["f1"])
+                off_p99 = float(np.quantile(off_preds, 0.99))
+                raw_anchor = max(1.35 * off_p99, sel_c * 1.25)
+                drift_anchor_w = round(min(raw_anchor, 0.70 * y_on_p10, upper_guard_w), 3)
+                if drift_anchor_w > sel_c + 1e-6:
+                    margin_pool = [
+                        r for r in fixed_mk_feas
+                        if r["thr"] >= sel_c - 1e-9
+                        and r["recall"] >= SCALED_PLATEAU_MIN_RECALL
+                        and r["f1"] >= best_f1_mk - SCALED_PLATEAU_F1_TOL
+                        and r["off_day_fp"] <= sel_row_cur["off_day_fp"]
+                        and r["fp"] <= sel_row_cur["fp"]
+                    ]
+                    if margin_pool:
+                        anchored = min(
+                            margin_pool,
+                            key=lambda r: (r["off_day_fp"], r["fp"], abs(r["thr"] - drift_anchor_w), -r["f1"]),
+                        )
+                        if anchored["thr"] > sel_c + 1e-6:
+                            sel_c = round(float(anchored["thr"]), 4)
+                            reasons.append(f"SCALED_ANTI_DRIFT_MARGIN(anchor={drift_anchor_w:.1f})")
+
+    selected_row = table[(sel_c, sel_m, sel_k)]
+    if selected_row["f1"] < 0.50:
+        confidence = "low"
+        reasons.append(f"LOW_VAL_CHAIN_F1({selected_row['f1']:.4f}<0.50)")
+
+    # 构造与现有 decision_thr_w_decision 100% 同构的幅值决策字典（按最终 sel_m, sel_k 切片候选表）
+    dec_candidates_at_sel_mk = [
+        {k: v for k, v in table[(c, sel_m, sel_k)].items() if k not in ("post_min_on", "post_fill_short_off")}
+        for c in c_cands
+    ]
+    base_row_at_sel_mk = table[(c_ref_on, sel_m, sel_k)]
+    dec_reasons = list(reasons)
+    if c_is_auto and abs(sel_c - c_ref_on) < 1e-6 and "KEEP_ON_THR_NEAR_OPTIMAL" not in dec_reasons:
+        dec_reasons.append("KEEP_ON_THR_NEAR_OPTIMAL")
+
+    dec_info = {
+        "configured": cfg_decision_thr_w,
+        "resolved_decision_thr_w": float(sel_c),
+        "stage": "auto_val_joint_postproc_calibrated" if c_is_auto else ("explicit_on_thr" if c_is_on_thr else "explicit"),
+        "confidence": confidence if c_is_auto else "explicit",
+        "calibrated_model": calibrated_model,
+        "pbus_mode": pbus_mode,
+        "eval_split": eval_split,
+        "on_thr_w": base_thr,
+        "y_on_p10": round(y_on_p10, 3),
+        "upper_guard_w": round(upper_guard_w, 3),
+        "min_recall_guard": MIN_VAL_RECALL,
+        "post_min_on": int(sel_m),
+        "post_fill_short_off": int(sel_k),
+        "val_f1_at_on_thr": base_row_at_sel_mk["f1"],
+        "val_off_fp_at_on_thr": base_row_at_sel_mk["off_day_fp"],
+        "val_f1_selected": selected_row["f1"],
+        "val_recall_selected": selected_row["recall"],
+        "val_precision_selected": selected_row["precision"],
+        "val_off_fp_selected": selected_row["off_day_fp"],
+        "candidates": dec_candidates_at_sel_mk,
+        "reasons": dec_reasons,
+    }
+
+    gt_loss_sel = float(bounds.get("gt_on_loss_by_m", {}).get(str(sel_m), 0.0))
+    gt_bridge_sel = float(bounds.get("gt_bridge_ratio_by_k", {}).get(str(sel_k), 0.0))
+    postproc_info = {
+        "configured_post_min_on": cfg_post_min_on,
+        "configured_post_fill_short_off": cfg_post_fill_off,
+        "resolved_post_min_on": int(sel_m),
+        "resolved_post_fill_short_off": int(sel_k),
+        "resolved_decision_thr_w": float(sel_c),
+        "stage": "auto_two_stage_calibrated",
+        "confidence": confidence,
+        "calibrated_model": calibrated_model,
+        "eval_split": eval_split,
+        "m_max": m_max,
+        "k_max": k_max,
+        "m_anchor": m_anchor,
+        "k_anchor": k_anchor,
+        "m_candidates": m_cands,
+        "k_candidates": k_cands,
+        "gt_on_loss_at_selected_m": round(gt_loss_sel, 5),
+        "gt_bridge_ratio_at_selected_k": round(gt_bridge_sel, 5),
+        "val_f1_before": anchor_best_row["f1"],
+        "val_f1_after": selected_row["f1"],
+        "val_recall_after": selected_row["recall"],
+        "val_off_fp_before": anchor_best_row["off_day_fp"],
+        "val_off_fp_after": selected_row["off_day_fp"],
+        "anchor_decision_thr_w": float(c_best_anchor),
+        "reasons": reasons,
+    }
+    return float(sel_c), int(sel_m), int(sel_k), dec_info, postproc_info
+
+
+def log_auto_postprocess_train(user_key: str, postproc_decision: dict) -> None:
+    """当训练阶段 post_min_on 或 post_fill_short_off 配置为 'auto' 时输出黄/红高亮日志。"""
+    c_m = postproc_decision.get("configured_post_min_on")
+    c_k = postproc_decision.get("configured_post_fill_short_off")
+    if not (
+        (isinstance(c_m, str) and c_m.strip().lower() == "auto")
+        or (isinstance(c_k, str) and c_k.strip().lower() == "auto")
+    ):
+        return
+    res_m = int(postproc_decision["resolved_post_min_on"])
+    res_k = int(postproc_decision["resolved_post_fill_short_off"])
+    m_max = postproc_decision.get("m_max")
+    k_max = postproc_decision.get("k_max")
+    gt_loss = float(postproc_decision.get("gt_on_loss_at_selected_m", 0.0))
+    gt_bridge = float(postproc_decision.get("gt_bridge_ratio_at_selected_k", 0.0))
+    model = postproc_decision.get("calibrated_model") or "unknown"
+    f1_b = postproc_decision.get("val_f1_before")
+    f1_a = postproc_decision.get("val_f1_after")
+    off_b = postproc_decision.get("val_off_fp_before")
+    off_a = postproc_decision.get("val_off_fp_after")
+    reasons = "; ".join(postproc_decision.get("reasons", []))
+
+    if postproc_decision.get("confidence") == "high":
+        log.warning("%s", yellow_text(
+            f"[{user_key}] [AUTO-POSTPROC] 游程后处理两阶段自动定参生效 -> "
+            f"post_min_on={res_m}, post_fill_short_off={res_k} "
+            f"(物理上界 M_max={m_max}, K_max={k_max}, 真值开态折损={gt_loss:.2%}, "
+            f"真值桥接率={gt_bridge:.2%}, model={model}, val_F1: {f1_b}->{f1_a}, "
+            f"全关日FP: {off_b}->{off_a}, {reasons})"
+        ))
+    else:
+        log.warning("%s", red_text(
+            f"[{user_key}] [AUTO-POSTPROC-WARN] 游程后处理自动定参触发低置信/回退告警 "
+            f"({reasons}) -> 暂取安全锚点 post_min_on={res_m}, post_fill_short_off={res_k} "
+            f"(M_max={m_max}, K_max={k_max}, model={model})！"
+        ))
+
+
+def resolve_infer_postprocess_params(
+    user_key: str,
+    user_cfg: dict,
+    meta: dict,
+    model_name: str | None = None,
+) -> tuple[int, int, dict]:
+    """推理阶段统一解析 (post_min_on, post_fill_short_off)：显式整数 100% 优先，'auto' 按模型继承训练 meta.json。"""
+    prov = user_cfg.get("_provenance") or {}
+    cfg_m = user_cfg.get("post_min_on", 1)
+    cfg_k = user_cfg.get("post_fill_short_off", 3)
+    prov_m = prov.get("post_min_on", "default(硬编码)")
+    prov_k = prov.get("post_fill_short_off", "default(硬编码)")
+
+    model_pp_map = meta.get("model_postprocess_params") or {}
+    model_entry = model_pp_map.get(model_name) if (model_name and model_name in model_pp_map) else None
+
+    meta_m_raw = meta.get("post_min_on")
+    meta_k_raw = meta.get("post_fill_short_off")
+    trained_m = (
+        int(model_entry["post_min_on"])
+        if (isinstance(model_entry, dict) and model_entry.get("post_min_on") is not None)
+        else (int(meta_m_raw) if meta_m_raw is not None else 1)
+    )
+    trained_k = (
+        int(model_entry["post_fill_short_off"])
+        if (isinstance(model_entry, dict) and model_entry.get("post_fill_short_off") is not None)
+        else (int(meta_k_raw) if meta_k_raw is not None else 3)
+    )
+
+    m_auto_cfg = isinstance(cfg_m, str) and cfg_m.strip().lower() == "auto"
+    k_auto_cfg = isinstance(cfg_k, str) and cfg_k.strip().lower() == "auto"
+
+    # 1) post_min_on 解析
+    if m_auto_cfg:
+        res_m = trained_m
+        m_source = (
+            f"meta.model_postprocess_params[{model_name}]"
+            if isinstance(model_entry, dict) and "post_min_on" in model_entry
+            else "meta.post_min_on"
+        )
+    elif prov_m == "default(硬编码)" and meta.get("post_min_on_configured") == "auto":
+        res_m = trained_m
+        m_source = "inherited_train_meta(default_auto)"
+    else:
+        res_m = int(cfg_m)
+        m_source = f"explicit({prov_m})"
+
+    # 2) post_fill_short_off 解析
+    if k_auto_cfg:
+        res_k = trained_k
+        k_source = (
+            f"meta.model_postprocess_params[{model_name}]"
+            if isinstance(model_entry, dict) and "post_fill_short_off" in model_entry
+            else "meta.post_fill_short_off"
+        )
+    elif prov_k == "default(硬编码)" and meta.get("post_fill_short_off_configured") == "auto":
+        res_k = trained_k
+        k_source = "inherited_train_meta(default_auto)"
+    else:
+        res_k = int(cfg_k)
+        k_source = f"explicit({prov_k})"
+
+    if m_auto_cfg or k_auto_cfg or "default_auto" in m_source or "default_auto" in k_source:
+        log.warning("%s", yellow_text(
+            f"[{user_key}] [AUTO-POSTPROC-INFER] 推理继承训练产物游程参数 -> "
+            f"post_min_on={res_m} ({m_source}), post_fill_short_off={res_k} ({k_source}), "
+            f"model={model_name or 'auto'}"
+        ))
+    elif (
+        (meta_m_raw is not None and res_m != trained_m and prov_m != "default(硬编码)")
+        or (meta_k_raw is not None and res_k != trained_k and prov_k != "default(硬编码)")
+    ):
+        log.warning("%s", yellow_text(
+            f"[{user_key}] [POSTPROC-OVERRIDE] 推理显式游程参数 (min_on={res_m}, fill_off={res_k}) "
+            f"覆盖训练产物参数 (min_on={trained_m}, fill_off={trained_k})"
+        ))
+
+    return res_m, res_k, {
+        "post_min_on": res_m,
+        "post_min_on_configured": cfg_m,
+        "post_min_on_source": m_source,
+        "post_fill_short_off": res_k,
+        "post_fill_short_off_configured": cfg_k,
+        "post_fill_short_off_source": k_source,
+    }
+
+
 def check_offline_decision_drift(
     user_key: str,
     y_infer_true: np.ndarray,
@@ -735,7 +1448,7 @@ def resolve_joint_val_infer_decision_thr_w(
             return None, {"skipped": "NO_TRAIN_PRED_COL"}
         pred_col = pred_cols[0]
 
-    # 推断 post_min_on / post_fill_short_off（优先 meta -> metrics_daily_chain -> 默认 1/3）
+    # 推断当前生效的 post_min_on / post_fill_short_off（优先 meta -> metrics_daily_chain -> 默认 1/3）
     post_min_on = int(inf_meta.get("post_min_on", tr_meta.get("post_min_on", 1)))
     post_fill_off = int(inf_meta.get("post_fill_short_off", tr_meta.get("post_fill_short_off", 3)))
     chain_csv = infer_dir / "metrics_daily_chain.csv"
@@ -764,19 +1477,229 @@ def resolve_joint_val_infer_decision_thr_w(
     upper_guard_w = max(on_thr, UPPER_ON_P10_RATIO * y_on_p10)
     min_cand_w = max(0.001, 0.60 * on_thr)
 
-    raw_cands: set[float] = {round(on_thr, 4), round(cur_dec, 4)}
-    for g in STANDARD_DECISION_GRID:
-        if min_cand_w - 1e-9 <= g <= upper_guard_w + 1e-9:
-            raw_cands.add(round(float(g), 4))
-    for y_s, p_s in ((y_va, p_va), (y_inf, p_inf)):
-        off_p = p_s[(y_s < on_thr) & np.isfinite(p_s) & (p_s > 0)]
-        if len(off_p) >= 8:
-            for q in (0.75, 0.90, 0.95, 0.98, 0.99):
-                qv = round(float(np.quantile(off_p, q)) * 1.05, 2)
-                if min_cand_w <= qv <= upper_guard_w:
-                    raw_cands.add(qv)
-    cands = sorted(c for c in raw_cands if 0.001 <= c <= 5000.0)
+    dec_cfg_tr = tr_meta.get("decision_thr_w_configured", "auto")
+    inf_dec_src = str((inf_meta.get("thresholds") or {}).get("decision_thr_w_source", ""))
+    c_joint_auto = (dec_cfg_tr == "auto") and not inf_dec_src.startswith("explicit")
 
+    if c_joint_auto or ("decision_thr_w_configured" not in tr_meta):
+        raw_cands: set[float] = {round(on_thr, 4), round(cur_dec, 4)}
+        for g in STANDARD_DECISION_GRID:
+            if min_cand_w - 1e-9 <= g <= upper_guard_w + 1e-9:
+                raw_cands.add(round(float(g), 4))
+        for y_s, p_s in ((y_va, p_va), (y_inf, p_inf)):
+            off_p = p_s[(y_s < on_thr) & np.isfinite(p_s) & (p_s > 0)]
+            if len(off_p) >= 8:
+                for q in (0.75, 0.90, 0.95, 0.98, 0.99):
+                    qv = round(float(np.quantile(off_p, q)) * 1.05, 2)
+                    if min_cand_w <= qv <= upper_guard_w:
+                        raw_cands.add(qv)
+        cands = sorted(c for c in raw_cands if 0.001 <= c <= 5000.0)
+    else:
+        cands = [round(cur_dec, 4)]
+
+    inf_pp = inf_meta.get("postprocess") or {}
+    m_joint_auto = (
+        tr_meta.get("post_min_on_configured") == "auto"
+        and not str(inf_pp.get("post_min_on_source", "")).startswith("explicit(")
+    )
+    k_joint_auto = (
+        tr_meta.get("post_fill_short_off_configured") == "auto"
+        and not str(inf_pp.get("post_fill_short_off_source", "")).startswith("explicit(")
+    )
+
+    cur_key = round(cur_dec, 4)
+
+    # ---- 分支 A：当 post_min_on 或 post_fill_short_off 为 auto 时，在物理上界 (M_max, K_max) 内联合收口 ----
+    if m_joint_auto or k_joint_auto:
+        bounds = tr_meta.get("postprocess_bounds")
+        if not isinstance(bounds, dict) or "m_max" not in bounds:
+            # 严格只用 train + val 真值恢复物理上界，严禁触碰 test 折
+            pool_df = pd.concat([tr_sub, va_sub], ignore_index=True).sort_values("timestamp")
+            bounds = resolve_postprocess_physical_bounds(
+                pool_df["target"].to_numpy(dtype=np.float64),
+                pd.DatetimeIndex(pd.to_datetime(pool_df["timestamp"])),
+                on_thr_w=on_thr,
+            )
+        m_max = int(bounds.get("m_max", 1))
+        k_max = int(bounds.get("k_max", 3))
+        m_anchor = 1 if m_joint_auto else post_min_on
+        k_anchor = int(min(3, k_max)) if k_joint_auto else post_fill_off
+
+        m_cands = sorted({m for m in MIN_ON_GRID if m <= m_max} | {m_anchor}) if m_joint_auto else [post_min_on]
+        k_cands = sorted({k for k in FILL_OFF_GRID if k <= k_max} | {k_anchor}) if k_joint_auto else [post_fill_off]
+        m_eval_all = sorted(set(m_cands) | {post_min_on})
+        k_eval_all = sorted(set(k_cands) | {post_fill_off} | ({0} if k_joint_auto else set()))
+
+        val_tab, _, val_has_off = _eval_3d_grid_fast(y_va, p_va, idx_va, on_thr, cands, m_eval_all, k_eval_all)
+        inf_tab, inf_n_off, inf_has_off = _eval_3d_grid_fast(y_inf, p_inf, idx_inf, on_thr, cands, m_eval_all, k_eval_all)
+
+        all_cand_3d = [(c, m, k) for c in cands for m in m_cands for k in k_cands]
+
+        def _mk_ok_val(c_v: float, m_v: int, k_v: int) -> bool:
+            r = val_tab[(c_v, m_v, k_v)]
+            if r["recall"] < MIN_VAL_RECALL:
+                return False
+            if m_v > m_anchor and r["recall"] < val_tab[(c_v, m_anchor, k_v)]["recall"] - 0.03 - 1e-9:
+                return False
+            if k_joint_auto and val_has_off and k_v > 0 and r["off_day_fp"] > val_tab[(c_v, m_v, 0)]["off_day_fp"]:
+                return False
+            return True
+
+        def _mk_ok_inf(c_v: float, m_v: int, k_v: int) -> bool:
+            r = inf_tab[(c_v, m_v, k_v)]
+            if r["recall"] < MIN_VAL_RECALL:
+                return False
+            if m_v > m_anchor and r["recall"] < inf_tab[(c_v, m_anchor, k_v)]["recall"] - 0.03 - 1e-9:
+                return False
+            if k_joint_auto and inf_has_off and k_v > 0 and r["off_day_fp"] > inf_tab[(c_v, m_v, 0)]["off_day_fp"]:
+                return False
+            return True
+
+        val_feas_3d = [key for key in all_cand_3d if _mk_ok_val(*key)]
+        val_peak_f1_3d = max((val_tab[key]["f1"] for key in val_feas_3d), default=0.0)
+        inf_feas_3d = [key for key in all_cand_3d if _mk_ok_inf(*key)]
+
+        amp_span = max(upper_guard_w - on_thr, on_thr, 1.0)
+
+        def _inf_reg_score(key: tuple[float, int, int], include_val: bool = True) -> tuple[float, int, int, int, float]:
+            c_v, m_v, k_v = key
+            ri = inf_tab[key]
+            rv = val_tab[key]
+            amp_ratio = max(0.0, c_v - on_thr) / amp_span if len(cands) > 1 else 0.0
+            off_pen = (0.50 * ri["off_day_fp"] / inf_n_off) if inf_has_off else (0.15 * ri["fp"] / max(1, len(y_inf)))
+            score = (
+                ri["f1"]
+                - off_pen
+                - 0.0006 * abs(m_v - m_anchor)
+                - 0.0006 * abs(k_v - k_anchor)
+                - 0.0080 * amp_ratio
+            )
+            return (
+                round(score, 6),
+                -ri["off_day_fp"],
+                -ri["fp"],
+                -(rv["off_day_fp"] if include_val else 0),
+                -abs(c_v - cur_dec),
+            )
+
+        pure_inf_key: tuple[float, int, int] | None = None
+        if inf_feas_3d:
+            pure_inf_key = max(inf_feas_3d, key=lambda key: _inf_reg_score(key, include_val=False))
+
+        joint_feas_3d = [
+            key for key in inf_feas_3d
+            if (not val_feas_3d or (_mk_ok_val(*key) and val_tab[key]["f1"] >= val_peak_f1_3d - 0.02))
+        ]
+        confidence = "high"
+        reasons_3d: list[str] = []
+        heteropeak_override = False
+        val_capped_candidate: float | None = None
+
+        if not joint_feas_3d:
+            joint_feas_3d = [key for key in inf_feas_3d if val_tab[key]["recall"] >= 0.93]
+            if joint_feas_3d:
+                confidence = "low"
+                reasons_3d.append("RELAXED_VAL_F1_FLOOR_FOR_SEVERE_SHIFT")
+        if not joint_feas_3d:
+            joint_feas_3d = list(inf_feas_3d)
+            if joint_feas_3d:
+                confidence = "low"
+                heteropeak_override = True
+                reasons_3d.append("INFER_RECALL_ONLY_FALLBACK")
+
+        cur_3d = (cur_key, post_min_on, post_fill_off)
+        if not joint_feas_3d:
+            confidence = "low"
+            reasons_3d.append("RECALL_BELOW_095_GUARD")
+            best_key = max(
+                all_cand_3d,
+                key=lambda key: (inf_tab[key]["f1"], inf_tab[key]["recall"], -abs(key[0] - cur_dec)),
+            )
+        else:
+            cand_joint_key = max(joint_feas_3d, key=lambda key: _inf_reg_score(key, include_val=True))
+            cur_inf_r = inf_tab[cur_3d]
+            cand_inf_r = inf_tab[cand_joint_key]
+            f1_gain_cur = cand_inf_r["f1"] - cur_inf_r["f1"]
+            fp_saved_cur = cur_inf_r["fp"] - cand_inf_r["fp"]
+            thr_lowered_cur = (
+                cand_joint_key[0] <= 0.80 * cur_dec
+                and (cur_dec - cand_joint_key[0]) >= max(10.0, 0.20 * on_thr)
+                and cand_inf_r["f1"] >= cur_inf_r["f1"] - 0.002
+                and cand_inf_r["off_day_fp"] <= cur_inf_r["off_day_fp"]
+            )
+            if (
+                cur_3d in joint_feas_3d
+                and f1_gain_cur < 0.002
+                and fp_saved_cur < max(2, int(0.20 * cur_inf_r["fp"]))
+                and not thr_lowered_cur
+            ):
+                joint_best_key = cur_3d
+                joint_reason = "DUAL_CHAIN_CONSISTENT_KEEP"
+            else:
+                joint_best_key = cand_joint_key
+                joint_reason = "DUAL_CHAIN_JOINT_POSTPROC_OPTIMIZED"
+
+            if pure_inf_key is not None:
+                j_inf_r = inf_tab[joint_best_key]
+                p_inf_r = inf_tab[pure_inf_key]
+                shift_vs_joint = abs(pure_inf_key[0] - joint_best_key[0])
+                f1_gain_vs_joint = p_inf_r["f1"] - j_inf_r["f1"]
+                fp_cut_vs_joint = (
+                    (j_inf_r["fp"] - p_inf_r["fp"]) / max(j_inf_r["fp"], 1)
+                    if j_inf_r["fp"] > 0 else 0.0
+                )
+                if (
+                    (shift_vs_joint >= max(15.0, 0.20 * max(joint_best_key[0], 1.0)) or pure_inf_key[1:] != joint_best_key[1:])
+                    and (
+                        f1_gain_vs_joint >= 0.02
+                        or (j_inf_r["fp"] >= 15 and fp_cut_vs_joint >= 0.50 and f1_gain_vs_joint >= 0.005)
+                    )
+                ):
+                    val_capped_candidate = float(joint_best_key[0])
+                    best_key = pure_inf_key
+                    heteropeak_override = True
+                    reasons_3d.append(
+                        f"CROSS_SEASON_INFER_DOMINANT_OVERRIDE("
+                        f"val_capped={joint_best_key[0]:.4g}->infer_opt={pure_inf_key[0]:.4g},"
+                        f"m={pure_inf_key[1]},k={pure_inf_key[2]},"
+                        f"infer_f1_gain={f1_gain_vs_joint:+.4f},fp_cut={fp_cut_vs_joint:.1%})"
+                    )
+                else:
+                    best_key = joint_best_key
+                    reasons_3d.append(joint_reason)
+            else:
+                best_key = joint_best_key
+                reasons_3d.append(joint_reason)
+
+        best_c, best_m, best_k = best_key
+        return float(best_c), {
+            "stage": "joint_val_infer_postproc_calibrated",
+            "confidence": confidence,
+            "heteropeak_override": heteropeak_override,
+            "val_capped_candidate_w": val_capped_candidate,
+            "pure_infer_optimal_w": pure_inf_key[0] if pure_inf_key is not None else None,
+            "model": model_name,
+            "on_thr_w": on_thr,
+            "previous_decision_thr_w": cur_dec,
+            "resolved_decision_thr_w": float(best_c),
+            "previous_post_min_on": post_min_on,
+            "resolved_post_min_on": int(best_m),
+            "previous_post_fill_short_off": post_fill_off,
+            "resolved_post_fill_short_off": int(best_k),
+            "m_max": m_max,
+            "k_max": k_max,
+            "upper_guard_w": round(upper_guard_w, 3),
+            "y_on_p10": round(y_on_p10, 3),
+            "post_min_on": int(best_m),
+            "post_fill_short_off": int(best_k),
+            "val_before": val_tab[cur_3d],
+            "val_after": val_tab[best_key],
+            "infer_before": inf_tab[cur_3d],
+            "infer_after": inf_tab[best_key],
+            "reasons": reasons_3d,
+        }
+
+    # ---- 分支 B：post_min_on 与 post_fill_short_off 均为显式/缺省整数（100% 保持既有 1D 双链收口行为） ----
     val_map = {
         c: _eval_chain_candidate(y_va, p_va, idx_va, on_thr, c, post_min_on, post_fill_off)
         for c in cands
@@ -838,17 +1761,17 @@ def resolve_joint_val_infer_decision_thr_w(
         best_c = max(cands, key=lambda c: (inf_map[c]["f1"], inf_map[c]["recall"], -abs(c - cur_dec)))
     else:
         best_inf_f1 = max(inf_map[c]["f1"] for c in joint_feas)
-        cur_inf = inf_map[round(cur_dec, 4)]
+        cur_inf = inf_map[cur_key]
         min_inf_fp = min(inf_map[c]["fp"] for c in joint_feas if inf_map[c]["f1"] >= best_inf_f1 - 0.0025)
         f1_gain = best_inf_f1 - cur_inf["f1"]
         fp_saved = cur_inf["fp"] - min_inf_fp
 
         if (
-            round(cur_dec, 4) in joint_feas
+            cur_key in joint_feas
             and f1_gain < 0.002
             and fp_saved < max(3, int(0.20 * cur_inf["fp"]))
         ):
-            joint_best_c = round(cur_dec, 4)
+            joint_best_c = cur_key
             joint_reason = "DUAL_CHAIN_CONSISTENT_KEEP"
         else:
             top_cands = [c for c in joint_feas if inf_map[c]["f1"] >= best_inf_f1 - 0.0025]
@@ -899,7 +1822,6 @@ def resolve_joint_val_infer_decision_thr_w(
             best_c = joint_best_c
             reasons.append(joint_reason)
 
-    cur_key = round(cur_dec, 4)
     return float(best_c), {
         "stage": "joint_val_infer_calibrated",
         "confidence": confidence,
@@ -910,6 +1832,10 @@ def resolve_joint_val_infer_decision_thr_w(
         "on_thr_w": on_thr,
         "previous_decision_thr_w": cur_dec,
         "resolved_decision_thr_w": float(best_c),
+        "previous_post_min_on": post_min_on,
+        "resolved_post_min_on": post_min_on,
+        "previous_post_fill_short_off": post_fill_off,
+        "resolved_post_fill_short_off": post_fill_off,
         "upper_guard_w": round(upper_guard_w, 3),
         "y_on_p10": round(y_on_p10, 3),
         "post_min_on": post_min_on,
@@ -929,6 +1855,8 @@ def sync_decision_thr_artifacts(
     new_dec_thr: float,
     reason: str = "manual_sync",
     sync_details: dict | None = None,
+    new_post_min_on: int | None = None,
+    new_post_fill_short_off: int | None = None,
 ) -> dict:
     """零模型重训原子同步刷新 train 与 infer 全套后处理判决链产物，确保 T1-T4 / I1-I10 100% 一致。"""
     dec_val = float(new_dec_thr)
@@ -936,6 +1864,12 @@ def sync_decision_thr_artifacts(
     updated: dict[str, str] = {}
     old_train_dec: float | None = None
     old_infer_dec: float | None = None
+    old_train_min_on: int | None = None
+    old_train_fill_off: int | None = None
+    old_infer_min_on: int | None = None
+    old_infer_fill_off: int | None = None
+    eff_min_on_out: int | None = new_post_min_on
+    eff_fill_off_out: int | None = new_post_fill_short_off
 
     # ---------------- 1) 同步刷新 train_dir ----------------
     if train_dir is not None and (train_dir / "meta.json").exists():
@@ -966,6 +1900,14 @@ def sync_decision_thr_artifacts(
             if len(cdf_old) > 0 and "post_min_on" in cdf_old.columns:
                 post_min_on = int(cdf_old["post_min_on"].iloc[0])
                 post_fill_off = int(cdf_old["post_fill_short_off"].iloc[0])
+        old_train_min_on = post_min_on
+        old_train_fill_off = post_fill_off
+        if new_post_min_on is not None:
+            post_min_on = int(new_post_min_on)
+        if new_post_fill_short_off is not None:
+            post_fill_off = int(new_post_fill_short_off)
+        eff_min_on_out = post_min_on
+        eff_fill_off_out = post_fill_off
 
         tp_csv = train_dir / "predictions" / "train_predictions.csv"
         if tp_csv.exists():
@@ -1051,25 +1993,52 @@ def sync_decision_thr_artifacts(
                 f"decision_thr_w={dec_val:g}",
                 txt,
             )
+            txt_new = re.sub(r"post_min_on=\d+", f"post_min_on={post_min_on}", txt_new)
+            txt_new = re.sub(r"post_fill_short_off=\d+", f"post_fill_short_off={post_fill_off}", txt_new)
             if txt_new != txt:
                 comp_md.write_text(txt_new, encoding="utf-8")
 
         if "decision_thr_w_val_initial" not in tr_meta and old_train_dec is not None:
             tr_meta["decision_thr_w_val_initial"] = old_train_dec
+        if "post_min_on_val_initial" not in tr_meta and old_train_min_on is not None:
+            tr_meta["post_min_on_val_initial"] = old_train_min_on
+        if "post_fill_short_off_val_initial" not in tr_meta and old_train_fill_off is not None:
+            tr_meta["post_fill_short_off_val_initial"] = old_train_fill_off
+
         tr_meta["decision_thr_w"] = dec_val
+        tr_meta["post_min_on"] = post_min_on
+        tr_meta["post_fill_short_off"] = post_fill_off
+
         model_map = dict(tr_meta.get("model_decision_thr_w") or {})
+        model_pp_map = {k: dict(v) for k, v in (tr_meta.get("model_postprocess_params") or {}).items()}
         target_model = (sync_details or {}).get("model") or tr_meta.get("best_model")
         if target_model:
             model_map[str(target_model)] = dec_val
+            if new_post_min_on is not None or new_post_fill_short_off is not None or str(target_model) in model_pp_map:
+                pp_entry = dict(model_pp_map.get(str(target_model)) or {})
+                pp_entry["post_min_on"] = post_min_on
+                pp_entry["post_fill_short_off"] = post_fill_off
+                model_pp_map[str(target_model)] = pp_entry
         for m in tr_meta.get("models") or []:
             if reason == "explicit_sync":
                 model_map[str(m)] = dec_val
+                if new_post_min_on is not None or new_post_fill_short_off is not None:
+                    model_pp_map[str(m)] = {
+                        "post_min_on": post_min_on,
+                        "post_fill_short_off": post_fill_off,
+                    }
         tr_meta["model_decision_thr_w"] = model_map
+        if model_pp_map:
+            tr_meta["model_postprocess_params"] = model_pp_map
         tr_meta["decision_thr_w_sync"] = {
             "synced_at": ts_now,
             "reason": reason,
             "previous_decision_thr_w": old_train_dec,
             "synced_decision_thr_w": dec_val,
+            "previous_post_min_on": old_train_min_on,
+            "synced_post_min_on": post_min_on,
+            "previous_post_fill_short_off": old_train_fill_off,
+            "synced_post_fill_short_off": post_fill_off,
             "details": sync_details,
         }
         tr_meta_path.write_text(json.dumps(tr_meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1094,6 +2063,14 @@ def sync_decision_thr_artifacts(
             if len(cdf_i) > 0 and "post_min_on" in cdf_i.columns:
                 post_min_on_i = int(cdf_i["post_min_on"].iloc[0])
                 post_fill_off_i = int(cdf_i["post_fill_short_off"].iloc[0])
+        old_infer_min_on = post_min_on_i
+        old_infer_fill_off = post_fill_off_i
+        if new_post_min_on is not None:
+            post_min_on_i = int(new_post_min_on)
+        if new_post_fill_short_off is not None:
+            post_fill_off_i = int(new_post_fill_short_off)
+        eff_min_on_out = post_min_on_i
+        eff_fill_off_out = post_fill_off_i
 
         pred_np = df_inf["pred"].to_numpy(dtype=np.float64)
         new_st = postprocess_state(pred_np, dec_val, post_min_on_i, post_fill_off_i).astype(int)
@@ -1145,14 +2122,29 @@ def sync_decision_thr_artifacts(
         if inf_meta_path.exists():
             if "decision_thr_w_before_sync" not in inf_meta:
                 inf_meta["decision_thr_w_before_sync"] = old_infer_dec
+            if "post_min_on_before_sync" not in inf_meta and old_infer_min_on is not None:
+                inf_meta["post_min_on_before_sync"] = old_infer_min_on
+            if "post_fill_short_off_before_sync" not in inf_meta and old_infer_fill_off is not None:
+                inf_meta["post_fill_short_off_before_sync"] = old_infer_fill_off
             inf_meta["decision_thr_w"] = dec_val
+            inf_meta["post_min_on"] = post_min_on_i
+            inf_meta["post_fill_short_off"] = post_fill_off_i
             thr_blk = dict(inf_meta.get("thresholds") or {})
             thr_blk["decision_thr_w"] = dec_val
             thr_blk["decision_thr_w_source"] = f"synced({reason})"
             inf_meta["thresholds"] = thr_blk
+            if "postprocess" in inf_meta or new_post_min_on is not None or new_post_fill_short_off is not None:
+                pp_blk = dict(inf_meta.get("postprocess") or {})
+                pp_blk["post_min_on"] = post_min_on_i
+                pp_blk["post_fill_short_off"] = post_fill_off_i
+                pp_blk["post_min_on_source"] = f"synced({reason})"
+                pp_blk["post_fill_short_off_source"] = f"synced({reason})"
+                inf_meta["postprocess"] = pp_blk
             inf_meta["offline_drift_advice"] = {
                 "drift_detected": False,
                 "synced_decision_thr_w": dec_val,
+                "synced_post_min_on": post_min_on_i,
+                "synced_post_fill_short_off": post_fill_off_i,
                 "reason": reason,
             }
             inf_meta["decision_thr_w_sync"] = {
@@ -1160,6 +2152,10 @@ def sync_decision_thr_artifacts(
                 "reason": reason,
                 "previous_decision_thr_w": old_infer_dec,
                 "synced_decision_thr_w": dec_val,
+                "previous_post_min_on": old_infer_min_on,
+                "synced_post_min_on": post_min_on_i,
+                "previous_post_fill_short_off": old_infer_fill_off,
+                "synced_post_fill_short_off": post_fill_off_i,
                 "details": sync_details,
             }
             inf_meta_path.write_text(json.dumps(inf_meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1168,8 +2164,14 @@ def sync_decision_thr_artifacts(
     return {
         "user_key": user_key,
         "synced_decision_thr_w": dec_val,
+        "synced_post_min_on": eff_min_on_out,
+        "synced_post_fill_short_off": eff_fill_off_out,
         "previous_train_decision_thr_w": old_train_dec,
         "previous_infer_decision_thr_w": old_infer_dec,
+        "previous_train_post_min_on": old_train_min_on,
+        "previous_infer_post_min_on": old_infer_min_on,
+        "previous_train_post_fill_short_off": old_train_fill_off,
+        "previous_infer_post_fill_short_off": old_infer_fill_off,
         "updated": updated,
         "reason": reason,
     }
@@ -1186,15 +2188,29 @@ def calibrate_and_sync_joint_decision_thr(
         return info
 
     prev_thr = float(info["previous_decision_thr_w"])
+    prev_m = int(info.get("previous_post_min_on", info["post_min_on"]))
+    prev_k = int(info.get("previous_post_fill_short_off", info["post_fill_short_off"]))
+    new_m = int(info.get("resolved_post_min_on", info["post_min_on"]))
+    new_k = int(info.get("resolved_post_fill_short_off", info["post_fill_short_off"]))
+
     inf_before = info["infer_before"]
     inf_after = info["infer_after"]
     val_after = info["val_after"]
     shift = abs(new_thr - prev_thr)
 
-    # 即使数值相等，若 train/meta.json 与 infer 的阈值曾不一致也做对齐
+    # 即使数值相等，若 train/meta.json 与 infer 的阈值或游程参数不一致也做原子对齐
     tr_meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
     tr_prev = float(tr_meta.get("decision_thr_w", prev_thr))
-    need_write = (shift > 1e-6) or (abs(tr_prev - new_thr) > 1e-6)
+    tr_prev_m = int(tr_meta.get("post_min_on", prev_m))
+    tr_prev_k = int(tr_meta.get("post_fill_short_off", prev_k))
+    pp_changed = (new_m != prev_m) or (new_k != prev_k) or (tr_prev_m != new_m) or (tr_prev_k != new_k)
+    need_write = (shift > 1e-6) or (abs(tr_prev - new_thr) > 1e-6) or pp_changed
+
+    pp_note = (
+        f", post=({prev_m},{prev_k})->({new_m},{new_k})"
+        if (new_m != prev_m or new_k != prev_k)
+        else f", post=({new_m},{new_k})"
+    )
 
     if need_write:
         sync_res = sync_decision_thr_artifacts(
@@ -1204,6 +2220,8 @@ def calibrate_and_sync_joint_decision_thr(
             new_dec_thr=new_thr,
             reason="joint_val_infer_auto_sync",
             sync_details=info,
+            new_post_min_on=new_m,
+            new_post_fill_short_off=new_k,
         )
         info["synced"] = True
         info["sync_result"] = sync_res
@@ -1214,7 +2232,7 @@ def calibrate_and_sync_joint_decision_thr(
             cap_note = f"历史val受召回约束卡在 {val_cap_s:.4g}" if isinstance(val_cap_s, (int, float)) else f"train_val={tr_prev:.4g}"
             msg = (
                 f"[{user_key}] [AUTO-DEC-THR-SYNC] 检测到跨季双链异峰（{cap_note}，当期 infer 最优为 "
-                f"decision_thr_w={new_thr:.4g}），遵循调参铁律按 infer 链定阈 "
+                f"decision_thr_w={new_thr:.4g}{pp_note}），遵循调参铁律按 infer 链定阈 "
                 f"(model={info['model']}, infer_F1: {inf_before['f1']:.4f}->{inf_after['f1']:.4f}, "
                 f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_recall={inf_after['recall']:.4f}, "
                 f"历史val_recall={val_after['recall']:.4f})，已零重训同步刷新 train+infer 全套产物！"
@@ -1222,7 +2240,7 @@ def calibrate_and_sync_joint_decision_thr(
         elif severe_shift:
             msg = (
                 f"[{user_key}] [AUTO-DEC-THR-SYNC] 双链联合收口生效：检测到显著跨期偏移 "
-                f"train_val={tr_prev:.4g} -> 双链最优 decision_thr_w={new_thr:.4g} "
+                f"train_val={tr_prev:.4g} -> 双链最优 decision_thr_w={new_thr:.4g}{pp_note} "
                 f"(model={info['model']}, infer_F1: {inf_before['f1']:.4f}->{inf_after['f1']:.4f}, "
                 f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_recall={inf_after['recall']:.4f}, "
                 f"val_F1={val_after['f1']:.4f})，已零重训同步刷新 train+infer 全套产物！"
@@ -1230,7 +2248,7 @@ def calibrate_and_sync_joint_decision_thr(
         else:
             msg = (
                 f"[{user_key}] [AUTO-DEC-THR-SYNC] 双链联合微调收口："
-                f"train_val={tr_prev:.4g} -> 双链最优 decision_thr_w={new_thr:.4g} "
+                f"train_val={tr_prev:.4g} -> 双链最优 decision_thr_w={new_thr:.4g}{pp_note} "
                 f"(model={info['model']}, infer_F1: {inf_before['f1']:.4f}->{inf_after['f1']:.4f}, "
                 f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_recall={inf_after['recall']:.4f}, "
                 f"val_F1={val_after['f1']:.4f})，已零重训同步刷新 train+infer 全套产物"
@@ -1239,8 +2257,8 @@ def calibrate_and_sync_joint_decision_thr(
     else:
         info["synced"] = False
         log.warning("%s", yellow_text(
-            f"[{user_key}] [AUTO-DEC-THR-SYNC] 双链联合复核一致：train 与 infer 最优阈值均为 "
-            f"decision_thr_w={new_thr:.4g} (infer_F1={inf_after['f1']:.4f}, "
+            f"[{user_key}] [AUTO-DEC-THR-SYNC] 双链联合复核一致：train 与 infer 最优参数均为 "
+            f"decision_thr_w={new_thr:.4g}{pp_note} (infer_F1={inf_after['f1']:.4f}, "
             f"infer_FP={inf_after['fp']}, infer_recall={inf_after['recall']:.4f})，双侧产物已对齐"
         ))
     return info

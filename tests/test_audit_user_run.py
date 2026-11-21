@@ -157,3 +157,88 @@ def test_audit_expect_mismatch(tmp_path, capsys):
     rc = main(["--run-root", str(tmp_path / "run"), "--expect-confusion", "9,9,9,9"])
     out = capsys.readouterr().out
     assert rc == 1 and "总混淆 == 期望 [9, 9, 9, 9]" in out
+
+
+def test_audit_auto_resolves_nondefault_postprocess_params_without_cli_flags(tmp_path, capsys):
+    """当 auto 定参落盘非 1/3（如 min_on=3, fill_off=1）时，audit_user_run 零参调用应从 meta/chain 自适应解析通过。"""
+    udir = _make_run(tmp_path / "run_custom_pp")
+    tdir = sorted((udir / "train").glob("*/"))[-1]
+    idir = sorted((udir / "infer").glob("*/"))[-1]
+
+    mo, fo = 3, 1
+    # 用 (mo=3, fo=1) 重刷 train 与 infer 全部自描述表及 meta.json
+    tp_df = pd.read_csv(tdir / "predictions" / "train_predictions.csv")
+    new_parts = []
+    for _, g in tp_df.groupby("split", sort=False):
+        g = g.copy()
+        g["pred_state_transformer"] = postprocess_state(g["pred_transformer"].to_numpy(float), 10.0, mo, fo).astype(int)
+        new_parts.append(g)
+    tp_new = pd.concat(new_parts, ignore_index=True)
+    tp_new.to_csv(tdir / "predictions" / "train_predictions.csv", index=False)
+
+    test_g = tp_new[tp_new["split"] == "test"]
+    t_test = test_g["target_state"].to_numpy(int)
+    p_test = test_g["pred_state_transformer"].to_numpy(int)
+    tp_s = int(((t_test == 1) & (p_test == 1)).sum())
+    fp_s = int(((t_test == 0) & (p_test == 1)).sum())
+    fn_s = int(((t_test == 1) & (p_test == 0)).sum())
+    strat_df = pd.read_csv(tdir / "state_strategy_metrics.csv")
+    dr_mask = strat_df["strategy"] == "decision+runs"
+    strat_df.loc[dr_mask, "post_min_on"] = mo
+    strat_df.loc[dr_mask, "post_fill_short_off"] = fo
+    strat_df.loc[dr_mask, ["tp", "fp", "fn"]] = [tp_s, fp_s, fn_s]
+    strat_df.to_csv(tdir / "state_strategy_metrics.csv", index=False)
+
+    tp_new["_date"] = pd.to_datetime(tp_new["timestamp"]).dt.strftime("%Y-%m-%d")
+    tr_chain = pd.read_csv(tdir / "metrics_daily_chain.csv")
+    for idx_r, r in tr_chain.iterrows():
+        sub = tp_new[(tp_new["split"] == r["split"]) & (tp_new["_date"] == r["date"])]
+        ts = sub["target_state"].to_numpy(int)
+        ps = sub["pred_state_transformer"].to_numpy(int)
+        tr_chain.loc[idx_r, ["tp", "fp", "fn", "tn"]] = [
+            int(((ts == 1) & (ps == 1)).sum()),
+            int(((ts == 0) & (ps == 1)).sum()),
+            int(((ts == 1) & (ps == 0)).sum()),
+            int(((ts == 0) & (ps == 0)).sum()),
+        ]
+    tr_chain["post_min_on"] = mo
+    tr_chain["post_fill_short_off"] = fo
+    tr_chain.to_csv(tdir / "metrics_daily_chain.csv", index=False)
+    (tdir / "meta.json").write_text(json.dumps({"post_min_on": mo, "post_fill_short_off": fo}), encoding="utf-8")
+
+    inf_df = pd.read_csv(idir / "predictions" / "inference_result.csv")
+    inf_df["pred_state"] = postprocess_state(inf_df["pred"].to_numpy(float), 10.0, mo, fo).astype(int)
+    inf_df.to_csv(idir / "predictions" / "inference_result.csv", index=False)
+    inf_df["_date"] = pd.to_datetime(inf_df["timestamp"]).dt.strftime("%Y-%m-%d")
+    in_chain = pd.read_csv(idir / "metrics_daily_chain.csv")
+    for idx_r, r in in_chain.iterrows():
+        sub = inf_df[inf_df["_date"] == r["date"]]
+        ts = sub["target_state"].to_numpy(int)
+        ps = sub["pred_state"].to_numpy(int)
+        in_chain.loc[idx_r, ["tp", "fp", "fn", "tn"]] = [
+            int(((ts == 1) & (ps == 1)).sum()),
+            int(((ts == 0) & (ps == 1)).sum()),
+            int(((ts == 1) & (ps == 0)).sum()),
+            int(((ts == 0) & (ps == 0)).sum()),
+        ]
+    in_chain["post_min_on"] = mo
+    in_chain["post_fill_short_off"] = fo
+    in_chain.to_csv(idir / "metrics_daily_chain.csv", index=False)
+    (idir / "meta.json").write_text(
+        json.dumps({"n_points": len(inf_df), "post_min_on": mo, "post_fill_short_off": fo}),
+        encoding="utf-8",
+    )
+
+    # 不传 --min-on / --fill-off，应自动按 meta.json 读取 (3, 1) 全绿通过
+    rc = main(["--run-root", str(tmp_path / "run_custom_pp")])
+    out = capsys.readouterr().out
+    assert rc == 0 and "全部通过" in out
+    assert "min_on=3, fill_off=1" in out
+
+    # 若篡改 state_strategy_metrics.csv 中 decision+runs 的 post_min_on 为 1，则审计必须捕获不一致
+    strat_df.loc[dr_mask, "post_min_on"] = 1
+    strat_df.to_csv(tdir / "state_strategy_metrics.csv", index=False)
+    rc_bad = main(["--run-root", str(tmp_path / "run_custom_pp")])
+    out_bad = capsys.readouterr().out
+    assert rc_bad == 1 and "state_strategy decision+runs 游程参数一致" in out_bad
+

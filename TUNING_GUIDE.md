@@ -132,8 +132,8 @@ python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/420000
   "on_thr_w": "auto",
   "decision_thr_w": "auto",
   "pbus_mode": "auto",
-  "post_min_on": 1,
-  "post_fill_short_off": 3,
+  "post_min_on": "auto",
+  "post_fill_short_off": "auto",
   "quality": {"day_gate": true, "min_on_day_ratio": 0.2},
   "train": {"include": [["2025-07-10","2026-06-30"]]},
   "infer": {"include": [["2026-07-01","2026-07-31"]]}
@@ -146,7 +146,7 @@ python -c "import pandas as pd; p='data/trains/900080270900_4200000000001/420000
     1. 训练阶段在选定推理模型的 `val` 验证集（零测试集泄漏）执行带物理护栏（`val_recall ≥ 0.95`、`≤ 0.80 × P10(y_on)` 兼容多路求和局部启停、最小增益门 `0.003` + 全关日 FP 优先；`pbus_mode="scaled"` 另设高分平台期抗漂移裕度）的判决链寻优，全量候选表写入 `train/meta.json`；
     2. 一键脚本 `auto_run_steps2to5.py` 完成 Step 5 推理后，若 `infer` 含分路真值（离线验收场景），自动执行 `(val + infer)` 双链联合寻优（统一共享训练集物理上限 `train_upper_guard_w = 0.80 × P10(y_train_on)`；双链同峰/宽交集时联合稳健选点，**跨季双链异峰时自动解除历史旧季节 `val` 的窄缝否决、遵循 Step 4 铁律按当期 `infer` 链定阈**）并**零重训原子同步刷新** `train` 与 `infer` 双侧全部状态列、日表、策略表与 `meta.json`（保留 `decision_thr_w_val_initial` 留痕，不触碰 `test` 折），确保双侧 `decision_thr_w` 完全一致且通过 `audit_user_run.py` 全绿门禁；也可随时用 `--stage sync-thr [--decision-thr 400]` 毫秒级零重训同步，或加 `--save-config` 自动备份并写回 `configs/time_filters.json`；常规微调输出**黄色提示日志**，跨季双链异峰、大跨度跨期偏移、显式覆盖或召回退化时输出**红色/黄色高亮日志**（也可配 `"on_thr"` 显式锁定沿用 `on_thr_w`）。
 * `pbus_mode` 默认 `"auto"`（推荐）：采用**零泄漏三步验证闭环**——① 不依赖易误伤的静态千瓦阈值盲跳，所有用户默认统一先跑抗漂移基态 `"raw"`（`pbus` 未缩放 + 物理零点锚定，绝大多数用户如 `2842/2844/856/870/778` 一遍即完稳留 `"raw"`）；② 仅当 `train + val` 检测到序列模型真实欠拟合信号（`R²` 与 `val MAE` 双双显著劣于 `ridge/history_profile` 基线，或预测坍缩，如 `733`）时，才启动候选 `"scaled"` 重训；③ 候选 `"scaled"` 在 `val` 验证集（严禁看 `test`）与刚跑完的 `"raw"` 正面对决，**必须同时满足「`val MAE` 实质改善（相对下降 ≥5%）」与「`val F1` 不退化（跌幅 ≤0.015）」才打印红色高亮日志切换为 `"scaled"`**（若像 `778` 出现关机虚报激增、`val F1` 下跌超限，则自动拒绝切换并保留抗漂移的 `"raw"`）；推理自动继承训练产物模式。也可手工指定 `"raw"` 或 `"scaled"` 锁死（切换后须加 `--force` 重训重推）。
-* `post_min_on 1` 去 <1 窗的抖动（恒空操作，防短闪），`post_fill_short_off 3` 填 ≤45min 的短关断。
+* `post_min_on` 与 `post_fill_short_off` 支持 `"auto"`（`auto_run_steps2to5.py` 新用户默认 `"auto"`，未写时保持历史硬编码默认 `1/3` 向后兼容，显式整数 `0..96` 100% 优先且二者可独立解耦配置）：配置 `"auto"` 时执行**零泄漏两阶段自动确定**——① **阶段一（训练连续时间块真值物理定界）**：在非测试集连续 `15min` 时间块真值上统计开态游程与日内短关态游程，用真值自回放约束（`GT_On_Loss(m) ≤ 0.5%` 锁死 $M_{\max}$；`GT_Bridge_Ratio(k) ≤ 1.0%` 及日内真停机桥接率锁死 $K_{\max}$）为间歇循环/午休停机负荷收窄 $K_{\max}$、为连续长班次工业机组放开 $M_{\max}$；② **阶段二（验证集按模型协同校准 + 奥卡姆正则）**：在安全盒 $\{ \le M_{\max} \} \times \{ \le K_{\max} \}$ 内与 `decision_thr_w` 协同寻优，施加召回护栏（`≥0.95`）、**全关日防桥接护栏**（`off_day_fp(c,m,k) ≤ off_day_fp(c,m,0)`）与惰性保持门（无实质增益保持锚点 `(1, min(3, K_max))`），推理阶段按模型自动继承并支持双链收口同步（`--stage sync-thr [--min-on M] [--fill-off K]`）。
 * `day_gate true` 全局默认（优先级 `day > train_range > full`），`min_on_day_ratio 0.2` 防“无可学开机模式”（2844旧池 31%→71%已验）。
 * `train/include` 为闭区间，`YYYY-MM-DD` 自动扩到 00:00-23:59:59。
 

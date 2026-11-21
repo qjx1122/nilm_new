@@ -201,3 +201,47 @@ def test_on_thr_and_decision_thr_auto_contract():
             resolve_user_config(UK, cb)
 
 
+# ---------------------------------------------------------------- post_min_on / post_fill_short_off auto 与向后兼容
+def test_postprocess_params_auto_and_explicit_contract():
+    """验证 post_min_on 与 post_fill_short_off 支持 'auto'、独立混合配置、null 回退及严格整数校验。"""
+    # 1) 未写时保持历史硬编码默认 1 / 3（100% 向后兼容）
+    m0 = resolve_user_config(UK, {UK: {}})
+    assert m0["post_min_on"] == 1 and isinstance(m0["post_min_on"], int)
+    assert m0["post_fill_short_off"] == 3 and isinstance(m0["post_fill_short_off"], int)
+
+    # 2) 支持大小写无关的 "auto"，以及一个显式整数 + 一个 "auto" 独立解耦配置
+    c1 = _cfg()
+    c1[UK]["post_min_on"] = "AUTO"
+    c1[UK]["post_fill_short_off"] = 0
+    m1 = resolve_user_config(UK, c1)
+    assert m1["post_min_on"] == "auto"
+    assert m1["post_fill_short_off"] == 0 and isinstance(m1["post_fill_short_off"], int)
+
+    c1b = _cfg()
+    c1b["_default"]["post_min_on"] = "auto"
+    c1b["_default"]["post_fill_short_off"] = "Auto"
+    c1b[UK]["post_min_on"] = 4
+    m1b = resolve_user_config(UK, c1b)
+    assert m1b["post_min_on"] == 4
+    assert m1b["post_fill_short_off"] == "auto"
+    assert m1b["_provenance"]["post_min_on"] == UK
+    assert m1b["_provenance"]["post_fill_short_off"] == "_default"
+
+    # 3) 显式 null 回退硬编码默认 1 / 3
+    c2 = _cfg()
+    c2[UK]["post_min_on"] = None
+    c2[UK]["post_fill_short_off"] = None
+    m2 = resolve_user_config(UK, c2)
+    assert m2["post_min_on"] == 1
+    assert m2["post_fill_short_off"] == 3
+
+    # 4) 拒绝布尔、非整浮点、越界整数（<0 或 >96）与未知字符串
+    for key in ("post_min_on", "post_fill_short_off"):
+        for bad in ("invalid", "on_thr", -1, 97, 1.5, True, False):
+            cb = _cfg()
+            cb[UK][key] = bad
+            with pytest.raises(UserConfigError, match=key):
+                resolve_user_config(UK, cb)
+
+
+

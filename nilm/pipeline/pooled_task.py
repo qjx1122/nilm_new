@@ -34,6 +34,7 @@ from nilm.models import MODEL_REGISTRY
 from nilm.models.base import BaseModel
 from nilm.models.constraints import apply_constraints
 from nilm.pipeline.auto_thresholds import (
+    resolve_infer_postprocess_params,
     resolve_infer_thresholds,
     resolve_train_on_thr_w,
 )
@@ -541,15 +542,19 @@ def run_pooled_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         pred = apply_constraints(pred[:, None], valid["pbus"].to_numpy() * pre["cap"],
                                  nonnegative=not allow_negative, sum_consistency=False)[:, 0]
 
+        user_post_proxy = (meta.get("postprocess_map") or {}).get(user_key) or {}
         user_meta_proxy = {
             "on_thr_w": (meta.get("on_thr_map") or {}).get(user_key, pre["on_thr_w"]),
             "decision_thr_w": (meta.get("decision_thr_map") or {}).get(user_key),
+            "post_min_on": user_post_proxy.get("post_min_on"),
+            "post_fill_short_off": user_post_proxy.get("post_fill_short_off"),
         }
         on_thr, dec_thr, _ = resolve_infer_thresholds(
             user_key, user_cfg, user_meta_proxy, model_name=model_name
         )
-        post_min_on = int(user_cfg.get("post_min_on", 1))
-        post_fill_off = int(user_cfg.get("post_fill_short_off", 3))
+        post_min_on, post_fill_off, postproc_info = resolve_infer_postprocess_params(
+            user_key, user_cfg, user_meta_proxy, model_name=model_name
+        )
         pred_state = postprocess_state(pred, dec_thr, post_min_on, post_fill_off)
         pred_prob = state_probability(pred, dec_thr)
 
@@ -581,6 +586,9 @@ def run_pooled_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": "infer", "model": model_name,
             "universal_dir": str(train_dir), "cap": pre["cap"], "n_points": len(valid),
+            "on_thr_w": on_thr, "decision_thr_w": dec_thr,
+            "post_min_on": post_min_on, "post_fill_short_off": post_fill_off,
+            "postprocess": postproc_info,
             "finished_at": datetime.now().isoformat(timespec="seconds"),
         })
         (out / DONE_MARKER).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")

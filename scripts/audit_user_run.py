@@ -77,6 +77,54 @@ def _find_user_dir(run_root: Path, user_key: str | None) -> Path:
     return cands[0]
 
 
+def _resolve_stage_post_params(
+    stage_dir: Path | None,
+    cli_min_on: int | None,
+    cli_fill_off: int | None,
+) -> tuple[int, int]:
+    """按阶段解析审计用 (post_min_on, post_fill_short_off)：
+    显式 CLI 参数 > stage_dir/meta.json > metrics_daily_chain.csv > state_strategy_metrics.csv > 兜底 (1, 3)。
+    """
+    mo = cli_min_on
+    fo = cli_fill_off
+    if stage_dir is not None and (mo is None or fo is None):
+        meta_p = stage_dir / "meta.json"
+        if meta_p.exists():
+            try:
+                meta = json.loads(meta_p.read_text(encoding="utf-8"))
+                m_val = meta.get("post_min_on")
+                k_val = meta.get("post_fill_short_off")
+                if mo is None and isinstance(m_val, int) and not isinstance(m_val, bool):
+                    mo = int(m_val)
+                if fo is None and isinstance(k_val, int) and not isinstance(k_val, bool):
+                    fo = int(k_val)
+            except Exception:  # noqa: BLE001
+                pass
+        chain_p = stage_dir / "metrics_daily_chain.csv"
+        if (mo is None or fo is None) and chain_p.exists():
+            try:
+                cdf = pd.read_csv(chain_p)
+                if mo is None and "post_min_on" in cdf.columns and cdf["post_min_on"].nunique() == 1:
+                    mo = int(cdf["post_min_on"].iloc[0])
+                if fo is None and "post_fill_short_off" in cdf.columns and cdf["post_fill_short_off"].nunique() == 1:
+                    fo = int(cdf["post_fill_short_off"].iloc[0])
+            except Exception:  # noqa: BLE001
+                pass
+        strat_p = stage_dir / "state_strategy_metrics.csv"
+        if (mo is None or fo is None) and strat_p.exists():
+            try:
+                sdf = pd.read_csv(strat_p)
+                dr = sdf[sdf["strategy"] == "decision+runs"]
+                if len(dr) > 0:
+                    if mo is None and "post_min_on" in dr.columns and dr["post_min_on"].nunique() == 1:
+                        mo = int(dr["post_min_on"].iloc[0])
+                    if fo is None and "post_fill_short_off" in dr.columns and dr["post_fill_short_off"].nunique() == 1:
+                        fo = int(dr["post_fill_short_off"].iloc[0])
+            except Exception:  # noqa: BLE001
+                pass
+    return (1 if mo is None else int(mo)), (3 if fo is None else int(fo))
+
+
 def audit_train(tdir: Path | None, min_on: int, fill_off: int) -> None:
     print("== TRAIN ==")
     if tdir is None:
@@ -109,6 +157,10 @@ def audit_train(tdir: Path | None, min_on: int, fill_off: int) -> None:
     if has_counts and len(raw) == 1 and len(test_row) == 1:
         match = all(int(raw.iloc[0][c]) == int(test_row.iloc[0][c]) for c in ("tp", "fp", "fn"))
         _ok(match, "state_strategy raw 行 == metrics_by_split test 行（跨产物对账）")
+    dr_rows = sdf[sdf["strategy"] == "decision+runs"]
+    if len(dr_rows) > 0 and "post_min_on" in dr_rows.columns and "post_fill_short_off" in dr_rows.columns:
+        _ok(bool((dr_rows["post_min_on"] == min_on).all() and (dr_rows["post_fill_short_off"] == fill_off).all()),
+            f"state_strategy decision+runs 游程参数一致（min_on={min_on}, fill_off={fill_off}）")
     for _, r in sdf.iterrows():
         print(f"  · strategy {r['strategy']}@{r['decision_thr_w']:g} [{r['scope']}]: "
               f"tp={r['tp']} fp={r['fp']} fn={r['fn']} f1={r['f1']}")
@@ -309,8 +361,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="单用户 run 产物一键审计")
     ap.add_argument("--run-root", required=True, help="输出根目录：可为用户目录本身（如 outputs/<user> 含 train/infer）或父目录（如 outputs 需配合 --user-key）")
     ap.add_argument("--user-key", default=None, help="用户目录名（单用户时可省略）")
-    ap.add_argument("--min-on", type=int, default=1)
-    ap.add_argument("--fill-off", type=int, default=3)
+    ap.add_argument("--min-on", type=int, default=None,
+                    help="覆盖 post_min_on；未传则按阶段自动从 meta.json / metrics_daily_chain.csv 读取（兜底 1）")
+    ap.add_argument("--fill-off", type=int, default=None,
+                    help="覆盖 post_fill_short_off；未传则按阶段自动从 meta.json / metrics_daily_chain.csv 读取（兜底 3）")
     ap.add_argument("--expect-n", type=int, default=None, help="期望 inference 行数")
     ap.add_argument("--expect-confusion", default=None, help="期望总混淆 tp,fp,fn,tn")
     ap.add_argument("--expect-off-day-fp", type=int, default=None)
@@ -320,8 +374,12 @@ def main(argv: list[str] | None = None) -> int:
     FAILS.clear()
     udir = _find_user_dir(Path(args.run_root), args.user_key)
     print(f"审计: {args.run_root} / {udir.name}")
-    audit_train(_latest(udir, "train"), args.min_on, args.fill_off)
-    audit_infer(_latest(udir, "infer"), args.min_on, args.fill_off, args)
+    tdir = _latest(udir, "train")
+    idir = _latest(udir, "infer")
+    tr_min_on, tr_fill_off = _resolve_stage_post_params(tdir, args.min_on, args.fill_off)
+    in_min_on, in_fill_off = _resolve_stage_post_params(idir, args.min_on, args.fill_off)
+    audit_train(tdir, tr_min_on, tr_fill_off)
+    audit_infer(idir, in_min_on, in_fill_off, args)
     n_fail = len(FAILS)
     print(f"\n== 审计结果: {'全部通过 ✅' if n_fail == 0 else f'{n_fail} 项未过 ❌'} ==")
     return 1 if n_fail else 0

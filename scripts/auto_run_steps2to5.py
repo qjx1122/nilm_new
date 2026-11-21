@@ -86,13 +86,26 @@ def _parse_decision_thr_arg(val: str):
         raise argparse.ArgumentTypeError(f"--decision-thr 须为正数、'auto' 或 'on_thr': {val!r}") from e
 
 
+def _parse_postproc_arg(val: str):
+    norm = val.strip().lower()
+    if norm == "auto":
+        return "auto"
+    try:
+        iv = int(val)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"游程参数须为 0..96 整数或 'auto': {val!r}") from e
+    if iv < 0 or iv > 96:
+        raise argparse.ArgumentTypeError(f"游程参数须在 0..96 范围内: {iv}")
+    return iv
+
+
 def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None,
-                       decision_thr=None, pbus_mode=None) -> Path:
+                       decision_thr=None, pbus_mode=None, min_on=None, fill_off=None) -> Path:
     """已有用户：脚本参数优先但不写回（overlay）；新用户：补原文件（带备份）。
 
     返回本次运行实际使用的配置路径：已有用户无覆盖返回原文件，有覆盖返回
-    overlay；新用户写回原文件后返回原文件。target_col/on_thr/decision_thr/pbus_mode
-    为 None 表示未传，沿用配置值；新用户未传则默认 p1 / auto / auto / auto。
+    overlay；新用户写回原文件后返回原文件。target_col/on_thr/decision_thr/pbus_mode/
+    min_on/fill_off 为 None 表示未传，沿用配置值；新用户未传则默认 p1 / auto / auto / auto / auto / auto。
     """
     cfg = json.loads(tf_path.read_text(encoding="utf-8"))
     if user_key in cfg:
@@ -107,8 +120,14 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         eff_cur_pbus = cur.get("pbus_mode") or "auto"
         if pbus_mode is not None and eff_cur_pbus != pbus_mode:
             updates["pbus_mode"] = pbus_mode
+        if min_on is not None and cur.get("post_min_on") != min_on:
+            updates["post_min_on"] = min_on
+        if fill_off is not None and cur.get("post_fill_short_off") != fill_off:
+            updates["post_fill_short_off"] = fill_off
         if not updates:
-            log(f"time_filters.json 已含 {user_key} → 沿用（target={cur.get('target_col')} on={cur.get('on_thr_w')} dec={cur.get('decision_thr_w')} pbus_mode={eff_cur_pbus})")
+            log(f"time_filters.json 已含 {user_key} → 沿用（target={cur.get('target_col')} on={cur.get('on_thr_w')} "
+                f"dec={cur.get('decision_thr_w')} pbus_mode={eff_cur_pbus} "
+                f"min_on={cur.get('post_min_on', 1)} fill_off={cur.get('post_fill_short_off', 3)})")
             return tf_path
         old = {k: cur.get(k) for k in updates}
         cur.update(updates)
@@ -120,14 +139,16 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         "on_thr_w": on_thr if on_thr is not None else "auto",
         "decision_thr_w": decision_thr if decision_thr is not None else "auto",
         "pbus_mode": pbus_mode if pbus_mode is not None else "auto",
-        "post_min_on": 1,
-        "post_fill_short_off": 3,
+        "post_min_on": min_on if min_on is not None else "auto",
+        "post_fill_short_off": fill_off if fill_off is not None else "auto",
         "quality": {"day_gate": True, "min_on_day_ratio": 0.2},
         "train": {"include": [["2025-07-10","2026-06-30"]]},
         "infer": {"include": [["2026-07-01","2026-07-31"]]}
     }
     bak = _write_cfg_with_backup(tf_path, cfg)
-    log(f"新用户 {user_key} → 已补原 time_filters.json（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} dec={cfg[user_key]['decision_thr_w']} pbus_mode={cfg[user_key]['pbus_mode']}），原文件备份 {bak.name}", "WARN")
+    log(f"新用户 {user_key} → 已补原 time_filters.json（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} "
+        f"dec={cfg[user_key]['decision_thr_w']} pbus_mode={cfg[user_key]['pbus_mode']} "
+        f"min_on={cfg[user_key]['post_min_on']} fill_off={cfg[user_key]['post_fill_short_off']}），原文件备份 {bak.name}", "WARN")
     log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）", "WARN")
     return tf_path
 
@@ -202,11 +223,13 @@ def step_sync_decision_thr(
     orig_tf: Path,
     stage: str,
     explicit_dec_arg=None,
+    explicit_min_on_arg=None,
+    explicit_fill_off_arg=None,
     target_col_arg=None,
     pbus_mode_arg=None,
     save_config: bool = False,
 ) -> dict | None:
-    """零重训收口同步 train 与 infer 的 decision_thr_w（支持 auto 双链联合寻优与显式数值同步）。"""
+    """零重训收口同步 train 与 infer 的 decision_thr_w 与游程参数（支持 auto 双链联合寻优与显式数值同步）。"""
     from nilm.common.logging import get_logger, yellow_text
     from nilm.pipeline.auto_thresholds import (
         calibrate_and_sync_joint_decision_thr,
@@ -222,29 +245,51 @@ def step_sync_decision_thr(
     inf_dir = latest_done_dir(out_root / user_key / "infer")
 
     eff_dec_cfg = explicit_dec_arg
-    if eff_dec_cfg is None and effective_tf.exists():
+    eff_min_on_cfg = explicit_min_on_arg
+    eff_fill_off_cfg = explicit_fill_off_arg
+    if effective_tf.exists():
         raw_cfg = load_time_filter_config(effective_tf)
-        eff_dec_cfg = resolve_user_config(user_key, raw_cfg).get("decision_thr_w", "auto")
+        rcfg = resolve_user_config(user_key, raw_cfg)
+        if eff_dec_cfg is None:
+            eff_dec_cfg = rcfg.get("decision_thr_w", "auto")
+        if eff_min_on_cfg is None:
+            eff_min_on_cfg = rcfg.get("post_min_on", 1)
+        if eff_fill_off_cfg is None:
+            eff_fill_off_cfg = rcfg.get("post_fill_short_off", 3)
+
+    has_explicit_num_dec = isinstance(explicit_dec_arg, (int, float)) and not isinstance(explicit_dec_arg, bool)
+    has_explicit_num_mo = isinstance(explicit_min_on_arg, int) and not isinstance(explicit_min_on_arg, bool)
+    has_explicit_num_fo = isinstance(explicit_fill_off_arg, int) and not isinstance(explicit_fill_off_arg, bool)
 
     sync_out: dict | None = None
-    if stage == "sync-thr" and isinstance(explicit_dec_arg, (int, float)) and not isinstance(explicit_dec_arg, bool):
+    if stage == "sync-thr" and (has_explicit_num_dec or has_explicit_num_mo or has_explicit_num_fo):
         if tr_dir is None and inf_dir is None:
             log(f"sync-thr 跳过：未找到 {user_key} 的已完成 train/infer 产物", "WARN")
             return None
+        tr_meta_tmp = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8")) if (tr_dir and (tr_dir / "meta.json").exists()) else {}
+        inf_meta_tmp = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8")) if (inf_dir and (inf_dir / "meta.json").exists()) else {}
+        target_dec = (
+            float(explicit_dec_arg)
+            if has_explicit_num_dec
+            else float(inf_meta_tmp.get("decision_thr_w", tr_meta_tmp.get("decision_thr_w", 10.0)))
+        )
         sync_out = sync_decision_thr_artifacts(
             user_key=user_key,
             train_dir=tr_dir,
             infer_dir=inf_dir,
-            new_dec_thr=float(explicit_dec_arg),
+            new_dec_thr=target_dec,
             reason="explicit_sync",
+            new_post_min_on=int(explicit_min_on_arg) if has_explicit_num_mo else None,
+            new_post_fill_short_off=int(explicit_fill_off_arg) if has_explicit_num_fo else None,
         )
         ulog.warning("%s", yellow_text(
             f"[{user_key}] [DEC-THR-SYNC] 已按显式参数零重训同步刷新双侧产物 -> "
-            f"decision_thr_w={float(explicit_dec_arg):.4g} "
-            f"(train: {sync_out.get('previous_train_decision_thr_w')}->{float(explicit_dec_arg):.4g}, "
-            f"infer: {sync_out.get('previous_infer_decision_thr_w')}->{float(explicit_dec_arg):.4g})"
+            f"decision_thr_w={target_dec:.4g}, post_min_on={sync_out.get('new_post_min_on')}, "
+            f"post_fill_short_off={sync_out.get('new_post_fill_short_off')} "
+            f"(train: {sync_out.get('previous_train_decision_thr_w')}->{target_dec:.4g}, "
+            f"infer: {sync_out.get('previous_infer_decision_thr_w')}->{target_dec:.4g})"
         ))
-    elif eff_dec_cfg == "auto":
+    elif eff_dec_cfg == "auto" or eff_min_on_cfg == "auto" or eff_fill_off_cfg == "auto":
         if tr_dir is not None and inf_dir is not None:
             sync_out = calibrate_and_sync_joint_decision_thr(user_key, tr_dir, inf_dir)
         elif stage == "sync-thr":
@@ -262,10 +307,20 @@ def step_sync_decision_thr(
         if isinstance(tr_meta.get("on_thr_w"), (int, float)):
             entry["on_thr_w"] = float(tr_meta["on_thr_w"])
         final_dec = inf_meta.get("decision_thr_w", tr_meta.get("decision_thr_w"))
-        if isinstance(explicit_dec_arg, (int, float)) and not isinstance(explicit_dec_arg, bool):
+        if has_explicit_num_dec:
             final_dec = float(explicit_dec_arg)
         if isinstance(final_dec, (int, float)):
             entry["decision_thr_w"] = float(final_dec)
+        final_mo = inf_meta.get("post_min_on", tr_meta.get("post_min_on"))
+        if has_explicit_num_mo:
+            final_mo = int(explicit_min_on_arg)
+        if isinstance(final_mo, int) and not isinstance(final_mo, bool):
+            entry["post_min_on"] = int(final_mo)
+        final_fo = inf_meta.get("post_fill_short_off", tr_meta.get("post_fill_short_off"))
+        if has_explicit_num_fo:
+            final_fo = int(explicit_fill_off_arg)
+        if isinstance(final_fo, int) and not isinstance(final_fo, bool):
+            entry["post_fill_short_off"] = int(final_fo)
         if pbus_mode_arg is not None:
             entry["pbus_mode"] = pbus_mode_arg
         elif tr_meta.get("pbus_mode") and "pbus_mode" not in entry:
@@ -273,8 +328,9 @@ def step_sync_decision_thr(
         cfg_disk[user_key] = entry
         bak = _write_cfg_with_backup(orig_tf, cfg_disk)
         ulog.warning("%s", yellow_text(
-            f"[{user_key}] [AUTO-SAVE-CONFIG] 已固化阈值至 {orig_tf.name} "
+            f"[{user_key}] [AUTO-SAVE-CONFIG] 已固化阈值与后处理参数至 {orig_tf.name} "
             f"(on_thr_w={entry.get('on_thr_w')}, decision_thr_w={entry.get('decision_thr_w')}, "
+            f"post_min_on={entry.get('post_min_on')}, post_fill_short_off={entry.get('post_fill_short_off')}, "
             f"pbus_mode={entry.get('pbus_mode')}；原配置已备份至 {bak.name})"
         ))
 
@@ -353,10 +409,14 @@ def main(argv=None):
                     help="on_thr_w（支持正数或 'auto'）；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 auto）")
     ap.add_argument("--decision-thr", type=_parse_decision_thr_arg, default=None,
                     help="decision_thr_w（支持正数、'auto' 或 'on_thr'）；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 auto）")
+    ap.add_argument("--min-on", type=_parse_postproc_arg, default=None,
+                    help="post_min_on（支持 0..96 整数或 'auto'）；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 auto）")
+    ap.add_argument("--fill-off", type=_parse_postproc_arg, default=None,
+                    help="post_fill_short_off（支持 0..96 整数或 'auto'）；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 auto）")
     ap.add_argument("--pbus-mode", choices=["auto", "raw", "scaled"], default=None,
                     help="pbus_mode（auto=默认先试raw+欠拟合经val双向验收后红色熔断切scaled，默认；raw=锁死未缩放+分摊；scaled=锁死z-score+改学）")
     ap.add_argument("--stage", choices=["all","train","infer","threshold","sync-thr"], default="all",
-                    help="all=2+3+5+双链收口+4 完整；threshold=仅 Step4；sync-thr=零重训同步刷新 train+infer 的 decision_thr_w")
+                    help="all=2+3+5+双链收口+4 完整；threshold=仅 Step4；sync-thr=零重训同步刷新 train+infer 的 decision_thr_w 与游程参数")
     ap.add_argument("--save-config", action="store_true",
                     help="将最终定稿的阈值写回原 time_filters.json（自动备份 .bak.auto），消除 overlay 与原配置差异")
     ap.add_argument("--force", action="store_true", help="--force 忽略 _DONE 重跑")
@@ -375,7 +435,8 @@ def main(argv=None):
     effective_tf = tf
     if args.stage in ("all","train","infer"):
         effective_tf = ensure_user_config(user_key, tf, args.target_col, args.on_thr,
-                                          args.decision_thr, args.pbus_mode)
+                                          args.decision_thr, args.pbus_mode,
+                                          args.min_on, args.fill_off)
 
     if args.stage in ("all","train") and not args.skip_train:
         step2_train(user_key, effective_tf, base, data_root, out_root, args.force)
@@ -396,6 +457,8 @@ def main(argv=None):
             orig_tf=tf,
             stage=args.stage,
             explicit_dec_arg=args.decision_thr,
+            explicit_min_on_arg=args.min_on,
+            explicit_fill_off_arg=args.fill_off,
             target_col_arg=args.target_col,
             pbus_mode_arg=args.pbus_mode,
             save_config=args.save_config,
@@ -408,6 +471,8 @@ def main(argv=None):
             orig_tf=tf,
             stage=args.stage,
             explicit_dec_arg=args.decision_thr,
+            explicit_min_on_arg=args.min_on,
+            explicit_fill_off_arg=args.fill_off,
             target_col_arg=args.target_col,
             pbus_mode_arg=args.pbus_mode,
             save_config=True,

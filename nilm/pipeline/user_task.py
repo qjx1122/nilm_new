@@ -39,8 +39,12 @@ from nilm.pipeline.auto_thresholds import (
     UPPER_ON_P10_RATIO,
     check_offline_decision_drift,
     log_auto_decision_thr_train,
+    log_auto_postprocess_train,
     resolve_auto_decision_thr_w,
+    resolve_auto_postprocess_and_decision_thr,
+    resolve_infer_postprocess_params,
     resolve_infer_thresholds,
+    resolve_postprocess_physical_bounds,
     resolve_train_on_thr_w,
     select_calibration_model_zero_leakage,
 )
@@ -742,8 +746,21 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             }
 
         cfg_dec_thr_raw = user_cfg.get("decision_thr_w", "auto")
-        post_min_on = int(user_cfg["post_min_on"])
-        post_fill_off = int(user_cfg["post_fill_short_off"])
+        cfg_post_min_on_raw = user_cfg.get("post_min_on", 1)
+        cfg_post_fill_off_raw = user_cfg.get("post_fill_short_off", 3)
+        postproc_is_auto = (
+            (isinstance(cfg_post_min_on_raw, str) and cfg_post_min_on_raw.strip().lower() == "auto")
+            or (isinstance(cfg_post_fill_off_raw, str) and cfg_post_fill_off_raw.strip().lower() == "auto")
+        )
+        non_test_mask = ~masks["test"].to_numpy()
+        postproc_bounds = (
+            resolve_postprocess_physical_bounds(
+                y.to_numpy(np.float64)[non_test_mask],
+                f.index[non_test_mask],
+                on_thr_w=on_thr,
+            )
+            if postproc_is_auto else None
+        )
         mp_override = user_cfg.get("model_params") or {}
 
         def _run_pbus_mode_pass(eff_mode: str):
@@ -824,36 +841,21 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                                 "任何开机点，勿用于推理", user_key, name, band_sp, on_thr)
                 res_local[name] = res_by_sp_local[name]["test"]
 
-            # 零泄漏解析本趟 decision_thr_w：显式数值优先；auto 时仅在 val（空则 train）上校准
-            prov_dec = (user_cfg.get("_provenance") or {}).get("decision_thr_w", "default(硬编码)")
-            if isinstance(cfg_dec_thr_raw, (int, float)) and not isinstance(cfg_dec_thr_raw, bool):
-                dec_thr_local = float(cfg_dec_thr_raw)
-                model_dec_map_local = {m: dec_thr_local for m in fitted_models_local}
-                dec_decision_local = {
-                    "configured": dec_thr_local,
-                    "resolved_decision_thr_w": dec_thr_local,
-                    "stage": "explicit",
-                    "confidence": "explicit",
-                    "provenance": prov_dec,
-                    "reasons": ["EXPLICIT_USER_CONFIG"],
-                }
-            elif isinstance(cfg_dec_thr_raw, str) and cfg_dec_thr_raw.strip().lower() == "on_thr":
-                dec_thr_local = float(on_thr)
-                model_dec_map_local = {m: dec_thr_local for m in fitted_models_local}
-                dec_decision_local = {
-                    "configured": "on_thr",
-                    "resolved_decision_thr_w": dec_thr_local,
-                    "stage": "explicit_on_thr",
-                    "confidence": "explicit",
-                    "provenance": prov_dec,
-                    "reasons": ["EXPLICIT_LOCK_ON_THR"],
-                }
-            else:
+            # 零泄漏解析本趟 (decision_thr_w, post_min_on, post_fill_short_off)：
+            # 显式数值 100% 优先；auto 时基于阶段一物理上界 (M_max, K_max) 在 val（空则 train）上校准
+            prov_map = user_cfg.get("_provenance") or {}
+            prov_dec = prov_map.get("decision_thr_w", "default(硬编码)")
+            prov_min_on = prov_map.get("post_min_on", "default(硬编码)")
+            prov_fill_off = prov_map.get("post_fill_short_off", "default(硬编码)")
+
+            if postproc_is_auto:
                 cal_model = select_calibration_model_zero_leakage(
                     user_cfg, base_cfg, res_by_sp_local, split_bands_local, on_thr
                 )
                 model_dec_map_local = {}
+                model_postproc_map_local: dict[str, dict[str, int]] = {}
                 per_model_dec_info: dict[str, dict] = {}
+                per_model_postproc_info: dict[str, dict] = {}
                 y_tr_1d = sc_splits["train"][1][:, 0]
                 y_va_1d = sc_splits["val"][1][:, 0] if len(sc_splits["val"][0]) > 0 else np.array([], dtype=np.float64)
                 idx_va = splits["val"][2] if len(sc_splits["val"][0]) > 0 else None
@@ -865,24 +867,45 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     p_tr_1d = (raw_preds_by_sp_local[mname]["train"][:, 0]
                                if "train" in raw_preds_by_sp_local[mname]
                                else None)
-                    m_thr, m_info = resolve_auto_decision_thr_w(
+                    m_thr, m_mo, m_fo, m_dec_info, m_pp_info = resolve_auto_postprocess_and_decision_thr(
                         y_train=y_tr_1d,
                         y_val=y_va_1d,
                         pred_val=p_va_1d,
                         val_index=idx_va,
                         on_thr_w=on_thr,
-                        post_min_on=post_min_on,
-                        post_fill_off=post_fill_off,
+                        cfg_decision_thr_w=cfg_dec_thr_raw,
+                        cfg_post_min_on=cfg_post_min_on_raw,
+                        cfg_post_fill_off=cfg_post_fill_off_raw,
+                        bounds=postproc_bounds,
                         pred_train=p_tr_1d,
                         train_index=idx_tr,
                         calibrated_model=mname,
                         pbus_mode=eff_mode,
                     )
                     model_dec_map_local[mname] = m_thr
-                    per_model_dec_info[mname] = m_info
+                    model_postproc_map_local[mname] = {
+                        "post_min_on": int(m_mo),
+                        "post_fill_short_off": int(m_fo),
+                    }
+                    per_model_dec_info[mname] = m_dec_info
+                    per_model_postproc_info[mname] = m_pp_info
+
+                default_mo = 1 if cfg_post_min_on_raw == "auto" else int(cfg_post_min_on_raw)
+                default_fo = (
+                    int(min(3, postproc_bounds["k_max"]))
+                    if (cfg_post_fill_off_raw == "auto" and postproc_bounds is not None)
+                    else (3 if cfg_post_fill_off_raw == "auto" else int(cfg_post_fill_off_raw))
+                )
                 dec_thr_local = float(model_dec_map_local.get(cal_model, on_thr))
+                cal_pp = model_postproc_map_local.get(cal_model) or {
+                    "post_min_on": default_mo,
+                    "post_fill_short_off": default_fo,
+                }
+                post_min_on_local = int(cal_pp["post_min_on"])
+                post_fill_off_local = int(cal_pp["post_fill_short_off"])
+
                 dec_decision_local = dict(per_model_dec_info.get(cal_model, {
-                    "configured": "auto",
+                    "configured": cfg_dec_thr_raw,
                     "resolved_decision_thr_w": dec_thr_local,
                     "stage": "auto_fallback_on_thr",
                     "confidence": "low",
@@ -892,7 +915,105 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 dec_decision_local["provenance"] = prov_dec
                 dec_decision_local["model_decision_thr_w"] = model_dec_map_local
 
-            # 统一使用本趟最终敲定的单值 dec_thr_local 生成判决链（保证 T3/T4 跨产物逐位一致）
+                postproc_decision_local = dict(per_model_postproc_info.get(cal_model, {
+                    "configured_post_min_on": cfg_post_min_on_raw,
+                    "configured_post_fill_short_off": cfg_post_fill_off_raw,
+                    "resolved_post_min_on": post_min_on_local,
+                    "resolved_post_fill_short_off": post_fill_off_local,
+                    "stage": "auto_fallback_anchor",
+                    "confidence": "low",
+                    "calibrated_model": cal_model,
+                    "reasons": ["NO_MODEL_AVAILABLE"],
+                }))
+                postproc_decision_local["provenance"] = {
+                    "post_min_on": prov_min_on,
+                    "post_fill_short_off": prov_fill_off,
+                }
+                postproc_decision_local["model_postprocess_params"] = model_postproc_map_local
+            else:
+                post_min_on_local = int(cfg_post_min_on_raw)
+                post_fill_off_local = int(cfg_post_fill_off_raw)
+                model_postproc_map_local = {
+                    m: {"post_min_on": post_min_on_local, "post_fill_short_off": post_fill_off_local}
+                    for m in fitted_models_local
+                }
+                postproc_decision_local = {
+                    "configured_post_min_on": post_min_on_local,
+                    "configured_post_fill_short_off": post_fill_off_local,
+                    "resolved_post_min_on": post_min_on_local,
+                    "resolved_post_fill_short_off": post_fill_off_local,
+                    "stage": "explicit",
+                    "confidence": "explicit",
+                    "provenance": {"post_min_on": prov_min_on, "post_fill_short_off": prov_fill_off},
+                    "reasons": ["EXPLICIT_OR_DEFAULT_INT"],
+                }
+                if isinstance(cfg_dec_thr_raw, (int, float)) and not isinstance(cfg_dec_thr_raw, bool):
+                    dec_thr_local = float(cfg_dec_thr_raw)
+                    model_dec_map_local = {m: dec_thr_local for m in fitted_models_local}
+                    dec_decision_local = {
+                        "configured": dec_thr_local,
+                        "resolved_decision_thr_w": dec_thr_local,
+                        "stage": "explicit",
+                        "confidence": "explicit",
+                        "provenance": prov_dec,
+                        "reasons": ["EXPLICIT_USER_CONFIG"],
+                    }
+                elif isinstance(cfg_dec_thr_raw, str) and cfg_dec_thr_raw.strip().lower() == "on_thr":
+                    dec_thr_local = float(on_thr)
+                    model_dec_map_local = {m: dec_thr_local for m in fitted_models_local}
+                    dec_decision_local = {
+                        "configured": "on_thr",
+                        "resolved_decision_thr_w": dec_thr_local,
+                        "stage": "explicit_on_thr",
+                        "confidence": "explicit",
+                        "provenance": prov_dec,
+                        "reasons": ["EXPLICIT_LOCK_ON_THR"],
+                    }
+                else:
+                    cal_model = select_calibration_model_zero_leakage(
+                        user_cfg, base_cfg, res_by_sp_local, split_bands_local, on_thr
+                    )
+                    model_dec_map_local = {}
+                    per_model_dec_info = {}
+                    y_tr_1d = sc_splits["train"][1][:, 0]
+                    y_va_1d = sc_splits["val"][1][:, 0] if len(sc_splits["val"][0]) > 0 else np.array([], dtype=np.float64)
+                    idx_va = splits["val"][2] if len(sc_splits["val"][0]) > 0 else None
+                    idx_tr = splits["train"][2]
+                    for mname in fitted_models_local:
+                        p_va_1d = (raw_preds_by_sp_local[mname]["val"][:, 0]
+                                   if "val" in raw_preds_by_sp_local[mname]
+                                   else np.array([], dtype=np.float64))
+                        p_tr_1d = (raw_preds_by_sp_local[mname]["train"][:, 0]
+                                   if "train" in raw_preds_by_sp_local[mname]
+                                   else None)
+                        m_thr, m_info = resolve_auto_decision_thr_w(
+                            y_train=y_tr_1d,
+                            y_val=y_va_1d,
+                            pred_val=p_va_1d,
+                            val_index=idx_va,
+                            on_thr_w=on_thr,
+                            post_min_on=post_min_on_local,
+                            post_fill_off=post_fill_off_local,
+                            pred_train=p_tr_1d,
+                            train_index=idx_tr,
+                            calibrated_model=mname,
+                            pbus_mode=eff_mode,
+                        )
+                        model_dec_map_local[mname] = m_thr
+                        per_model_dec_info[mname] = m_info
+                    dec_thr_local = float(model_dec_map_local.get(cal_model, on_thr))
+                    dec_decision_local = dict(per_model_dec_info.get(cal_model, {
+                        "configured": "auto",
+                        "resolved_decision_thr_w": dec_thr_local,
+                        "stage": "auto_fallback_on_thr",
+                        "confidence": "low",
+                        "calibrated_model": cal_model,
+                        "reasons": ["NO_MODEL_AVAILABLE"],
+                    }))
+                    dec_decision_local["provenance"] = prov_dec
+                    dec_decision_local["model_decision_thr_w"] = model_dec_map_local
+
+            # 统一使用本趟最终敲定的单值 (dec_thr_local, post_min_on_local, post_fill_off_local) 生成判决链（保证 T3/T4 跨产物逐位一致）
             pred_frames_local: dict[str, pd.DataFrame] = {
                 s: pd.DataFrame({"timestamp": splits[s][2]
                                  .strftime("%Y-%m-%d %H:%M:%S"),
@@ -906,7 +1027,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                         continue
                     y_hat = raw_preds_by_sp_local[name][split]
                     pred_state_arr = postprocess_state(
-                        y_hat[:, 0], dec_thr_local, post_min_on, post_fill_off).astype(int)
+                        y_hat[:, 0], dec_thr_local, post_min_on_local, post_fill_off_local).astype(int)
                     daily_chain = evaluate_daily_chain(
                         sc_splits[split][1], y_hat, pred_state_arr, splits[split][2],
                         metric_names, on_thr_w=on_thr)
@@ -914,8 +1035,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     daily_chain.insert(0, "model", name)
                     daily_chain["state_thr_w"] = on_thr
                     daily_chain["decision_thr_w"] = dec_thr_local
-                    daily_chain["post_min_on"] = post_min_on
-                    daily_chain["post_fill_short_off"] = post_fill_off
+                    daily_chain["post_min_on"] = post_min_on_local
+                    daily_chain["post_fill_short_off"] = post_fill_off_local
                     daily_chain_local.append(daily_chain)
                     pred_frames_local[split][f"pred_{name}"] = y_hat[:, 0]
                     pred_frames_local[split][f"pred_state_{name}"] = pred_state_arr
@@ -924,12 +1045,14 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     res_by_sp_local, daily_local, daily_chain_local,
                     test_preds_local, collapsed_local, pred_frames_local,
                     split_bands_local, dec_thr_local, dec_decision_local,
-                    model_dec_map_local)
+                    model_dec_map_local, post_min_on_local, post_fill_off_local,
+                    postproc_decision_local, model_postproc_map_local)
 
         (scale_cols, scaler, scaled, fitted_models, results, results_by_split,
          daily_rows, daily_chain_rows, test_preds, collapsed_models,
          pred_frames, split_bands, dec_thr, dec_decision,
-         model_dec_map) = _run_pbus_mode_pass(pbus_mode)
+         model_dec_map, post_min_on, post_fill_off,
+         postproc_decision, model_postproc_map) = _run_pbus_mode_pass(pbus_mode)
 
         # 第2–3步闭环（仅 auto 模式）：默认跑完 raw 后，若 train/val 检测到真实欠拟合，
         # 启动候选 scaled 重训并执行验证集双向验收（MAE 实质改善 + F1 不退化，零泄漏禁看 test）：
@@ -946,7 +1069,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 (c_sc_cols, c_scaler, c_scaled, c_models, c_results, c_res_by_sp,
                  c_daily, c_daily_chain, c_test_preds, c_collapsed,
                  c_pred_frames, c_split_bands, c_dec_thr, c_dec_decision,
-                 c_model_dec_map) = cand_bundle
+                 c_model_dec_map, c_post_min_on, c_post_fill_off,
+                 c_postproc_decision, c_model_postproc_map) = cand_bundle
                 accepted, gate_notes = _accept_scaled_candidate(
                     results_by_split, split_bands,
                     c_res_by_sp, c_split_bands,
@@ -971,7 +1095,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     (scale_cols, scaler, scaled, fitted_models, results, results_by_split,
                      daily_rows, daily_chain_rows, test_preds, collapsed_models,
                      pred_frames, split_bands, dec_thr, dec_decision,
-                     model_dec_map) = cand_bundle
+                     model_dec_map, post_min_on, post_fill_off,
+                     postproc_decision, model_postproc_map) = cand_bundle
                 else:
                     log.warning(
                         "[%s] [AUTO-REJECT-SCALED] 候选 pbus_mode=scaled 未通过验证集双向验收"
@@ -980,8 +1105,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     pbus_decision["resolved_mode"] = "raw"
                     pbus_decision["stage"] = "post_fallback_rejected"
 
-        # 最终胜出 pbus_mode 确定后，若 decision_thr_w 配置为 auto，输出一次黄/红提示日志
+        # 最终胜出 pbus_mode 确定后，若 decision_thr_w 或游程参数配置为 auto，输出一次黄/红提示日志
         log_auto_decision_thr_train(user_key, dec_decision)
+        log_auto_postprocess_train(user_key, postproc_decision)
 
         # 最终选定模式落盘：窗口样本索引（§10）与各模型权重
         if split_sizes["train"] >= window:
@@ -1025,8 +1151,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         # 三条策略：raw = 与 metrics_by_split 同口径的对照行（on_thr_w 判决、无游程），
         # 便于跨产物对账；decision+runs = 生产判决链（decision_thr_w + min_on/fill）
         strategies = [("raw_on_thr", on_thr, 0, 0),
-                      ("decision+runs", dec_thr, int(user_cfg["post_min_on"]),
-                       int(user_cfg["post_fill_short_off"]))]
+                      ("decision+runs", dec_thr, post_min_on, post_fill_off)]
         for mname, p in test_preds.items():
             for strat, thr_, mo_, fo_ in strategies:
                 st = postprocess_state(p, thr_, mo_, fo_)
@@ -1059,10 +1184,16 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         dec_thr_note = (f"decision_thr_w={dec_thr} (configured={cfg_dec_thr_raw}, "
                         f"model={dec_decision.get('calibrated_model')})"
                         if cfg_dec_thr_raw == "auto" else f"decision_thr_w={dec_thr}")
+        post_note = (
+            f"post_min_on={post_min_on}, post_fill_short_off={post_fill_off} "
+            f"(configured={cfg_post_min_on_raw}/{cfg_post_fill_off_raw})"
+            if postproc_is_auto
+            else f"post_min_on={post_min_on}, post_fill_short_off={post_fill_off}"
+        )
         write_markdown_report(out, f"{user_key}/train", table, summary,
                               notes=[f"target_col={'+'.join(target_cols)}",
                                      f"split_strategy={user_cfg['split_strategy']}",
-                                     pbus_note, on_thr_note, dec_thr_note])
+                                     pbus_note, on_thr_note, dec_thr_note, post_note])
         best = summary.get("overall_best")
         y_tr_meta = splits["train"][1][:, 0]
         y_tr_on_meta = y_tr_meta[y_tr_meta >= on_thr]
@@ -1093,6 +1224,11 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "train_upper_guard_w": train_upper_guard_w,
             "post_min_on": post_min_on,
             "post_fill_short_off": post_fill_off,
+            "post_min_on_configured": cfg_post_min_on_raw,
+            "post_fill_short_off_configured": cfg_post_fill_off_raw,
+            "postprocess_bounds": postproc_bounds,
+            "postprocess_decision": postproc_decision,
+            "model_postprocess_params": model_postproc_map,
             "quality": {"bus": q_bus, "branch": q_br},
             "identifiable": ident.get("identifiable"),
             "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -1316,8 +1452,9 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 daily["state_thr_w"] = on_thr
                 daily.to_csv(out / "metrics_daily.csv", index=False, encoding="utf-8")
 
-        post_min_on = int(user_cfg["post_min_on"])
-        post_fill_off = int(user_cfg["post_fill_short_off"])
+        post_min_on, post_fill_off, infer_postproc_info = resolve_infer_postprocess_params(
+            user_key, user_cfg, meta, model_name=model_name
+        )
         pred_state = postprocess_state(pred, dec_thr, post_min_on, post_fill_off)
         pred_prob = state_probability(pred, dec_thr)
         # 状态真值：分路真值按同一 on_thr_w 二值化；无真值处为空（NaN）
@@ -1410,6 +1547,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "post_min_on": post_min_on,
             "post_fill_short_off": post_fill_off,
             "thresholds": infer_thr_info,
+            "postprocess": infer_postproc_info,
             "offline_drift_advice": drift_advice,
             "train_dir": str(train_dir), "n_points": len(valid),
             "quality": infer_quality,

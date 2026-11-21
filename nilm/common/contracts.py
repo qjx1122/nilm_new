@@ -146,6 +146,7 @@ SPLIT_STRATEGIES = ("stratified_day", "stratified", "time", "global_stratified",
 PBUS_MODES = ("auto", "raw", "scaled")
 ON_THR_MODES = ("auto",)
 DECISION_THR_MODES = ("auto", "on_thr")
+POSTPROC_MODES = ("auto",)
 
 CONFIG_RULES: dict[str, dict] = {
     # field: default, validator 说明（具体校验见 pipeline/user_config.py）
@@ -167,8 +168,13 @@ CONFIG_RULES: dict[str, dict] = {
     "pbus_mode":             {"default": "auto", "choices": PBUS_MODES},
     "split_ratios":          {"default": [0.6, 0.2, 0.2]},
     "split_strategy":        {"default": "stratified_day", "choices": SPLIT_STRATEGIES},
-    "post_min_on":           {"default": 1, "min": 0},
-    "post_fill_short_off":   {"default": 3, "min": 0},
+    # 游程后处理参数（15min 点数）：支持显式非负整数或 "auto"（两阶段自动定参：
+    # ① 训练全池真值游程画像锁定物理安全上界 (M_max, K_max)；② 验证集带护栏与奥卡姆正则协同寻优；
+    # 硬编码缺省保持 1 / 3 完全向后兼容，显式整数 100% 优先）。
+    "post_min_on":           {"default": 1, "min": 0, "max": 96,
+                              "special_modes": POSTPROC_MODES},
+    "post_fill_short_off":   {"default": 3, "min": 0, "max": 96,
+                              "special_modes": POSTPROC_MODES},
     # 决策阈值（kW）：仅作用于预测功率→开机状态的判决（pred_state/状态策略评估）；
     # 支持显式正数、"auto"（默认：训练阶段在 val 验证集带护栏零泄漏寻优并落盘 meta.json，
     # 推理阶段自动继承，全程输出黄色/红色提示日志；显式数值 100% 优先）或 "on_thr"（锁定沿用 on_thr_w）。

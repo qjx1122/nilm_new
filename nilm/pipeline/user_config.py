@@ -124,8 +124,9 @@ def resolve_user_config(user_key: str, cfg: dict) -> dict:
             merged[k] = v
             provenance[k] = layer_name
 
-    # pbus_mode / on_thr_w / decision_thr_w 显式写 null 时回退硬编码默认值
-    for _null_fallback_key in ("pbus_mode", "on_thr_w", "decision_thr_w"):
+    # pbus_mode / on_thr_w / decision_thr_w / post_min_on / post_fill_short_off 显式写 null 时回退硬编码默认值
+    for _null_fallback_key in ("pbus_mode", "on_thr_w", "decision_thr_w",
+                               "post_min_on", "post_fill_short_off"):
         if merged.get(_null_fallback_key) is None:
             merged[_null_fallback_key] = CONFIG_RULES[_null_fallback_key]["default"]
 
@@ -141,7 +142,13 @@ def resolve_user_config(user_key: str, cfg: dict) -> dict:
                 if not isinstance(merged[field], bool):
                     raise UserConfigError(f"{field} 必须为布尔值")
             elif field in ("post_min_on", "post_fill_short_off"):
-                merged[field] = int(_validate_value(field, merged[field]))
+                val_checked = _validate_value(field, merged[field])
+                if isinstance(val_checked, str):
+                    merged[field] = val_checked
+                else:
+                    if isinstance(merged[field], float) and not merged[field].is_integer():
+                        raise UserConfigError(f"{field} 必须为非负整数或 'auto': {merged[field]!r}")
+                    merged[field] = int(val_checked)
             else:
                 merged[field] = _validate_value(field, merged[field])
 

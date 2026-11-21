@@ -778,4 +778,400 @@ def test_2844_archetype_cross_season_heteropeak_override_and_upper_guard(
     assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
 
 
+# ---------------------------------------------------------------- 10. 任务78：两阶段 post_min_on / post_fill_short_off 自动定参单元测试
+def test_stage1_postprocess_physical_bounds_regimes_and_gap_isolation():
+    """阶段一真值物理定界：长连续工业班次 vs 间歇/午休短停机负荷 vs 跨日断层隔离 vs 稀疏回退。"""
+    from nilm.pipeline.auto_thresholds import resolve_postprocess_physical_bounds
+
+    # 1) 长连续工业班次（每天连续开机 32 窗=8h，无日内短停机）：M_max 放开至 >=6，K_max >=4
+    days = 10
+    idx_cont = pd.date_range("2026-01-01 00:00:00", periods=days * 96, freq="15min")
+    y_cont = np.zeros(days * 96, dtype=np.float64)
+    for d in range(days):
+        base = d * 96
+        y_cont[base + 32: base + 64] = 800.0
+    b_cont = resolve_postprocess_physical_bounds(y_cont, idx_cont, on_thr_w=50.0)
+    assert b_cont["m_max"] >= 6
+    assert b_cont["k_max"] >= 4
+    assert b_cont["confidence"] == "high"
+
+    # 2) 间歇循环 / 午休停机负荷（每天开机 6 窗 -> 真停机 2 窗=30min -> 再开机 6 窗）：
+    #    自回放 GT_Bridge_Ratio / gt_gap_bridged_rate 必须将 K_max 收窄至 <=1（禁止桥接 2 窗真停机！）
+    y_cyc = np.zeros(days * 96, dtype=np.float64)
+    for d in range(days):
+        base = d * 96
+        y_cyc[base + 32: base + 38] = 600.0
+        # base+38..base+39 为 2 窗真停机（0W）
+        y_cyc[base + 40: base + 46] = 600.0
+    b_cyc = resolve_postprocess_physical_bounds(y_cyc, idx_cont, on_thr_w=50.0)
+    assert b_cyc["k_max"] <= 1
+    assert 3 <= b_cyc["m_max"] <= 6
+    assert any("PROTECT_SHORT_TRUE_OFF_CYCLES" in r for r in b_cyc["reasons"])
+
+    # 3) stratified_day 跨日拼接断层防护：非相邻天各自末尾 2 窗与次块开头 2 窗为开态，
+    #    不得跨断层合并成 4 窗伪完整游程，且块边界完整游程长度统计严格只在连续 15min 块内进行
+    non_adj_days = ["2026-01-01", "2026-01-05", "2026-01-09", "2026-01-14", "2026-01-19", "2026-01-25"]
+    ts_parts, y_parts = [], []
+    for ds in non_adj_days:
+        ts_d = pd.date_range(f"{ds} 00:00:00", periods=96, freq="15min")
+        yd = np.zeros(96, dtype=np.float64)
+        yd[0:2] = 500.0      # 块首截断游程 2 窗
+        yd[40:44] = 500.0    # 块内完整游程 4 窗
+        yd[94:96] = 500.0    # 块尾截断游程 2 窗
+        ts_parts.append(ts_d)
+        y_parts.append(yd)
+    idx_gap = pd.DatetimeIndex(np.concatenate([t.to_numpy() for t in ts_parts]))
+    y_gap = np.concatenate(y_parts)
+    b_gap = resolve_postprocess_physical_bounds(y_gap, idx_gap, on_thr_w=50.0)
+    assert b_gap["n_contiguous_blocks"] == len(non_adj_days)
+    # 完整块内游程全为 4 窗，而块首尾 2 窗在自回放 enforce_min_on(m>=3) 时会造成 >0.5% 真开态损失，故 M_max 严格锁在 <=2
+    assert b_gap["on_run_p10"] == pytest.approx(4.0)
+    assert b_gap["m_max"] <= 2
+
+    # 4) 开态游程极少（<3 段）时低置信保守回退 M_max=1, K_max=3
+    y_sparse = np.zeros(192, dtype=np.float64)
+    y_sparse[20:28] = 500.0
+    b_sparse = resolve_postprocess_physical_bounds(
+        y_sparse, pd.date_range("2026-01-01", periods=192, freq="15min"), on_thr_w=50.0
+    )
+    assert b_sparse["m_max"] == 1
+    assert b_sparse["k_max"] == 3
+    assert b_sparse["confidence"] == "low"
+
+
+def test_stage2_postprocess_calibration_spike_filter_antibridge_and_decoupling():
+    """阶段二协同校准：短尖峰优先提 post_min_on 而非盲抬阈值、全关日防桥接护栏、独立混合配置与惰性保持。"""
+    from nilm.pipeline.auto_thresholds import (
+        resolve_auto_postprocess_and_decision_thr,
+        resolve_postprocess_physical_bounds,
+    )
+
+    idx_val = pd.date_range("2026-02-01 00:00:00", periods=6 * 96, freq="15min")
+    y_tr = np.zeros(10 * 96, dtype=np.float64)
+    idx_tr = pd.date_range("2026-01-01 00:00:00", periods=10 * 96, freq="15min")
+    for d in range(10):
+        if d % 2 == 0:
+            y_tr[d * 96 + 30: d * 96 + 62] = 600.0  # 32 窗长班次
+    bounds = resolve_postprocess_physical_bounds(y_tr, idx_tr, on_thr_w=50.0)
+    assert bounds["m_max"] >= 4
+
+    # 场景 A：3 个开机日（长班次，其中含一段仅 85W 的低功率开机段，故若把 decision_thr_w 抬高到 >85W 会损召回！）
+    # + 3 个全关日（含多处持续 2 窗的 180W 短尖峰干扰）：必须靠自动提升 post_min_on (>=3) 滤除短尖峰且保住低阈值高召回！
+    y_val = np.zeros(6 * 96, dtype=np.float64)
+    p_val = np.full(6 * 96, 10.0, dtype=np.float64)
+    for d in range(6):
+        b = d * 96
+        if d in (0, 2, 4):  # 开机日
+            y_val[b + 30: b + 62] = 600.0
+            p_val[b + 30: b + 40] = 85.0     # 轻载开机段（若抬阈值 >85W 会漏检 30/96 > 5% 违反 recall>=0.95！）
+            p_val[b + 40: b + 62] = 590.0
+        else:               # 全关日：多处 2 窗高幅短尖峰（180W）
+            for sp in (12, 36, 60, 80):
+                p_val[b + sp: b + sp + 2] = 180.0
+
+    dec_a, mo_a, fo_a, _, pp_info_a = resolve_auto_postprocess_and_decision_thr(
+        y_train=y_tr,
+        y_val=y_val,
+        pred_val=p_val,
+        val_index=idx_val,
+        on_thr_w=50.0,
+        cfg_decision_thr_w="auto",
+        cfg_post_min_on="auto",
+        cfg_post_fill_off="auto",
+        bounds=bounds,
+        calibrated_model="patchtst",
+        pbus_mode="raw",
+    )
+    assert mo_a >= 3
+    assert dec_a <= 85.0
+    assert pp_info_a["val_off_fp_after"] == 0
+    assert pp_info_a["val_recall_after"] >= 0.95
+
+    # 场景 B：全关日防桥接硬护栏 —— 全关日存在两处相距 2 窗的 4 窗噪声包（min_on 无法滤掉），
+    # k>=2 会把中间 2 窗也桥接成 FP，导致 off_day_fp(c,m,k) > off_day_fp(c,m,0)，必须被硬护栏拦截使 fo_b <= 1！
+    y_val_b = np.zeros(4 * 96, dtype=np.float64)
+    p_val_b = np.full(4 * 96, 5.0, dtype=np.float64)
+    idx_val_b = pd.date_range("2026-02-01 00:00:00", periods=4 * 96, freq="15min")
+    for d in (0, 2):
+        b = d * 96
+        y_val_b[b + 30: b + 62] = 600.0
+        p_val_b[b + 30: b + 40] = 75.0
+        p_val_b[b + 40: b + 62] = 590.0
+        # 开机日班次内部给 1 窗预测塌陷，使 k=1 有正增益而 k>=2 在全关日触发桥接惩罚
+        p_val_b[b + 50] = 20.0
+    for d in (1, 3):  # 全关日：两段 9 窗噪声（超 M_max=8）相距 2 窗，k>=2 会把中间 2 窗桥接成额外 4 个全关日 FP
+        b = d * 96
+        p_val_b[b + 20: b + 29] = 120.0
+        p_val_b[b + 31: b + 40] = 120.0
+
+    _, _, fo_b, _, _ = resolve_auto_postprocess_and_decision_thr(
+        y_train=y_tr,
+        y_val=y_val_b,
+        pred_val=p_val_b,
+        val_index=idx_val_b,
+        on_thr_w=50.0,
+        cfg_decision_thr_w="auto",
+        cfg_post_min_on="auto",
+        cfg_post_fill_off="auto",
+        bounds=bounds,
+        calibrated_model="patchtst",
+        pbus_mode="raw",
+    )
+    assert fo_b <= 1
+
+    # 场景 C：独立解耦配置（显式 post_min_on=2 + post_fill_short_off="auto"），显式维度严格锁死为 2
+    _, mo_c, fo_c, _, _ = resolve_auto_postprocess_and_decision_thr(
+        y_train=y_tr,
+        y_val=y_val,
+        pred_val=p_val,
+        val_index=idx_val,
+        on_thr_w=50.0,
+        cfg_decision_thr_w="auto",
+        cfg_post_min_on=2,
+        cfg_post_fill_off="auto",
+        bounds=bounds,
+        calibrated_model="patchtst",
+        pbus_mode="raw",
+    )
+    assert mo_c == 2
+    assert isinstance(fo_c, int)
+
+    # 场景 D：干净双峰无毛刺，奥卡姆惰性保持门锁定默认锚点 (1, min(3, K_max))
+    p_clean = np.where(y_val >= 50.0, 595.0, 5.0)
+    _, mo_d, fo_d, _, pp_info_d = resolve_auto_postprocess_and_decision_thr(
+        y_train=y_tr,
+        y_val=y_val,
+        pred_val=p_clean,
+        val_index=idx_val,
+        on_thr_w=50.0,
+        cfg_decision_thr_w="auto",
+        cfg_post_min_on="auto",
+        cfg_post_fill_off="auto",
+        bounds=bounds,
+        calibrated_model="patchtst",
+        pbus_mode="raw",
+    )
+    assert mo_d == 1
+    assert fo_d == min(3, bounds["k_max"])
+    assert any("KEEP_POSTPROC_ANCHOR" in r for r in pp_info_d["reasons"])
+
+
+# ---------------------------------------------------------------- 11. 任务78：端到端训练+推理继承+显式覆盖+双链收口+零参审计闭环
+def test_end_to_end_auto_postprocess_train_infer_sync_and_audit(tmp_path: Path, base_cfg: dict, caplog):
+    import yaml
+
+    full_base = dict(base_cfg)
+    full_base["metrics"] = [
+        "mae", "rmse", "r2", "sae",
+        "f1", "accuracy", "precision", "recall", "tp", "fp", "fn", "tn",
+    ]
+    base_cfg_full_file = tmp_path / "base_full_pp.yaml"
+    base_cfg_full_file.write_text(
+        yaml.safe_dump(full_base, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "outputs"
+    _write_bimodal_user_dir(data_root, USER_KEY, "trains", days=20, start="2026-01-01",
+                            standby_w=28.0, working_w=680.0, seed=31)
+    _write_bimodal_user_dir(data_root, USER_KEY, "infers", days=8, start="2026-02-01",
+                            standby_w=28.0, working_w=680.0, seed=32)
+
+    # 1) auto_run_steps2to5 新用户模板默认写入 post_min_on="auto", post_fill_short_off="auto"
+    tf_file = tmp_path / "tf_auto_pp.json"
+    tf_file.write_text(json.dumps({"_default": {"pt_ratio": 1.0}}), encoding="utf-8")
+    ensure_user_config(USER_KEY, tf_file, target_col="p1")
+    cfg_init = json.loads(tf_file.read_text(encoding="utf-8"))
+    assert cfg_init[USER_KEY]["post_min_on"] == "auto"
+    assert cfg_init[USER_KEY]["post_fill_short_off"] == "auto"
+    # 放宽训练/推理过滤时间窗以便匹配 2026-01 ~ 2026-02 合成数据
+    cfg_init[USER_KEY]["train"] = {"include": [["2026-01-01", "2026-01-31"]]}
+    cfg_init[USER_KEY]["infer"] = {"include": [["2026-02-01", "2026-02-28"]]}
+    cfg_init[USER_KEY]["split_ratios"] = [0.6, 0.2, 0.2]
+    cfg_init[USER_KEY]["split_strategy"] = "stratified_day"
+    tf_file.write_text(json.dumps(cfg_init, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        info = run_batch(
+            tf_file,
+            base_config_path=base_cfg_full_file,
+            data_root=data_root,
+            output_root=out_root,
+            stages=("train", "infer"),
+            force=True,
+        )
+    status_df = pd.read_csv(info["status_csv"])
+    assert (status_df["status"] == Status.OK).all(), status_df
+
+    tr_dir = latest_done_dir(out_root / USER_KEY / "train")
+    inf_dir = latest_done_dir(out_root / USER_KEY / "infer")
+    assert tr_dir is not None and inf_dir is not None
+
+    tr_meta = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    inf_meta = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8"))
+    assert tr_meta["post_min_on_configured"] == "auto"
+    assert tr_meta["post_fill_short_off_configured"] == "auto"
+    assert isinstance(tr_meta["post_min_on"], int)
+    assert isinstance(tr_meta["post_fill_short_off"], int)
+    assert tr_meta["postprocess_bounds"] is not None
+    # 零泄漏核查：阶段一统计总点数严格等于 train + val（绝不含 test 折！）
+    expected_non_test = tr_meta["split_sizes"]["train"] + tr_meta["split_sizes"]["val"]
+    assert tr_meta["postprocess_bounds"]["n_points"] == expected_non_test
+    assert "model_postprocess_params" in tr_meta and len(tr_meta["model_postprocess_params"]) >= 1
+
+    # 推理侧自动继承所选模型的游程参数，且零参调用 audit_user_run 100% 全绿
+    chosen_m = inf_meta["model"]
+    assert inf_meta["post_min_on"] == tr_meta["model_postprocess_params"][chosen_m]["post_min_on"]
+    assert inf_meta["post_fill_short_off"] == tr_meta["model_postprocess_params"][chosen_m]["post_fill_short_off"]
+    msgs = [r.message for r in caplog.records]
+    assert any("[AUTO-POSTPROC]" in m for m in msgs)
+    assert any("[AUTO-POSTPROC-INFER]" in m for m in msgs)
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+    # 2) auto_run_steps2to5 --stage sync-thr --min-on 2 --fill-off 1 --save-config 零重训原子回刷 + 固化写回
+    rc_sync = auto_run_main([
+        "--user-key", USER_KEY,
+        "--time-filter-config", str(tf_file),
+        "--base-config", str(base_cfg_full_file),
+        "--data-root", str(data_root),
+        "--output-root", str(out_root),
+        "--stage", "sync-thr",
+        "--min-on", "2",
+        "--fill-off", "1",
+        "--save-config",
+    ])
+    assert rc_sync == 0
+    tr_meta_s = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    inf_meta_s = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8"))
+    assert tr_meta_s["post_min_on"] == 2 and tr_meta_s["post_fill_short_off"] == 1
+    assert inf_meta_s["post_min_on"] == 2 and inf_meta_s["post_fill_short_off"] == 1
+    saved_tf = json.loads(tf_file.read_text(encoding="utf-8"))
+    assert saved_tf[USER_KEY]["post_min_on"] == 2
+    assert saved_tf[USER_KEY]["post_fill_short_off"] == 1
+    # 零参调用 audit_user_run 自动读取同步后的 (2, 1) 并对账 T1-T4 & I1-I10 全部通过！
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+    # 3) 显式覆盖推理游程参数（post_min_on=4, post_fill_short_off=0）应输出 [POSTPROC-OVERRIDE]
+    saved_tf[USER_KEY]["post_min_on"] = 4
+    saved_tf[USER_KEY]["post_fill_short_off"] = 0
+    tf_file.write_text(json.dumps(saved_tf, ensure_ascii=False, indent=2), encoding="utf-8")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        info2 = run_batch(
+            tf_file,
+            base_config_path=base_cfg_full_file,
+            data_root=data_root,
+            output_root=out_root,
+            stages=("infer",),
+            force=True,
+        )
+    assert (pd.read_csv(info2["status_csv"])["status"] == Status.OK).all()
+    assert any("[POSTPROC-OVERRIDE]" in r.message for r in caplog.records)
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+
+# ---------------------------------------------------------------- 12. 任务78：3D (val+infer) 双链自动收口游程参数同步验证
+def test_joint_val_infer_3d_auto_postprocess_sync(tmp_path: Path, base_cfg: dict, caplog):
+    """当 post_min_on='auto' 且推理期出现全关日 2 窗短尖峰时，双链 3D 联合收口自动上调 post_min_on 滤除尖峰并双侧原子同步。"""
+    import yaml
+
+    full_base = dict(base_cfg)
+    full_base["metrics"] = [
+        "mae", "rmse", "r2", "sae",
+        "f1", "accuracy", "precision", "recall", "tp", "fp", "fn", "tn",
+    ]
+    base_file = tmp_path / "base_3d.yaml"
+    base_file.write_text(yaml.safe_dump(full_base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "outputs"
+    _write_bimodal_user_dir(data_root, USER_KEY, "trains", days=20, start="2026-01-01",
+                            standby_w=25.0, working_w=680.0, seed=41)
+    _write_bimodal_user_dir(data_root, USER_KEY, "infers", days=8, start="2026-02-01",
+                            standby_w=25.0, working_w=680.0, seed=42)
+
+    tf_file = tmp_path / "tf_3d.json"
+    tf_file.write_text(json.dumps({
+        USER_KEY: {
+            "target_col": "p1",
+            "on_thr_w": 50.0,
+            "decision_thr_w": "auto",
+            "post_min_on": "auto",
+            "post_fill_short_off": "auto",
+            "pbus_mode": "raw",
+            "split_ratios": [0.6, 0.2, 0.2],
+            "split_strategy": "stratified_day",
+        }
+    }), encoding="utf-8")
+
+    info = run_batch(
+        tf_file,
+        base_config_path=base_file,
+        data_root=data_root,
+        output_root=out_root,
+        stages=("train", "infer"),
+        force=True,
+    )
+    assert (pd.read_csv(info["status_csv"])["status"] == Status.OK).all()
+    tr_dir = latest_done_dir(out_root / USER_KEY / "train")
+    inf_dir = latest_done_dir(out_root / USER_KEY / "infer")
+    assert tr_dir is not None and inf_dir is not None
+
+    # 注入跨期双链场景：保证训练真值连续长班次（M_max>=4），同时在 infer 全关日注入多处 2 窗短尖峰，
+    # 且 infer 开机班次含一段 75W 轻载期（使单纯抬高 decision_thr_w >75W 会损召回，必须靠 post_min_on>=3 滤掉尖峰！）
+    tr_meta = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    tr_meta["postprocess_bounds"]["m_max"] = 6
+    tr_meta["postprocess_bounds"]["k_max"] = 3
+    (tr_dir / "meta.json").write_text(json.dumps(tr_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    inf_csv = inf_dir / INFERENCE_RESULT_REL
+    inf_df = pd.read_csv(inf_csv)
+    inf_df["_day"] = inf_df["timestamp"].astype(str).str.slice(0, 10)
+    days_sorted = sorted(inf_df["_day"].unique().tolist())
+    # 前 2 天强制做成全关日并带 2 窗 220W 短尖峰；其余开机日把每段开态前 20% 置为 75W 轻载预测
+    for di, ds in enumerate(days_sorted):
+        mask_d = inf_df["_day"] == ds
+        idxs = inf_df.index[mask_d].to_numpy()
+        if di < 2:
+            inf_df.loc[idxs, "target"] = 10.0
+            inf_df.loc[idxs, "target_state"] = 0
+            inf_df.loc[idxs, "pred"] = 8.0
+            for sp in (10, 30, 50, 70):
+                if sp + 2 <= len(idxs):
+                    inf_df.loc[idxs[sp:sp + 2], "pred"] = 220.0
+        else:
+            on_sub = idxs[inf_df.loc[idxs, "target_state"] == 1]
+            off_sub = idxs[inf_df.loc[idxs, "target_state"] == 0]
+            inf_df.loc[off_sub, "pred"] = 8.0
+            if len(on_sub) >= 10:
+                n_light = max(2, len(on_sub) // 4)
+                inf_df.loc[on_sub[:n_light], "pred"] = 75.0
+                inf_df.loc[on_sub[n_light:], "pred"] = 660.0
+    inf_df.drop(columns=["_day"], inplace=True)
+    inf_df.to_csv(inf_csv, index=False)
+    sync_decision_thr_artifacts(
+        USER_KEY, tr_dir, inf_dir, float(tr_meta["decision_thr_w"]),
+        reason="inject_infer_short_spikes", new_post_min_on=1, new_post_fill_short_off=3
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        res_joint = calibrate_and_sync_joint_decision_thr(USER_KEY, tr_dir, inf_dir)
+
+    assert res_joint is not None and res_joint["synced"] is True
+    assert res_joint["resolved_post_min_on"] >= 3
+    assert res_joint["resolved_decision_thr_w"] <= 75.0
+    assert res_joint["infer_after"]["off_day_fp"] == 0
+    assert res_joint["infer_after"]["recall"] >= 0.95
+
+    tr_meta_after = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    inf_meta_after = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8"))
+    assert tr_meta_after["post_min_on"] == res_joint["resolved_post_min_on"]
+    assert inf_meta_after["post_min_on"] == res_joint["resolved_post_min_on"]
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+
+
+
 
