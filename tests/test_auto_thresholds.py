@@ -1497,6 +1497,227 @@ def test_end_to_end_901_trimodal_all_active_days_pipeline_and_audit(tmp_path: Pa
     assert audit_main(["--run-root", str(out_root / user_901)]) == 0
 
 
+# ---------------------------------------------------------------- 18. 实测 901 复现闭环：TARGET_EDGE_BURIED_IN_BUS + 四路合并窄走廊 + 13 天坏天剔除 + scaled 救援门
+def test_901_buried_bus_4branch_corridor_and_13_bad_days_day_gate_refresh(
+    tmp_path: Path, base_cfg: dict, caplog
+):
+    """精准复现 901 实测日志全部棘手条件：
+    1) 总厂母线波动完全淹没全分路（pt=1, ct=1 二次侧微弱值，snr_thr2 < 1.0 触发 TARGET_EDGE_BURIED_IN_BUS）；
+    2) 四路合并走廊“4 台待机 (~155W) vs 1 台单开轻载 (~470W)”曾令 0.35*P05(C2) < 1.15*P98(C01) 倒挂；
+    3) 原始训练目录含 13 天缺测全零坏天（得分 <70 被 day_gate 剔除，剔除后 20 个双达标天全为开机日 off_days=0）；
+    4) 验证 _accept_scaled_candidate 在 901 实测 R2/RMSE 显著改善（train R2 0.6079->0.9499, val R2 0.6059->0.6512,
+       val RMSE 479.1->450.7）但 val MAE 持平时成功通过救援门，且不破坏 778 F1 退化拦截。
+    """
+    import yaml
+    from nilm.pipeline.user_task import _accept_scaled_candidate
+
+    # --- (A) 验证 _accept_scaled_candidate 对 901 实测日志指标的 R2+RMSE 救援与对 778 的严格拦截 ---
+    bands_901 = {"transformer": {"train": 1500.0, "val": 1200.0}}
+    raw_901 = {
+        "transformer": {
+            "train": {"r2": {"macro": 0.6079}, "mae": {"macro": 315.6675}, "rmse": {"macro": 424.7081}, "f1": {"macro": 0.8957}},
+            "val": {"r2": {"macro": 0.6059}, "mae": {"macro": 390.0289}, "rmse": {"macro": 479.1151}, "f1": {"macro": 0.8131}},
+        }
+    }
+    scaled_901 = {
+        "transformer": {
+            "train": {"r2": {"macro": 0.9499}, "mae": {"macro": 103.5899}, "rmse": {"macro": 151.8329}, "f1": {"macro": 0.9477}},
+            "val": {"r2": {"macro": 0.6512}, "mae": {"macro": 389.9385}, "rmse": {"macro": 450.7100}, "f1": {"macro": 0.8131}},
+        }
+    }
+    ok_901_sc, notes_901_sc = _accept_scaled_candidate(
+        raw_901, bands_901, scaled_901, bands_901,
+        on_thr=180.0, triggered_reasons=["transformer_UNDERFIT_VS_BASELINE"],
+    )
+    assert ok_901_sc is True
+    assert any("VAL_R2_RMSE_RESCUE_PASS" in n for n in notes_901_sc)
+
+    # 若 F1 退化超限（模拟 778 漂移），即使 R2/RMSE 改善也必须一票否决
+    scaled_f1_drop = {
+        "transformer": {
+            "train": {"r2": {"macro": 0.95}, "mae": {"macro": 103.0}, "rmse": {"macro": 150.0}, "f1": {"macro": 0.95}},
+            "val": {"r2": {"macro": 0.70}, "mae": {"macro": 389.9}, "rmse": {"macro": 440.0}, "f1": {"macro": 0.7800}},
+        }
+    }
+    ok_drop, notes_drop = _accept_scaled_candidate(
+        raw_901, bands_901, scaled_f1_drop, bands_901,
+        on_thr=180.0, triggered_reasons=["transformer_UNDERFIT_VS_BASELINE"],
+    )
+    assert ok_drop is False and any("F1_DEGRADED" in n for n in notes_drop)
+
+    # --- (A2) 独立验证“四路合并窄走廊”在三峰晋升态（24% 零点）与双峰态（8% 零点）下均稳定落入 [175W, 280W] ---
+    rng_unit = np.random.default_rng(90104)
+    pbus_buried = 150.0 + rng_unit.normal(0.0, 45.0, 2000)  # 完全淹没分路跳变的大厂母线
+    y_tri_4br = np.concatenate([
+        rng_unit.uniform(0.0, 1.5, 500),       # 25% 断电零点
+        rng_unit.uniform(65.0, 158.0, 220),    # 11% 四路同时待机（P98≈155W）
+        rng_unit.uniform(465.0, 515.0, 200),   # 10% 单台轻载（P05(C2)≈475W，旧版 0.35*475=166 < 1.15*155=178 倒挂！）
+        rng_unit.uniform(1250.0, 2150.0, 1080),
+    ])
+    thr_tri, dec_tri = resolve_auto_on_thr_w(y_tri_4br, fallback_thr_w=10.0, pbus_pool=pbus_buried)
+    assert dec_tri["stage"] == "auto_trimodal_standby_promoted"
+    assert 175.0 <= thr_tri <= 280.0
+
+    y_bi_4br = np.concatenate([
+        rng_unit.uniform(0.0, 1.5, 160),       # 8% 断电零点（一级 Otsu 直接跨到次谷）
+        rng_unit.uniform(65.0, 158.0, 340),    # 17% 四路待机
+        rng_unit.uniform(465.0, 515.0, 200),   # 10% 单台轻载（旧版 0.30*480=144W 倒挂切穿待机 P99=154W！）
+        rng_unit.uniform(1250.0, 2150.0, 1300),
+    ])
+    thr_bi, dec_bi = resolve_auto_on_thr_w(y_bi_4br, fallback_thr_w=10.0, pbus_pool=pbus_buried)
+    assert 175.0 <= thr_bi <= 280.0
+
+    # --- (B) 端到端验证：TARGET_EDGE_BURIED_IN_BUS + 13 天坏天被 day_gate 剔除后重刷新 + 四路窄走廊晋升 ---
+    rng = np.random.default_rng(20261121)
+    user_901 = "800080270901_4200008005677"
+    device, user = user_901.split("_")
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "outputs"
+
+    # 训练 33 天（前 13 天为母线大面积缺测 + 异常停机/谷底毛刺坏天，后 20 天为双达标全开机日）
+    for mode_dir, start_dt, days, n_bad_days in (
+        ("trains", "2026-04-01", 33, 13),
+        ("infers", "2026-05-05", 8, 0),
+    ):
+        d = data_root / mode_dir / user_901
+        d.mkdir(parents=True, exist_ok=True)
+        n15 = 96 * days
+        idx15 = pd.date_range(start_dt, periods=n15, freq="15min")
+        total_br = np.zeros(n15, dtype=np.float64)
+        for day_i in range(days):
+            s = day_i * 96
+            if day_i < n_bad_days:
+                # 13 天坏天：停机全 0W 夹杂通讯冻结残值 (180~360W)，填平 day_gate 前次谷令预估卡在 15W
+                total_br[s : s + 64] = 0.0
+                total_br[s + 64 : s + 96] = rng.uniform(180.0, 360.0, 32)
+            else:
+                # 合格全开机日（严格复刻 901 实测占比：24% 零点 + 10% 四路待机 + 10% 单台轻载 + 56% 多台满载）：
+                total_br[s : s + 23] = rng.uniform(0.0, 1.8, 23)
+                total_br[s + 23 : s + 33] = rng.uniform(65.0, 158.0, 10)
+                total_br[s + 33 : s + 43] = rng.uniform(465.0, 515.0, 10)
+                total_br[s + 43 : s + 96] = rng.uniform(1250.0, 2150.0, 53)
+
+        branch_df = pd.DataFrame({
+            "time": idx15.strftime("%Y-%m-%d %H:%M:%S"),
+            "p1": np.round(total_br * 0.28, 3),
+            "p2": np.round(total_br * 0.27, 3),
+            "p3": np.round(total_br * 0.23, 3),
+            "p4": np.round(total_br * 0.22, 3),
+        })
+
+        # 构造 pt=1, ct=1 二次侧微弱母线（约 140W ± 75W 二次侧 -> /1000 后 0.14 ± 0.075 kW），
+        # 分路仅耦合 1/12000（~0.12W 二次侧），令主簇与待机簇在母线上全部满足 snr < 1.0 (TARGET_EDGE_BURIED_IN_BUS)！
+        n5 = 288 * days
+        idx5 = pd.date_range(start_dt, periods=n5, freq="5min")
+        br_5m = np.repeat(total_br, 3)
+        ptotal_sec_w = np.clip(
+            145.0 + 45.0 * np.sin(2 * np.pi * (np.arange(n5) % 288) / 288.0)
+            + rng.normal(0.0, 42.0, n5) + br_5m / 12000.0,
+            25.0,
+            None,
+        )
+        pa = ptotal_sec_w / 3.0
+        pb = ptotal_sec_w / 3.0
+        pc = ptotal_sec_w - pa - pb
+        ua = np.full(n5, 57.7) + rng.normal(0.0, 0.1, n5)
+        ub = np.full(n5, 57.7) + rng.normal(0.0, 0.1, n5)
+        uc = np.full(n5, 57.7) + rng.normal(0.0, 0.1, n5)
+        pf = np.clip(0.92 + rng.normal(0.0, 0.01, n5), 0.75, 0.99)
+        bus_df = pd.DataFrame({
+            "event_time": idx5.strftime("%Y-%m-%d %H:%M:%S"),
+            "load_iden_data0": ua, "load_iden_data1": ub, "load_iden_data2": uc,
+            "load_iden_data3": pa / (ua * pf), "load_iden_data4": pb / (ub * pf),
+            "load_iden_data5": pc / (uc * pf),
+            "load_iden_data6": pa, "load_iden_data7": pb, "load_iden_data8": pc,
+            "load_iden_data9": pf, "load_iden_data10": pf, "load_iden_data11": pf,
+        })
+        if n_bad_days > 0:
+            # 将前 13 天中每小时删除 45 分钟母线行（缺失率 75%），使逐天质量分 < 70 被 day_gate 精准剔除
+            bad_5m_end = 288 * n_bad_days
+            keep_mask = np.ones(n5, dtype=bool)
+            for k in range(bad_5m_end):
+                if (k % 12) >= 3:
+                    keep_mask[k] = False
+            bus_df = bus_df.loc[keep_mask].reset_index(drop=True)
+
+        s_code, e_code = idx5[0].strftime("%y%m%d"), idx5[-1].strftime("%y%m%d")
+        bus_df.to_csv(d / f"e241_{device}_{user}-Ch1-{s_code}-{e_code}.csv", index=False)
+        branch_df.to_csv(d / f"{user}-{s_code}-{e_code}.csv", index=False)
+
+    full_base = dict(base_cfg)
+    full_base["quality"] = {
+        "max_missing_rate": 0.9,
+        "min_coverage": 0.15,
+        "min_score": 70,
+        "gate_scope": "full",
+        "day_gate": True,
+        "min_days": 3,
+        "max_daily_missing_rate": 0.95,
+    }
+    full_base["metrics"] = [
+        "mae", "rmse", "r2", "sae",
+        "f1", "accuracy", "precision", "recall", "tp", "fp", "fn", "tn",
+    ]
+    base_file = tmp_path / "base_901_real.yaml"
+    base_file.write_text(yaml.safe_dump(full_base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    tf_file = tmp_path / "tf_901_real.json"
+    tf_file.write_text(json.dumps({
+        "_default": {"pt_ratio": 1.0, "ct_ratio": 1.0},
+        user_901: {
+            "target_col": "p1+p2+p3+p4",
+            "pt_ratio": 1.0,
+            "ct_ratio": 1.0,
+            "on_thr_w": "auto",
+            "decision_thr_w": "auto",
+            "post_min_on": "auto",
+            "post_fill_short_off": "auto",
+            "pbus_mode": "auto",
+            "split_ratios": [0.60, 0.20, 0.20],
+            "split_strategy": "stratified_day",
+        },
+    }), encoding="utf-8")
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="nilm"):
+        info = run_batch(
+            tf_file,
+            base_config_path=base_file,
+            data_root=data_root,
+            output_root=out_root,
+            stages=("train", "infer"),
+            force=True,
+        )
+    assert (pd.read_csv(info["status_csv"])["status"] == Status.OK).all()
+
+    tr_dir = latest_done_dir(out_root / user_901 / "train")
+    inf_dir = latest_done_dir(out_root / user_901 / "infer")
+    assert tr_dir is not None and inf_dir is not None
+
+    # 1) 确认真实触发了 TARGET_EDGE_BURIED_IN_BUS 且 day_gate 剔除了 13 天坏天
+    ident_rep = json.loads((tr_dir / "identifiability_report.json").read_text(encoding="utf-8"))
+    assert "TARGET_EDGE_BURIED_IN_BUS" in ident_rep.get("risk", [])
+    dg_rep = json.loads((tr_dir / "day_gate.json").read_text(encoding="utf-8"))
+    assert len(dg_rep["excluded_unqualified_days"]) == 13
+    assert dg_rep["off_days"] == 0 and dg_rep["on_days"] == 20
+
+    # 2) 确认 on_thr_w 在 day_gate 后完成重校准，且成功跨越 ~158W 待机簇晋升至 [175W, 300W]（绝不再卡死 15W！）
+    tr_meta = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    on_dec = tr_meta["on_thr_w_decision"]
+    assert on_dec.get("refreshed_after_day_filter") is True
+    assert on_dec.get("excluded_unqualified_day_count") == 13
+    assert on_dec["stage"] == "auto_trimodal_standby_promoted"
+    assert 175.0 <= float(tr_meta["on_thr_w"]) <= 300.0
+
+    # 3) 确认物理护栏上限 upper_guard_w 彻底解锁（不再被待机拉低至 96W，而是 >=360W）
+    assert float(tr_meta["decision_thr_w_decision"]["upper_guard_w"]) >= 360.0
+
+    # 4) 双链收口与审计全绿通过
+    calibrate_and_sync_joint_decision_thr(user_901, tr_dir, inf_dir)
+    assert audit_main(["--run-root", str(out_root / user_901)]) == 0
+
+
+
 
 
 

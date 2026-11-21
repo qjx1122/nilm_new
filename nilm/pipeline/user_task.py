@@ -18,7 +18,7 @@ import pandas as pd
 from nilm.analysis import analyze_branch_sessions, identifiability_report
 from nilm.common.contracts import (INFER_RESULT_COLUMNS, INFERENCE_RESULT_REL,
                                    Status, split_user_key)
-from nilm.common.logging import get_logger, red_text
+from nilm.common.logging import get_logger, red_text, yellow_text
 from nilm.common.schema import bus_total
 from nilm.common.timefilter import filter_dataframe
 from nilm.data_io.csv_source import CsvBranchLoader, CsvBusLoader
@@ -41,6 +41,7 @@ from nilm.pipeline.auto_thresholds import (
     log_auto_decision_thr_train,
     log_auto_postprocess_train,
     resolve_auto_decision_thr_w,
+    resolve_auto_on_thr_w,
     resolve_auto_postprocess_and_decision_thr,
     resolve_infer_postprocess_params,
     resolve_infer_thresholds,
@@ -338,6 +339,8 @@ def _accept_scaled_candidate(raw_results_by_split: dict[str, dict],
             raw_results_by_split, raw_pred_frames, seq_name, eval_split, on_thr)
         sc_mae, sc_f1 = _extract_split_mae_f1(
             scaled_results_by_split, scaled_pred_frames, seq_name, eval_split, on_thr)
+        raw_rmse = raw_by.get(eval_split, {}).get("rmse", {}).get("macro")
+        sc_rmse = sc_by.get(eval_split, {}).get("rmse", {}).get("macro")
 
         if raw_collapsed:
             if raw_f1 is not None and sc_f1 is not None and sc_f1 + 1e-9 < raw_f1:
@@ -354,8 +357,30 @@ def _accept_scaled_candidate(raw_results_by_split: dict[str, dict],
 
         rel_gain = (((raw_mae - sc_mae) / raw_mae)
                     if (raw_mae is not None and sc_mae is not None and raw_mae > 1e-9) else 0.0)
+        tr_r2_gain = (
+            float(sc_tr_r2 - raw_tr_r2)
+            if (sc_tr_r2 is not None and raw_tr_r2 is not None) else 0.0
+        )
+        ev_r2_gain = (
+            float(sc_ev_r2 - raw_ev_r2)
+            if (sc_ev_r2 is not None and raw_ev_r2 is not None) else 0.0
+        )
+        rmse_rel_gain = (
+            float((raw_rmse - sc_rmse) / raw_rmse)
+            if (raw_rmse is not None and sc_rmse is not None and raw_rmse > 1e-9) else 0.0
+        )
+        # 微小二次侧母线（pt=1,ct=1 未校正）重度欠拟合救援门：当 train_R2 暴涨 >=0.20、
+        # val_R2 提升 >=0.03、val_RMSE 实质改善 >=5% 且 val_MAE 不退化时，不因单折 MAE 持平一票否决
+        r2_rmse_rescued = (
+            tr_r2_gain >= 0.20
+            and ev_r2_gain >= 0.03
+            and rmse_rel_gain >= 0.05
+            and raw_mae is not None
+            and sc_mae is not None
+            and sc_mae <= raw_mae * 1.005 + 1e-9
+        )
         if seq_name in triggered_set and raw_mae is not None and sc_mae is not None:
-            if sc_mae > raw_mae * (1.0 - mae_min_rel_gain) + 1e-9:
+            if sc_mae > raw_mae * (1.0 - mae_min_rel_gain) + 1e-9 and not r2_rmse_rescued:
                 reject_notes.append(
                     f"{seq_name}_{eval_split.upper()}_MAE_GAIN_INSUFFICIENT("
                     f"raw={raw_mae:.2f}->scaled={sc_mae:.2f}, "
@@ -375,7 +400,16 @@ def _accept_scaled_candidate(raw_results_by_split: dict[str, dict],
                    if (raw_mae is not None and sc_mae is not None) else f"{eval_split}_mae:n/a")
         f1_str = (f"{eval_split}_f1:{raw_f1:.4f}->{sc_f1:.4f}"
                   if (raw_f1 is not None and sc_f1 is not None) else f"{eval_split}_f1:n/a")
-        accept_notes.append(f"{seq_name}_VAL_DUAL_GATE_PASS({mae_str}, {f1_str})")
+        if r2_rmse_rescued and rel_gain < mae_min_rel_gain:
+            accept_notes.append(
+                f"{seq_name}_VAL_R2_RMSE_RESCUE_PASS("
+                f"tr_r2:{raw_tr_r2:.4f}->{sc_tr_r2:.4f}, "
+                f"{eval_split}_r2:{raw_ev_r2:.4f}->{sc_ev_r2:.4f}, "
+                f"{eval_split}_rmse:{raw_rmse:.2f}->{sc_rmse:.2f}({rmse_rel_gain:+.1%}), "
+                f"{mae_str}, {f1_str})"
+            )
+        else:
+            accept_notes.append(f"{seq_name}_VAL_DUAL_GATE_PASS({mae_str}, {f1_str})")
 
     if reject_notes:
         return False, reject_notes
@@ -632,6 +666,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         # —— 日级放行筛选（day_gate，任务⑭策略步骤③）：只保留「总线与分路同时达标」
         #    的天参与训练/评估；可选 min_on_day_ratio 对双达标天中的开机日占比设门禁
+        drop_days: list[str] = []
         if day_gate:
             qual = set(daily_q.loc[daily_q["qualified"] == 1, "date"].astype(str))
             kept = sorted({d.strftime("%Y-%m-%d") for d in bus_al.index.normalize()}
@@ -648,6 +683,47 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                 target = target[~target.index.normalize().isin(drop_set)]
                 log.warning("[%s] 日级放行剔除非双达标天 %d 天: %s", user_key, len(drop_days),
                             drop_days[:12] + (["…"] if len(drop_days) > 12 else []))
+
+        # —— 剔除无效天 / 非双达标坏天后，在纯净有效天上重校准 on_thr_w="auto"（隔绝缺测全零日对首谷的污染）
+        if (
+            isinstance(cfg_on_thr_raw, str)
+            and cfg_on_thr_raw.strip().lower() == "auto"
+            and (len(bad_days) > 0 or len(drop_days) > 0)
+            and len(target.dropna()) >= 96
+        ):
+            clean_target_for_on_thr = target
+            test_inc_pre = ((user_cfg.get("splits") or {}).get("test") or {}).get("include")
+            if test_inc_pre:
+                _non_test_t = filter_dataframe(target.to_frame("p"), None, test_inc_pre)["p"]
+                if len(_non_test_t.dropna()) >= 96:
+                    clean_target_for_on_thr = _non_test_t
+            clean_pbus_for_on_thr = bus_total(bus_al).reindex(clean_target_for_on_thr.index)
+            refreshed_thr, refreshed_dec = resolve_auto_on_thr_w(
+                clean_target_for_on_thr, fallback_thr_w=10.0, pbus_pool=clean_pbus_for_on_thr
+            )
+            excluded_day_total = len(
+                {d.strftime("%Y-%m-%d") for d in bad_days} | set(drop_days)
+            )
+            refreshed_dec["provenance"] = on_thr_decision.get("provenance", "default(硬编码)")
+            refreshed_dec["refreshed_after_day_filter"] = True
+            refreshed_dec["excluded_unqualified_day_count"] = int(excluded_day_total)
+            refreshed_dec["pre_filter_on_thr_w"] = float(on_thr)
+            prev_on_thr = float(on_thr)
+            on_thr = float(refreshed_thr)
+            on_thr_decision = refreshed_dec
+            if abs(on_thr - prev_on_thr) > 1e-6:
+                log.warning("%s", yellow_text(
+                    f"[{user_key}] [AUTO-ON-THR-REFRESH] 剔除 {excluded_day_total} 天无效/非双达标坏天后重校准 "
+                    f"on_thr_w: {prev_on_thr:.4g} -> {on_thr:.4g} (stage={refreshed_dec.get('stage')}, "
+                    f"eta={refreshed_dec.get('otsu_eta')}, 待机P99={refreshed_dec.get('y_off_p99')}, "
+                    f"工况P10={refreshed_dec.get('y_on_p10')})"
+                ))
+                sessions = analyze_branch_sessions(branch_al, on_thr, columns=target_cols)
+                sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
+                q_bus["on_thr_w"] = on_thr
+                q_br["on_thr_w"] = on_thr
+
+        if day_gate:
             t_d = target.dropna()
             day_max = (t_d.groupby(t_d.index.normalize()).max()
                        if len(t_d) else pd.Series(dtype=float))

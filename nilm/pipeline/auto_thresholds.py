@@ -177,8 +177,11 @@ def _evaluate_bus_observability_for_trimodal(
 
     y_prev = yb[:-1][adj]
     y_curr = yb[1:][adj]
-    dy_abs = np.abs(y_curr - y_prev)
-    dbus_abs = np.abs(pb[1:] - pb[:-1])[adj]
+    dy_signed = y_curr - y_prev
+    dy_abs = np.abs(dy_signed)
+    dbus_signed = (pb[1:] - pb[:-1])[adj]
+    dbus_abs = np.abs(dbus_signed)
+    dir_dbus = np.sign(dy_signed) * dbus_signed
 
     edge_1 = ((y_prev < thr_1) & (y_curr >= 2.0 * thr_1)) | ((y_prev >= 2.0 * thr_1) & (y_curr < thr_1))
     edge_2 = ((y_prev < thr_2) & (y_curr >= 2.0 * thr_2)) | ((y_prev >= 2.0 * thr_2) & (y_curr < thr_2))
@@ -202,21 +205,26 @@ def _evaluate_bus_observability_for_trimodal(
     n_e2 = int(edge_2.sum())
     n_esub = int(edge_sub.sum())
 
-    snr_1 = round(float(np.median(dbus_abs[edge_1]) / bg_p90), 4) if n_e1 >= 6 else None
-    snr_2 = round(float(np.median(dbus_abs[edge_2]) / bg_p90), 4) if n_e2 >= 6 else None
+    snr_1 = round(float(np.median(dir_dbus[edge_1]) / bg_p90), 4) if n_e1 >= 6 else None
+    snr_2 = round(float(np.median(dir_dbus[edge_2]) / bg_p90), 4) if n_e2 >= 6 else None
 
     s_bus_br: float | None = None
+    e2_sign_rate: float | None = None
     if n_e2 >= 4:
         valid_e2 = edge_2 & (dy_abs > 1e-6)
         if int(valid_e2.sum()) >= 4:
-            s_bus_br = float(np.median(dbus_abs[valid_e2] / dy_abs[valid_e2]))
+            s_bus_br = max(0.0, float(np.median(dir_dbus[valid_e2] / dy_abs[valid_e2])))
+            e2_sign_rate = round(float(np.mean(dir_dbus[valid_e2] > 0)), 4)
 
+    sub_sign_rate: float | None = None
     if n_esub >= 6:
-        snr_sub = round(float(np.median(dbus_abs[edge_sub]) / bg_p90), 4)
+        snr_sub = round(float(np.median(dir_dbus[edge_sub]) / bg_p90), 4)
+        sub_sign_rate = round(float(np.mean(dir_dbus[edge_sub] > 0)), 4)
         snr_sub_mode = "direct_edges"
-    elif s_bus_br is not None and np.isfinite(s_bus_br) and s_bus_br > 0:
+    elif s_bus_br is not None and np.isfinite(s_bus_br):
         implied_dbus_c1 = s_bus_br * max(c1_p50 - c0_p50, 0.0)
         snr_sub = round(float(implied_dbus_c1 / bg_p90), 4)
+        sub_sign_rate = e2_sign_rate
         snr_sub_mode = "implied_step_ratio"
     else:
         snr_sub = None
@@ -225,15 +233,19 @@ def _evaluate_bus_observability_for_trimodal(
     sub_mask = yb < thr_2
     r_sub = _spearman_1d(pb[sub_mask], yb[sub_mask]) if int(sub_mask.sum()) >= 16 else None
 
-    sub_buried = (
+    # 反向否决制（物理守恒律）：若子簇为真低功率工作档，其在母线上必须具备正向同号可观测阶跃
+    # (snr_sub >= 1.2 且同向率 >= 0.65)，且同母线上幅值 >=4x 的主工作簇绝不可能反而被淹没 (snr_2 >= 1.2)。
+    multigear_veto = bool(
         snr_sub is not None
-        and snr_sub < 1.0
-        and (n_esub >= 6 or r_sub is None or abs(r_sub) < 0.30)
+        and snr_sub >= 1.2
+        and (sub_sign_rate is None or sub_sign_rate >= 0.65)
+        and (snr_2 is None or snr_2 >= 1.2)
     )
-    main_clear = (
-        snr_2 is not None
-        and snr_2 >= 1.0
-        and (snr_1 is None or snr_1 < 1.0 or snr_2 >= 1.35 * snr_1)
+    bus_main_observable = bool(snr_2 is not None and snr_2 >= 1.0)
+    bus_verified_promote = bool(
+        bus_main_observable
+        and not multigear_veto
+        and (snr_sub is None or snr_sub < 1.0)
     )
 
     return {
@@ -245,9 +257,12 @@ def _evaluate_bus_observability_for_trimodal(
         "snr_thr1": snr_1,
         "snr_thr2": snr_2,
         "snr_sub": snr_sub,
+        "sub_sign_rate": sub_sign_rate,
         "snr_sub_mode": snr_sub_mode,
         "r_sub_spearman": r_sub,
-        "promote_ok": bool(sub_buried and main_clear),
+        "multigear_veto": multigear_veto,
+        "bus_main_observable": bus_main_observable,
+        "promote_ok": bus_verified_promote,
     }
 
 
@@ -331,7 +346,11 @@ def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
 
     min_floor = min(fallback, 0.15 * max(y_on_p05, 0.01))
     raw_thr = max(min_floor, 1.40 * y_off_p99, y_off_p99 + 0.01 * y_on_p50)
-    hi_bound = max(0.30 * y_on_p05, 0.001)
+    if 1.15 * y_off_p99 <= 0.30 * y_on_p05 or y_off_p99 >= 0.60 * y_on_p05:
+        hi_bound = max(0.30 * y_on_p05, 0.001)
+    else:
+        # 多路合并走廊保护（如 4 台待机 ~155W vs 1 台单开轻载 ~480W）：防止 0.30*y_on_p05 倒挂压穿待机 P99
+        hi_bound = max(min(max(0.50 * y_on_p05, float(y_otsu)), 0.70 * y_on_p05), 0.001)
     lo_bound = min(max(1.15 * y_off_p99, 0.001), hi_bound)
     clamped = float(np.clip(raw_thr, lo_bound, hi_bound))
     thr_1 = _snap_nice_threshold(clamped, lo=lo_bound, hi=hi_bound)
@@ -362,6 +381,21 @@ def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
         v_2, on_sub_eta = _otsu_log1p(y_on)
         c0 = y_off
         c1 = y_nonneg[(y_nonneg >= y_otsu) & (y_nonneg < v_2)]
+        # 多路合并分路（如 p1+p2+p3+p4）四模态细化：当二级 Otsu 将“待机簇 + 单台轻载簇”一并划入 c1 时，
+        # 下探定位待机与单台轻载间的真实谷底，避免把单台运行误判为待机或被 c1_p90 门禁误拦
+        if len(c1) >= 16 and float(np.quantile(c1, 0.95)) > 2.5 * max(float(np.quantile(c1, 0.10)), 1.0):
+            v_1b, sub1_eta = _otsu_log1p(c1)
+            c1_lo = c1[c1 < v_1b]
+            c1_hi = c1[c1 >= v_1b]
+            if (
+                sub1_eta >= 0.76
+                and len(c1_lo) >= 8
+                and len(c1_hi) >= 6
+                and float(np.median(c1_hi)) >= 3.0 * max(float(np.median(c1_lo)), 1e-3)
+            ):
+                v_2 = v_1b
+                on_sub_eta = max(on_sub_eta, sub1_eta)
+                c1 = c1_lo
         c2 = y_nonneg[y_nonneg >= v_2]
         c01 = y_nonneg[y_nonneg < v_2]
         if len(c1) >= 8 and len(c2) >= 16 and len(c01) >= 8:
@@ -374,53 +408,53 @@ def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
             c2_p05 = float(np.quantile(c2, 0.05))
             c2_p10 = float(np.quantile(c2, 0.10))
             c2_p50 = float(np.quantile(c2, 0.50))
-            lo_2 = max(1.15 * c01_p98, 0.001)
-            hi_2 = max(0.35 * c2_p05, 0.001)
+            # 多路合并兼容走廊：兼顾“4 台同时待机 (~160W) vs 1 台单开轻载 (~480W)”的物理跨度，防止 lo_2 > hi_2 倒挂
+            hi_2 = max(0.50 * c2_p05, min(float(v_2), 0.70 * c2_p05), 0.001)
+            lo_2 = min(max(1.15 * c01_p98, 0.001), hi_2)
             energy_share_c2 = float(c2.sum() / max(float(y_on.sum()), 1e-9))
-            if lo_2 <= hi_2:
-                raw_2 = max(1.30 * c01_p98, 1.10 * c01_p99, c01_p98 + 0.01 * c2_p50)
-                cand_thr_2 = _snap_nice_threshold(float(np.clip(raw_2, lo_2, hi_2)), lo=lo_2, hi=hi_2)
-                thr_2 = float(np.clip(cand_thr_2, 0.001, 5000.0))
-                duty_c2 = float((y_nonneg >= thr_2).mean())
-                gate_a = (
-                    on_sub_eta >= 0.76
-                    and thr_2 >= max(2.0 * thr_1, thr_1 + 1e-6)
-                    and c2_p50 >= 4.0 * max(c1_p50, 1e-3)
-                    and duty_c2 >= 0.05
-                    and energy_share_c2 >= 0.88
-                )
-                bus_obs = _evaluate_bus_observability_for_trimodal(
-                    y_pool, pbus_pool, thr_1, thr_2, c0_p50=c0_p50, c1_p50=c1_p50
-                )
-                if gate_a:
-                    if bus_obs.get("available"):
-                        if bus_obs.get("promote_ok"):
-                            promoted_trimodal = True
-                        elif (bus_obs.get("snr_sub") is not None) and float(bus_obs["snr_sub"]) >= 1.2:
-                            verified_multigear = True
-                    else:
-                        # 无母线输入兜底：仅当零值断电簇 + 极低幅值寄生簇（<=8% 主簇功率）且主簇能量 >=95% 时晋升
-                        if (
-                            c0_p99 <= max(5.0, 0.005 * c2_p50)
-                            and c1_p90 <= 0.08 * max(c2_p50, 1e-9)
-                            and on_sub_eta >= 0.82
-                            and energy_share_c2 >= 0.95
-                        ):
-                            promoted_trimodal = True
+            raw_2 = max(1.25 * c01_p98, 1.08 * c01_p99, c01_p98 + 0.01 * c2_p50)
+            cand_thr_2 = _snap_nice_threshold(float(np.clip(raw_2, lo_2, hi_2)), lo=lo_2, hi=hi_2)
+            thr_2 = float(np.clip(cand_thr_2, 0.001, 5000.0))
+            duty_c2 = float((y_nonneg >= thr_2).mean())
+            gate_a = (
+                on_sub_eta >= 0.76
+                and thr_2 >= max(2.0 * thr_1, thr_1 + 1e-6)
+                and c2_p50 >= 4.0 * max(c1_p50, 1e-3)
+                and duty_c2 >= 0.05
+                and energy_share_c2 >= 0.88
+            )
+            bus_obs = _evaluate_bus_observability_for_trimodal(
+                y_pool, pbus_pool, thr_1, thr_2, c0_p50=c0_p50, c1_p50=c1_p50
+            )
+            if gate_a:
+                if bus_obs.get("multigear_veto"):
+                    verified_multigear = True
+                elif bus_obs.get("promote_ok"):
+                    promoted_trimodal = True
+                elif not bus_obs.get("bus_main_observable", False):
+                    # 反向否决制闭环：当总厂母线背景过大淹没全分路（TARGET_EDGE_BURIED_IN_BUS，snr_thr2 < 1.0）
+                    # 或无母线输入时，只要未触发真多档否决且分路自身呈强三峰 + 主簇能量绝对主导（>=90%），予以晋升
+                    if (
+                        on_sub_eta >= 0.78
+                        and c2_p50 >= 4.5 * max(c1_p50, 1e-3)
+                        and c1_p90 <= 0.25 * max(c2_p50, 1e-9)
+                        and energy_share_c2 >= 0.90
+                    ):
+                        promoted_trimodal = True
 
-                if promoted_trimodal and thr_2 is not None:
-                    resolved = thr_2
-                    y_off_p98 = c01_p98
-                    y_off_p99 = c01_p99
-                    y_on_p05 = c2_p05
-                    y_on_p10 = c2_p10
-                    y_on_p50 = c2_p50
-                    v_lo2 = max(1.20 * c01_p98, 1.0)
-                    v_hi2 = 0.50 * c2_p05
-                    valley_density = (
-                        float(((y_nonneg >= v_lo2) & (y_nonneg <= v_hi2)).mean())
-                        if v_hi2 > v_lo2 else 0.0
-                    )
+            if promoted_trimodal and thr_2 is not None:
+                resolved = thr_2
+                y_off_p98 = c01_p98
+                y_off_p99 = c01_p99
+                y_on_p05 = c2_p05
+                y_on_p10 = c2_p10
+                y_on_p50 = c2_p50
+                v_lo2 = max(1.20 * c01_p98, 1.0)
+                v_hi2 = 0.50 * c2_p05
+                valley_density = (
+                    float(((y_nonneg >= v_lo2) & (y_nonneg <= v_hi2)).mean())
+                    if v_hi2 > v_lo2 else 0.0
+                )
 
     reasons: list[str] = []
     confidence = "high"
