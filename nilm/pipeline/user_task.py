@@ -38,7 +38,6 @@ from nilm.models.constraints import apply_constraints
 from nilm.pipeline.auto_thresholds import (
     UPPER_ON_P10_RATIO,
     check_offline_decision_drift,
-    compute_decision_upper_guard_w,
     log_auto_decision_thr_train,
     resolve_auto_decision_thr_w,
     resolve_infer_thresholds,
@@ -514,25 +513,11 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         cfg_on_thr_raw = user_cfg.get("on_thr_w", 10.0)
         tspec_pre = user_cfg.get("train") or {}
         target_for_on_thr = target
-        _bus_for_on_thr = bus_c
         if tspec_pre.get("include") or tspec_pre.get("exclude"):
             _br_tr = filter_dataframe(branch_c, tspec_pre.get("include"), tspec_pre.get("exclude"))
             if len(_br_tr) > 0:
                 target_for_on_thr = build_target(_br_tr, target_cols)
-            _bus_tr = filter_dataframe(bus_c, tspec_pre.get("include"), tspec_pre.get("exclude"))
-            if len(_bus_tr) > 0:
-                _bus_for_on_thr = _bus_tr
-        _pbus_pre = bus_total(apply_pt_ct(_bus_for_on_thr, pt_ratio, ct_ratio)).dropna()
-        bus_p95_kw_pre = (
-            float(np.quantile(_pbus_pre.to_numpy(dtype=np.float64), 0.95))
-            if len(_pbus_pre) >= 16 else None
-        )
-        on_thr, on_thr_decision = resolve_train_on_thr_w(
-            user_key, user_cfg, target_for_on_thr, bus_p95_kw=bus_p95_kw_pre
-        )
-        _pool_on_vals = target_for_on_thr.dropna().to_numpy(dtype=np.float64)
-        _pool_on_vals = _pool_on_vals[_pool_on_vals >= on_thr]
-        pool_y_on_p10 = round(float(np.quantile(_pool_on_vals, 0.10)), 3) if len(_pool_on_vals) > 0 else None
+        on_thr, on_thr_decision = resolve_train_on_thr_w(user_key, user_cfg, target_for_on_thr)
 
         # —— 训练前分路开机情况分析（有效通道=目标通道，逐天开机段/时长/功率/电量）
         sessions = analyze_branch_sessions(branch_c, on_thr,
@@ -892,7 +877,6 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                         train_index=idx_tr,
                         calibrated_model=mname,
                         pbus_mode=eff_mode,
-                        pool_on_p10=pool_y_on_p10,
                     )
                     model_dec_map_local[mname] = m_thr
                     per_model_dec_info[mname] = m_info
@@ -1084,15 +1068,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         y_tr_on_meta = y_tr_meta[y_tr_meta >= on_thr]
         train_y_on_p10 = round(float(np.quantile(y_tr_on_meta, 0.10)), 3) if len(y_tr_on_meta) > 0 else None
         train_upper_guard_w = (
-            round(
-                compute_decision_upper_guard_w(
-                    on_thr_w=float(on_thr),
-                    y_train_on_p10=float(train_y_on_p10),
-                    pbus_mode=pbus_mode,
-                    pool_on_p10=pool_y_on_p10,
-                ),
-                3,
-            )
+            round(max(float(on_thr), UPPER_ON_P10_RATIO * float(train_y_on_p10)), 3)
             if train_y_on_p10 is not None else float(on_thr)
         )
 
@@ -1113,7 +1089,6 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "decision_thr_w_configured": cfg_dec_thr_raw,
             "decision_thr_w_decision": dec_decision,
             "model_decision_thr_w": model_dec_map,
-            "pool_y_on_p10": pool_y_on_p10,
             "train_y_on_p10": train_y_on_p10,
             "train_upper_guard_w": train_upper_guard_w,
             "post_min_on": post_min_on,
@@ -1410,13 +1385,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                         y_tr_ref = tp_tr.loc[tp_tr["split"] == "train", "target"].to_numpy(dtype=float)
                         y_tr_on = y_tr_ref[y_tr_ref >= on_thr]
                         if len(y_tr_on) > 0:
-                            pool_p10_meta = meta.get("pool_y_on_p10") or (meta.get("on_thr_w_decision") or {}).get("y_on_p10")
-                            train_upper_guard = compute_decision_upper_guard_w(
-                                on_thr_w=float(on_thr),
-                                y_train_on_p10=float(np.quantile(y_tr_on, 0.10)),
-                                pbus_mode=trained_pbus_mode,
-                                pool_on_p10=pool_p10_meta,
-                            )
+                            train_upper_guard = max(float(on_thr), UPPER_ON_P10_RATIO * float(np.quantile(y_tr_on, 0.10)))
                 drift_advice = check_offline_decision_drift(
                     user_key=user_key,
                     y_infer_true=have.to_numpy(dtype=float),
