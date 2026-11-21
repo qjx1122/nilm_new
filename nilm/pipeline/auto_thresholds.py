@@ -42,10 +42,32 @@ STANDARD_DECISION_GRID: tuple[float, ...] = (
 
 MIN_VAL_RECALL = 0.95
 UPPER_ON_P10_RATIO = 0.80
+RAW_UPPER_ON_P10_RATIO = 0.65
 MIN_DECISION_F1_GAIN = 0.003
 TIE_F1_TOL = 0.002
 SCALED_PLATEAU_F1_TOL = 0.006
 SCALED_PLATEAU_MIN_RECALL = 0.965
+
+
+def compute_decision_upper_guard_w(
+    on_thr_w: float,
+    y_train_on_p10: float,
+    pbus_mode: str | None = None,
+    pool_on_p10: float | None = None,
+) -> float:
+    """按 pbus_mode 与全池工况下沿计算判决链物理护栏上限 upper_guard_w。
+
+    - pbus_mode == "raw": 零点锚定无均值缩放漂移，采用 0.65 * min(y_train_on_p10, pool_on_p10)，
+      防止分日抽样幸存偏差（如 2842: train_P10=504.5 > 全池P10=404.7）把阈值顶到真实工作下沿；
+    - pbus_mode == "scaled"（或未指定时兼容回退）: 采用 0.80 * y_train_on_p10，兼容 733(400) 与 2844(500)。
+    """
+    base = float(on_thr_w)
+    ref_p10 = float(y_train_on_p10)
+    if str(pbus_mode or "").lower() == "raw":
+        if pool_on_p10 is not None and np.isfinite(pool_on_p10) and pool_on_p10 > 0:
+            ref_p10 = min(ref_p10, float(pool_on_p10))
+        return max(base, RAW_UPPER_ON_P10_RATIO * ref_p10)
+    return max(base, UPPER_ON_P10_RATIO * ref_p10)
 
 
 def _snap_nice_threshold(val: float, lo: float, hi: float) -> float:
@@ -88,12 +110,17 @@ def _otsu_log1p(y_pos: np.ndarray, n_bins: int = 256) -> tuple[float, float]:
     return float(np.expm1(z_star)), eta
 
 
-def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
-                          fallback_thr_w: float = 10.0) -> tuple[float, dict]:
+def resolve_auto_on_thr_w(
+    y_pool: np.ndarray | pd.Series,
+    fallback_thr_w: float = 10.0,
+    bus_p95_kw: float | None = None,
+) -> tuple[float, dict]:
     """基于训练范围分路目标功率分布自动估计物理开态阈值 on_thr_w。
 
     遵循《调参实战手册》Step 1a 物理定阈准则：
-      on_thr_w = 待机纹波带上沿 + 安全余量，且 <= 最小工作功率 P05(y_on) * 0.30。
+      on_thr_w = 待机纹波带上沿 + 安全余量，且 <= 最小工作功率 P05(y_on) * 0.30；
+      当母线规模较大（bus_p95_kw >= 2000）且分路双峰真空谷底极宽时，在不损失真值样本（<=0.2%）
+      的前提下适度上移至抗母线回归零漂档位（如 2842: 10 -> 50）。
     """
     arr = np.asarray(y_pool, dtype=np.float64).reshape(-1)
     y = arr[np.isfinite(arr)]
@@ -207,12 +234,43 @@ def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
     if not reasons:
         reasons.append("LOG_OTSU_BIMODAL_CLEAR")
 
+    # 大母线宽真空谷底抗零漂裕度（2842 原型：5MW 母线回归底噪 10~45kW，分路真值 [4, 400)kW 真空）：
+    # 仅在高置信清晰双峰、母线 P95 >= 2000kW 且上移区间真值样本占比 <= 0.2%（零真值损伤）时生效
+    bus_margin_applied = False
+    if (
+        confidence == "high"
+        and otsu_eta >= 0.90
+        and bus_p95_kw is not None
+        and np.isfinite(bus_p95_kw)
+        and float(bus_p95_kw) >= 2000.0
+        and y_off_p99 <= 20.0
+        and y_on_p05 >= 250.0
+    ):
+        target_cap = min(50.0, 0.15 * y_on_p05, 0.011 * float(bus_p95_kw))
+        nice_up = sorted(
+            [g for g in NICE_ON_THRESHOLDS if max(resolved, 29.9) < g <= target_cap + 1e-9],
+            reverse=True,
+        )
+        for cand_g in nice_up:
+            band_loss = float(((y_nonneg >= resolved) & (y_nonneg < cand_g)).mean())
+            if band_loss <= 0.0005:
+                base_res = resolved
+                resolved = float(cand_g)
+                bus_margin_applied = True
+                reasons.append(
+                    f"WIDE_VALLEY_BUS_ZERO_DRIFT_MARGIN("
+                    f"bus_p95={float(bus_p95_kw):.1f},{base_res:.4g}->{resolved:.4g})"
+                )
+                break
+
     on_ratio = float((y_nonneg >= resolved).mean())
     return resolved, {
         "configured": "auto",
         "resolved_on_thr_w": resolved,
         "stage": "auto_bimodal",
         "confidence": confidence,
+        "bus_p95_kw": round(float(bus_p95_kw), 2) if (bus_p95_kw is not None and np.isfinite(bus_p95_kw)) else None,
+        "bus_zero_drift_margin_applied": bus_margin_applied,
         "n_samples": int(len(y)),
         "otsu_valley_w": round(y_otsu, 3),
         "otsu_eta": round(otsu_eta, 4),
@@ -227,20 +285,30 @@ def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
     }
 
 
-def resolve_train_on_thr_w(user_key: str, user_cfg: dict,
-                           target_train_window: pd.Series | np.ndarray) -> tuple[float, dict]:
+def resolve_train_on_thr_w(
+    user_key: str,
+    user_cfg: dict,
+    target_train_window: pd.Series | np.ndarray,
+    bus_p95_kw: float | None = None,
+) -> tuple[float, dict]:
     """解析训练阶段 on_thr_w：显式数值优先；配置为 'auto' 时自动探测并输出黄/红高亮日志。"""
     cfg_val = user_cfg.get("on_thr_w", 10.0)
     prov = (user_cfg.get("_provenance") or {}).get("on_thr_w", "default(硬编码)")
     if isinstance(cfg_val, str) and cfg_val.strip().lower() == "auto":
-        resolved, decision = resolve_auto_on_thr_w(target_train_window, fallback_thr_w=10.0)
+        resolved, decision = resolve_auto_on_thr_w(
+            target_train_window, fallback_thr_w=10.0, bus_p95_kw=bus_p95_kw
+        )
         decision["provenance"] = prov
         if decision.get("confidence") == "high":
+            bus_note = (
+                f", 母线P95={decision.get('bus_p95_kw')}抗零漂上移"
+                if decision.get("bus_zero_drift_margin_applied") else ""
+            )
             log.warning("%s", yellow_text(
                 f"[{user_key}] [AUTO-ON-THR] on_thr_w=auto 自动定阈生效 -> "
                 f"on_thr_w={resolved:.4g} (双峰分离度 eta={decision.get('otsu_eta')}, "
                 f"待机P99={decision.get('y_off_p99')}, 工况P10={decision.get('y_on_p10')}, "
-                f"开机率={decision.get('on_ratio', 0.0) * 100:.1f}%)"
+                f"开机率={decision.get('on_ratio', 0.0) * 100:.1f}%{bus_note})"
             ))
         else:
             log.warning("%s", red_text(
@@ -305,8 +373,9 @@ def resolve_auto_decision_thr_w(
     pred_train: np.ndarray | None = None,
     train_index: pd.DatetimeIndex | None = None,
     calibrated_model: str = "",
-    pbus_mode: str = "raw",
+    pbus_mode: str | None = None,
     upper_guard_override: float | None = None,
+    pool_on_p10: float | None = None,
 ) -> tuple[float, dict]:
     """在选定模型的 val 验证集上执行带三重护栏与抗漂移裕度的零泄漏 decision_thr_w 校准。
 
@@ -353,7 +422,12 @@ def resolve_auto_decision_thr_w(
     if upper_guard_override is not None and np.isfinite(upper_guard_override) and upper_guard_override > 0:
         upper_guard_w = max(base_thr, float(upper_guard_override))
     else:
-        upper_guard_w = max(base_thr, UPPER_ON_P10_RATIO * y_on_p10)
+        upper_guard_w = compute_decision_upper_guard_w(
+            on_thr_w=base_thr,
+            y_train_on_p10=y_on_p10,
+            pbus_mode=pbus_mode,
+            pool_on_p10=pool_on_p10,
+        )
     min_cand_w = max(0.001, 0.60 * base_thr)
 
     raw_cands: set[float] = {round(base_thr, 4)}
@@ -435,10 +509,11 @@ def resolve_auto_decision_thr_w(
         "stage": "auto_val_calibrated",
         "confidence": confidence,
         "calibrated_model": calibrated_model,
-        "pbus_mode": pbus_mode,
+        "pbus_mode": pbus_mode or "default",
         "eval_split": eval_split,
         "on_thr_w": base_thr,
         "y_on_p10": round(y_on_p10, 3),
+        "pool_y_on_p10": round(float(pool_on_p10), 3) if (pool_on_p10 is not None and np.isfinite(pool_on_p10)) else None,
         "upper_guard_w": round(upper_guard_w, 3),
         "scaled_drift_anchor_w": drift_anchor_w,
         "min_recall_guard": MIN_VAL_RECALL,
@@ -761,10 +836,25 @@ def resolve_joint_val_infer_decision_thr_w(
     if len(y_on_ref) == 0:
         y_on_ref = y_inf[y_inf >= on_thr]
     y_on_p10 = float(np.quantile(y_on_ref, 0.10))
-    upper_guard_w = max(on_thr, UPPER_ON_P10_RATIO * y_on_p10)
+    pbus_mode_meta = str(tr_meta.get("pbus_mode") or inf_meta.get("pbus_mode") or "scaled")
+    pool_on_p10 = tr_meta.get("pool_y_on_p10")
+    if pool_on_p10 is None:
+        pool_on_p10 = (tr_meta.get("on_thr_w_decision") or {}).get("y_on_p10")
+    upper_guard_w = compute_decision_upper_guard_w(
+        on_thr_w=on_thr,
+        y_train_on_p10=y_on_p10,
+        pbus_mode=pbus_mode_meta,
+        pool_on_p10=pool_on_p10,
+    )
     min_cand_w = max(0.001, 0.60 * on_thr)
 
-    raw_cands: set[float] = {round(on_thr, 4), round(cur_dec, 4)}
+    cur_key = round(cur_dec, 4)
+    val_before_row = _eval_chain_candidate(y_va, p_va, idx_va, on_thr, cur_dec, post_min_on, post_fill_off)
+    inf_before_row = _eval_chain_candidate(y_inf, p_inf, idx_inf, on_thr, cur_dec, post_min_on, post_fill_off)
+
+    raw_cands: set[float] = {round(on_thr, 4)}
+    if cur_dec <= upper_guard_w + 1e-9:
+        raw_cands.add(cur_key)
     for g in STANDARD_DECISION_GRID:
         if min_cand_w - 1e-9 <= g <= upper_guard_w + 1e-9:
             raw_cands.add(round(float(g), 4))
@@ -838,17 +928,17 @@ def resolve_joint_val_infer_decision_thr_w(
         best_c = max(cands, key=lambda c: (inf_map[c]["f1"], inf_map[c]["recall"], -abs(c - cur_dec)))
     else:
         best_inf_f1 = max(inf_map[c]["f1"] for c in joint_feas)
-        cur_inf = inf_map[round(cur_dec, 4)]
+        cur_inf = inf_before_row
         min_inf_fp = min(inf_map[c]["fp"] for c in joint_feas if inf_map[c]["f1"] >= best_inf_f1 - 0.0025)
         f1_gain = best_inf_f1 - cur_inf["f1"]
         fp_saved = cur_inf["fp"] - min_inf_fp
 
         if (
-            round(cur_dec, 4) in joint_feas
+            cur_key in joint_feas
             and f1_gain < 0.002
             and fp_saved < max(3, int(0.20 * cur_inf["fp"]))
         ):
-            joint_best_c = round(cur_dec, 4)
+            joint_best_c = cur_key
             joint_reason = "DUAL_CHAIN_CONSISTENT_KEEP"
         else:
             top_cands = [c for c in joint_feas if inf_map[c]["f1"] >= best_inf_f1 - 0.0025]
@@ -864,10 +954,10 @@ def resolve_joint_val_infer_decision_thr_w(
             )
             joint_reason = "DUAL_CHAIN_JOINT_OPTIMIZED"
 
-        # 升级 ①（《调参实战手册》Step 4 铁律——双链异峰以 infer 链为准）：
-        # 当历史季节 val 召回贴线（如 2844: val 仅放行 [6,20]）把阈值卡死在低位，
-        # 而当期 infer 因基荷偏移在更高阈值（<= 0.80*P10(y_train_on) 且 infer_recall >= 0.95）
-        # 可显著提升 infer_F1 (>=0.02) 或大幅削减虚报 (FP>=15 且砍掉 >=50%) 时，解除历史 val 一票否决。
+        # 双向跨季双链异峰覆写（遵循《调参实战手册》Step 4 铁律——双链异峰以 infer 链为准）：
+        # (a) 正向异峰（2844 原型）：历史季节 val 召回贴线把阈值卡死低位（[6,20]），当期 infer 上调后大幅砍 FP；
+        # (b) 反向异峰（2842 原型）：历史季节 val 脏全关日把阈值顶至高位天花板，导致当期 infer 漏报 FN 激增、
+        #     召回贴近红线（<0.975），下调至 pure_inf_c 可大幅挽回 FN (>=50% 且 >=12 点)、拉升召回 >=+0.020 且提升 F1。
         if pure_inf_c is not None:
             j_inf = inf_map[joint_best_c]
             p_inf_row = inf_map[pure_inf_c]
@@ -877,13 +967,38 @@ def resolve_joint_val_infer_decision_thr_w(
                 (j_inf["fp"] - p_inf_row["fp"]) / max(j_inf["fp"], 1)
                 if j_inf["fp"] > 0 else 0.0
             )
-            if (
-                shift_vs_joint >= max(15.0, 0.20 * max(joint_best_c, 1.0))
+            fn_saved_vs_joint = j_inf["fn"] - p_inf_row["fn"]
+            fn_cut_vs_joint = (
+                fn_saved_vs_joint / max(j_inf["fn"], 1)
+                if j_inf["fn"] > 0 else 0.0
+            )
+            recall_gain_vs_joint = p_inf_row["recall"] - j_inf["recall"]
+
+            upward_fp_override = (
+                pure_inf_c > joint_best_c
+                and shift_vs_joint >= max(15.0, 0.20 * max(joint_best_c, 1.0))
                 and (
                     f1_gain_vs_joint >= 0.02
                     or (j_inf["fp"] >= 15 and fp_cut_vs_joint >= 0.50 and f1_gain_vs_joint >= 0.005)
                 )
-            ):
+            )
+            downward_fn_recovery = (
+                pure_inf_c < joint_best_c
+                and shift_vs_joint >= max(15.0, 0.20 * max(joint_best_c, 1.0))
+                and p_inf_row["off_day_fp"] <= j_inf["off_day_fp"] + 5
+                and (
+                    f1_gain_vs_joint >= 0.02
+                    or (
+                        j_inf["recall"] < 0.975
+                        and fn_saved_vs_joint >= 12
+                        and fn_cut_vs_joint >= 0.50
+                        and recall_gain_vs_joint >= 0.020
+                        and f1_gain_vs_joint >= 0.004
+                    )
+                )
+            )
+
+            if upward_fp_override:
                 val_capped_candidate = float(joint_best_c)
                 best_c = pure_inf_c
                 heteropeak_override = True
@@ -892,6 +1007,16 @@ def resolve_joint_val_infer_decision_thr_w(
                     f"val_capped={joint_best_c:.4g}->infer_opt={pure_inf_c:.4g},"
                     f"infer_f1_gain={f1_gain_vs_joint:+.4f},fp_cut={fp_cut_vs_joint:.1%})"
                 )
+            elif downward_fn_recovery:
+                val_capped_candidate = float(joint_best_c)
+                best_c = pure_inf_c
+                heteropeak_override = True
+                reasons.append(
+                    f"CROSS_SEASON_INFER_FN_RECOVERY_OVERRIDE("
+                    f"val_high={joint_best_c:.4g}->infer_opt={pure_inf_c:.4g},"
+                    f"infer_f1_gain={f1_gain_vs_joint:+.4f},fn_cut={fn_cut_vs_joint:.1%},"
+                    f"recall_gain={recall_gain_vs_joint:+.4f})"
+                )
             else:
                 best_c = joint_best_c
                 reasons.append(joint_reason)
@@ -899,7 +1024,6 @@ def resolve_joint_val_infer_decision_thr_w(
             best_c = joint_best_c
             reasons.append(joint_reason)
 
-    cur_key = round(cur_dec, 4)
     return float(best_c), {
         "stage": "joint_val_infer_calibrated",
         "confidence": confidence,
@@ -907,16 +1031,18 @@ def resolve_joint_val_infer_decision_thr_w(
         "val_capped_candidate_w": val_capped_candidate,
         "pure_infer_optimal_w": pure_inf_c,
         "model": model_name,
+        "pbus_mode": pbus_mode_meta,
         "on_thr_w": on_thr,
         "previous_decision_thr_w": cur_dec,
         "resolved_decision_thr_w": float(best_c),
         "upper_guard_w": round(upper_guard_w, 3),
         "y_on_p10": round(y_on_p10, 3),
+        "pool_y_on_p10": round(float(pool_on_p10), 3) if (pool_on_p10 is not None and np.isfinite(pool_on_p10)) else None,
         "post_min_on": post_min_on,
         "post_fill_short_off": post_fill_off,
-        "val_before": val_map[cur_key],
+        "val_before": val_before_row,
         "val_after": val_map[best_c],
-        "infer_before": inf_map[cur_key],
+        "infer_before": inf_before_row,
         "infer_after": inf_map[best_c],
         "reasons": reasons,
     }
@@ -1211,13 +1337,20 @@ def calibrate_and_sync_joint_decision_thr(
         severe_shift = hetero or (shift >= max(40.0, 0.35 * max(prev_thr, 1.0))) or (info.get("confidence") == "low")
         if hetero:
             val_cap_s = info.get("val_capped_candidate_w")
-            cap_note = f"历史val受召回约束卡在 {val_cap_s:.4g}" if isinstance(val_cap_s, (int, float)) else f"train_val={tr_prev:.4g}"
+            is_fn_rec = any("FN_RECOVERY" in str(r) for r in (info.get("reasons") or []))
+            if is_fn_rec and isinstance(val_cap_s, (int, float)):
+                cap_note = f"历史val受全关日虚报顶高至 {val_cap_s:.4g} 致漏报偏高"
+            elif isinstance(val_cap_s, (int, float)):
+                cap_note = f"历史val受召回约束卡在 {val_cap_s:.4g}"
+            else:
+                cap_note = f"train_val={tr_prev:.4g}"
             msg = (
                 f"[{user_key}] [AUTO-DEC-THR-SYNC] 检测到跨季双链异峰（{cap_note}，当期 infer 最优为 "
                 f"decision_thr_w={new_thr:.4g}），遵循调参铁律按 infer 链定阈 "
                 f"(model={info['model']}, infer_F1: {inf_before['f1']:.4f}->{inf_after['f1']:.4f}, "
-                f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_recall={inf_after['recall']:.4f}, "
-                f"历史val_recall={val_after['recall']:.4f})，已零重训同步刷新 train+infer 全套产物！"
+                f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_FN: {inf_before['fn']}->{inf_after['fn']}, "
+                f"infer_recall={inf_after['recall']:.4f}, 历史val_recall={val_after['recall']:.4f})，"
+                f"已零重训同步刷新 train+infer 全套产物！"
             )
         elif severe_shift:
             msg = (

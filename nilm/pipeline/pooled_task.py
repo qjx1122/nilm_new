@@ -232,7 +232,14 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
     if isinstance(user_cfg.get("on_thr_w"), str) and user_cfg["on_thr_w"].strip().lower() == "auto":
         if target is not None and need_branch:
-            eff_on_thr, _ = resolve_train_on_thr_w(user_key, user_cfg, target)
+            _pbus_pool = bus_total(bus_al).dropna()
+            _bus_p95 = (
+                float(np.quantile(_pbus_pool.to_numpy(dtype=np.float64), 0.95))
+                if len(_pbus_pool) >= 16 else None
+            )
+            eff_on_thr, _ = resolve_train_on_thr_w(
+                user_key, user_cfg, target, bus_p95_kw=_bus_p95
+            )
         else:
             eff_on_thr = 10.0
     else:

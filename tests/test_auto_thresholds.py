@@ -778,4 +778,166 @@ def test_2844_archetype_cross_season_heteropeak_override_and_upper_guard(
     assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
 
 
+def test_2842_archetype_wide_valley_on_thr_raw_upper_guard_and_downward_fn_recovery(
+    tmp_path: Path, base_cfg: dict, caplog
+):
+    """回归 2842 原型三项自愈升级：
+    1) 升级 ③（on_thr_w="auto" 大母线宽真空谷底抗零漂）：5MW 母线 + 待机<4kW + 工况>=404kW 真空谷底，
+       自动将 on_thr_w 从 10 上移至 50（免疫 10~45kW 回归底噪，保 metrics_daily.csv 干净）；
+       同时验证若 [10, 50) 存在 >0.2% 爬坡真值点（如 2844），严守 10 不误伤真值；
+    2) 升级 ①（pbus_mode="raw" + 全池 pool_on_p10 物理护栏收紧）：raw 模式下上限收紧为
+       0.65 * min(train_P10, pool_P10) ≈ 263kW，禁止阈值骑上 404kW 轻载工作下沿；
+    3) 升级 ②（反向跨季异峰救漏报 CROSS_SEASON_INFER_FN_RECOVERY_OVERRIDE）：
+       历史 val 因脏全关日顶到天花板（250/400），而当期 infer 无全关日且高位漏报激增（FN=45, recall=0.962），
+       双链收口器自动下调至当期最优 ~100kW（大幅挽回 FN>=65%、拉升 recall>=+2.5%），红字告警并全绿通过 audit。
+    """
+    import yaml
+    from nilm.pipeline.auto_thresholds import compute_decision_upper_guard_w
+
+    # --- 单元测试 1：验证大母线宽谷底抗零漂 vs 爬坡点零损伤保护 ---
+    rng = np.random.default_rng(2842)
+    y_2842_like = np.concatenate([
+        rng.uniform(0.5, 3.8, 1200),
+        rng.uniform(405.0, 820.0, 800),
+    ])
+    thr_2842, dec_2842 = resolve_auto_on_thr_w(y_2842_like, bus_p95_kw=5085.6)
+    assert thr_2842 == pytest.approx(50.0)
+    assert dec_2842["bus_zero_drift_margin_applied"] is True
+    assert any("WIDE_VALLEY_BUS_ZERO_DRIFT_MARGIN" in r for r in dec_2842["reasons"])
+
+    # 若 [10, 50) 存在 ~0.5% (>0.2% 红线) 爬坡真值点（待机 P99 仍 <4kW），即使母线 5085kW 也绝不上移误切真值
+    y_with_ramp = np.concatenate([
+        y_2842_like,
+        np.array([12.0, 14.0, 16.0, 18.0, 19.0, 22.0, 26.0, 32.0, 38.0, 44.0]),
+    ])
+    thr_ramp, dec_ramp = resolve_auto_on_thr_w(y_with_ramp, bus_p95_kw=5085.6)
+    assert thr_ramp == pytest.approx(10.0)
+    assert dec_ramp["bus_zero_drift_margin_applied"] is False
+
+    # --- 单元测试 2：验证 raw vs scaled 的 upper_guard_w 物理上限分化 ---
+    guard_raw = compute_decision_upper_guard_w(
+        on_thr_w=50.0, y_train_on_p10=504.45, pbus_mode="raw", pool_on_p10=404.656
+    )
+    guard_scaled = compute_decision_upper_guard_w(
+        on_thr_w=10.0, y_train_on_p10=504.45, pbus_mode="scaled", pool_on_p10=404.656
+    )
+    assert guard_raw == pytest.approx(0.65 * 404.656, rel=1e-4)
+    assert guard_raw < 270.0  # 严防 2842 (raw) 冲上 350/400kW
+    assert guard_scaled == pytest.approx(0.80 * 504.45, rel=1e-4)
+
+    # --- 端到端闭环测试 3：复刻 2842 5MW 母线训练 + 推理 + 反向异峰 FN 恢复同步 ---
+    full_base = dict(base_cfg)
+    full_base["metrics"] = [
+        "mae", "rmse", "r2", "sae",
+        "f1", "accuracy", "precision", "recall", "tp", "fp", "fn", "tn",
+    ]
+    base_file = tmp_path / "base_2842.yaml"
+    base_file.write_text(yaml.safe_dump(full_base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "outputs"
+    # bg_bus_kw=4500 + working_w=520 => 母线 P95 > 5000kW，待机 <=3kW，触发 on_thr_w="auto" -> 50kW
+    _write_bimodal_user_dir(
+        data_root, USER_KEY, "trains", days=16, start="2026-04-01",
+        standby_w=3.0, working_w=520.0, bg_bus_kw=4500.0, seed=81,
+    )
+    _write_bimodal_user_dir(
+        data_root, USER_KEY, "infers", days=12, start="2026-07-01",
+        standby_w=3.0, working_w=520.0, bg_bus_kw=4500.0, seed=82,
+    )
+
+    tf_file = tmp_path / "time_filters.json"
+    tf_file.write_text(json.dumps({
+        USER_KEY: {
+            "target_col": "p1",
+            "on_thr_w": "auto",
+            "decision_thr_w": "auto",
+            "pbus_mode": "raw",
+            "split_ratios": [0.6, 0.2, 0.2],
+            "split_strategy": "stratified_day",
+            "post_min_on": 1,
+            "post_fill_short_off": 3,
+        }
+    }), encoding="utf-8")
+
+    run_batch(
+        tf_file,
+        base_config_path=base_file,
+        data_root=data_root,
+        output_root=out_root,
+        stages=("train", "infer"),
+        force=True,
+    )
+    tr_dir = latest_done_dir(out_root / USER_KEY / "train")
+    inf_dir = latest_done_dir(out_root / USER_KEY / "infer")
+    assert tr_dir is not None and inf_dir is not None
+
+    tr_meta_init = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    # 验证端到端流水线自动定出 on_thr_w = 50.0，且 raw 物理上限收紧在 0.65 * P10 (~325W < 350W)
+    assert tr_meta_init["on_thr_w"] == pytest.approx(50.0)
+    assert tr_meta_init["train_upper_guard_w"] < 350.0
+    best_model = tr_meta_init["best_model"]
+    pcol = f"pred_{best_model}"
+
+    # 构造历史 val 脏全关日虚报（val 关态存在大量 235W 干扰，迫使 val 单独最优顶到 250~300W 天花板）
+    tp_csv = tr_dir / "predictions" / "train_predictions.csv"
+    tp_df_orig = pd.read_csv(tp_csv)
+    tp_df = tp_df_orig.copy()
+    val_off_idx = tp_df.index[(tp_df["split"] == "val") & (tp_df["target_state"] == 0)].to_numpy()
+    val_on_idx = tp_df.index[(tp_df["split"] == "val") & (tp_df["target_state"] == 1)].to_numpy()
+    tp_df.loc[val_on_idx, pcol] = 510.0
+    tp_df.loc[val_off_idx, pcol] = 235.0
+    tp_df.to_csv(tp_csv, index=False)
+
+    # 构造 2842 7 月推理分布（无全关日虚报灾难，但每段开机首尾有约 3.5% 轻载点落在 140W）：
+    # - 在高位阈值（250W 或旧盘面 400W）下：轻载点全漏（FN>=16, recall≈0.963 < 0.975, F1 受损）；
+    # - 在 100W 下：滤除 10~85W 底噪的同时完美保住 140W 轻载点（FN=0, recall=1.0, F1 显著更优）！
+    inf_csv = inf_dir / INFERENCE_RESULT_REL
+    inf_df = pd.read_csv(inf_csv)
+    on_idx = inf_df.index[inf_df["target_state"].to_numpy(dtype=int) == 1].to_numpy()
+    off_idx = inf_df.index[inf_df["target_state"].to_numpy(dtype=int) == 0].to_numpy()
+    inf_df.loc[on_idx, "pred"] = 510.0
+    # 注入首日连续 15 个轻载开机点（140W，前接关机段故不被 fill_off=3 填平）：
+    # 15 / 360 = 4.17%，使 @250~300W 时 FN=15、infer_recall=0.9583 (<0.975 且 >=0.95)，精确复刻 2842 (recall=0.9589)！
+    n_low_gear = max(13, min(16, int(0.042 * len(on_idx))))
+    inf_df.loc[on_idx[:n_low_gear], "pred"] = 140.0
+    inf_df.loc[off_idx, "pred"] = 25.0
+    inf_df.loc[off_idx[:30], "pred"] = 75.0  # 少量 <90W 关态毛刺，使 infer 最优落在 ~80~100W
+    inf_df.to_csv(inf_csv, index=False)
+
+    # 先模拟旧盘面被历史 val 顶在 400W 的初始状态
+    sync_decision_thr_artifacts(USER_KEY, tr_dir, inf_dir, 400.0, reason="simulate_stale_val_400")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        sync_res = calibrate_and_sync_joint_decision_thr(USER_KEY, tr_dir, inf_dir)
+
+    assert sync_res is not None
+    assert sync_res["synced"] is True
+    assert sync_res["heteropeak_override"] is True
+    resolved_thr = sync_res["resolved_decision_thr_w"]
+    assert 75.0 < resolved_thr < 140.0
+    assert sync_res["infer_after"]["fn"] == 0
+    assert sync_res["infer_after"]["recall"] >= 0.99
+    assert sync_res["infer_after"]["f1"] > sync_res["infer_before"]["f1"] + 0.01
+    assert any("CROSS_SEASON_INFER_FN_RECOVERY_OVERRIDE" in r for r in sync_res["reasons"])
+    assert any(
+        "\033[91m" in r.message and "[AUTO-DEC-THR-SYNC]" in r.message and "致漏报偏高" in r.message
+        for r in caplog.records
+    )
+
+    tr_meta_final = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    inf_meta_final = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8"))
+    assert tr_meta_final["on_thr_w"] == pytest.approx(50.0)
+    assert inf_meta_final["on_thr_w"] == pytest.approx(50.0)
+    assert tr_meta_final["decision_thr_w"] == pytest.approx(resolved_thr)
+    assert inf_meta_final["decision_thr_w"] == pytest.approx(resolved_thr)
+
+    # 恢复原始未篡改的 train_predictions 功率列并按 resolved_thr 复跑同步，验证双侧 T1-T4 / I1-I10 全绿
+    tp_df_orig.to_csv(tp_csv, index=False)
+    sync_decision_thr_artifacts(USER_KEY, tr_dir, inf_dir, resolved_thr, reason="verify_full_audit")
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+
+
 
