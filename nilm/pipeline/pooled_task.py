@@ -233,7 +233,9 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
     if isinstance(user_cfg.get("on_thr_w"), str) and user_cfg["on_thr_w"].strip().lower() == "auto":
         if target is not None and need_branch:
-            eff_on_thr, _ = resolve_train_on_thr_w(user_key, user_cfg, target)
+            eff_on_thr, _ = resolve_train_on_thr_w(
+                user_key, user_cfg, target, pbus_pool=bus_total(bus_al).reindex(target.index)
+            )
         else:
             eff_on_thr = 10.0
     else:

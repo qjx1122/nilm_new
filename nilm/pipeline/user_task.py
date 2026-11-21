@@ -521,16 +521,20 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             _br_tr = filter_dataframe(branch_c, tspec_pre.get("include"), tspec_pre.get("exclude"))
             if len(_br_tr) > 0:
                 target_for_on_thr = build_target(_br_tr, target_cols)
-        on_thr, on_thr_decision = resolve_train_on_thr_w(user_key, user_cfg, target_for_on_thr)
+
+        # —— §5 统一 15min（聚合策略可配置且记录；前移以便为三峰待机/多档位仲裁提供零泄漏训练期母线参考）
+        bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
+        _dump(out / "agg_strategy.json", agg_record)
+        pbus_for_on_thr = bus_total(bus15).reindex(target_for_on_thr.index)
+
+        on_thr, on_thr_decision = resolve_train_on_thr_w(
+            user_key, user_cfg, target_for_on_thr, pbus_pool=pbus_for_on_thr
+        )
 
         # —— 训练前分路开机情况分析（有效通道=目标通道，逐天开机段/时长/功率/电量）
         sessions = analyze_branch_sessions(branch_c, on_thr,
                                            columns=target_cols)
         sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
-
-        # —— §5 统一 15min（聚合策略可配置且记录）
-        bus15, agg_record = resample_bus(bus_c, strategy=pp.get("agg_strategy"))
-        _dump(out / "agg_strategy.json", agg_record)
 
         # —— 时间对齐（重叠率门禁；偏移只报告不改戳）
         bus_al, branch_al = align_frames(bus15, branch_c,

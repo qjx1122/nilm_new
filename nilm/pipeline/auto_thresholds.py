@@ -102,8 +102,158 @@ def _otsu_log1p(y_pos: np.ndarray, n_bins: int = 256) -> tuple[float, float]:
     return float(np.expm1(z_star)), eta
 
 
+def _spearman_1d(a: np.ndarray, b: np.ndarray) -> float | None:
+    """轻量级一维 Spearman 秩相关系数（不引额外重依赖，常数序列安全返回 None）。"""
+    if len(a) < 8 or len(b) != len(a):
+        return None
+    sa = pd.Series(a).rank().to_numpy(dtype=np.float64)
+    sb = pd.Series(b).rank().to_numpy(dtype=np.float64)
+    std_a = float(sa.std())
+    std_b = float(sb.std())
+    if std_a < 1e-12 or std_b < 1e-12:
+        return None
+    r = float(np.corrcoef(sa, sb)[0, 1])
+    return round(r, 4) if np.isfinite(r) else None
+
+
+def _evaluate_bus_observability_for_trimodal(
+    y_pool: np.ndarray | pd.Series,
+    pbus_pool: np.ndarray | pd.Series | None,
+    thr_1: float,
+    thr_2: float,
+    c0_p50: float,
+    c1_p50: float,
+) -> dict:
+    """尺度不变母线可观测性仲裁器：对比首谷 thr_1（待机子簇）与次谷 thr_2（主工作簇）的母线边沿信噪比。
+
+    无论 pbus 处于 PT/CT 校正前（二次侧）或校正后（一次侧 kW），常数倍率在 |Δpbus| 分子与背景 P90 分母中严格约消。
+    """
+    if pbus_pool is None:
+        return {"available": False}
+
+    if isinstance(y_pool, pd.Series) and isinstance(pbus_pool, pd.Series):
+        aligned = pd.concat({"y": y_pool, "pbus": pbus_pool}, axis=1).dropna()
+        if len(aligned) < 32:
+            return {"available": False}
+        if isinstance(aligned.index, pd.DatetimeIndex):
+            if not aligned.index.is_monotonic_increasing:
+                aligned = aligned.sort_index()
+            yb = np.maximum(aligned["y"].to_numpy(dtype=np.float64), 0.0)
+            pb = aligned["pbus"].to_numpy(dtype=np.float64)
+            adj = np.asarray(
+                (aligned.index[1:] - aligned.index[:-1]) == pd.Timedelta(minutes=15),
+                dtype=bool,
+            )
+        else:
+            yb = np.maximum(aligned["y"].to_numpy(dtype=np.float64), 0.0)
+            pb = aligned["pbus"].to_numpy(dtype=np.float64)
+            adj = np.ones(len(yb) - 1, dtype=bool)
+    else:
+        ya = np.asarray(y_pool, dtype=np.float64).reshape(-1)
+        pa = np.asarray(pbus_pool, dtype=np.float64).reshape(-1)
+        if len(ya) != len(pa):
+            return {"available": False}
+        vm = np.isfinite(ya) & np.isfinite(pa)
+        if int(vm.sum()) < 32:
+            return {"available": False}
+        yb = np.maximum(ya[vm], 0.0)
+        pb = pa[vm]
+        if isinstance(y_pool, pd.Series) and isinstance(y_pool.index, pd.DatetimeIndex):
+            ts_v = pd.DatetimeIndex(y_pool.index)[vm]
+            if not ts_v.is_monotonic_increasing:
+                ord_i = np.argsort(ts_v.asi8, kind="mergesort")
+                ts_v = ts_v[ord_i]
+                yb = yb[ord_i]
+                pb = pb[ord_i]
+            adj = np.asarray(
+                (ts_v[1:] - ts_v[:-1]) == pd.Timedelta(minutes=15),
+                dtype=bool,
+            )
+        else:
+            adj = np.ones(len(yb) - 1, dtype=bool)
+
+    if int(adj.sum()) < 16:
+        return {"available": False}
+
+    y_prev = yb[:-1][adj]
+    y_curr = yb[1:][adj]
+    dy_abs = np.abs(y_curr - y_prev)
+    dbus_abs = np.abs(pb[1:] - pb[:-1])[adj]
+
+    edge_1 = ((y_prev < thr_1) & (y_curr >= 2.0 * thr_1)) | ((y_prev >= 2.0 * thr_1) & (y_curr < thr_1))
+    edge_2 = ((y_prev < thr_2) & (y_curr >= 2.0 * thr_2)) | ((y_prev >= 2.0 * thr_2) & (y_curr < thr_2))
+    edge_sub = (
+        ((y_prev < thr_1) & (y_curr >= thr_1) & (y_curr < thr_2))
+        | ((y_prev >= thr_1) & (y_prev < thr_2) & (y_curr < thr_1))
+    )
+
+    # 母线纯背景波动基准：优先取目标分路近似平稳步（无分路自身跳变污染），不足时回退非主簇跳变步
+    flat_tol = max(0.25 * thr_1, 0.05 * max(c1_p50, 1e-6), 1e-6)
+    flat_mask = dy_abs <= flat_tol
+    if int(flat_mask.sum()) >= 10:
+        bg_p90 = float(np.quantile(dbus_abs[flat_mask], 0.90))
+    elif int((~edge_2).sum()) >= 10:
+        bg_p90 = float(np.quantile(dbus_abs[~edge_2], 0.90))
+    else:
+        bg_p90 = float(np.quantile(dbus_abs, 0.90))
+    bg_p90 = max(bg_p90, 1e-9)
+
+    n_e1 = int(edge_1.sum())
+    n_e2 = int(edge_2.sum())
+    n_esub = int(edge_sub.sum())
+
+    snr_1 = round(float(np.median(dbus_abs[edge_1]) / bg_p90), 4) if n_e1 >= 6 else None
+    snr_2 = round(float(np.median(dbus_abs[edge_2]) / bg_p90), 4) if n_e2 >= 6 else None
+
+    s_bus_br: float | None = None
+    if n_e2 >= 4:
+        valid_e2 = edge_2 & (dy_abs > 1e-6)
+        if int(valid_e2.sum()) >= 4:
+            s_bus_br = float(np.median(dbus_abs[valid_e2] / dy_abs[valid_e2]))
+
+    if n_esub >= 6:
+        snr_sub = round(float(np.median(dbus_abs[edge_sub]) / bg_p90), 4)
+        snr_sub_mode = "direct_edges"
+    elif s_bus_br is not None and np.isfinite(s_bus_br) and s_bus_br > 0:
+        implied_dbus_c1 = s_bus_br * max(c1_p50 - c0_p50, 0.0)
+        snr_sub = round(float(implied_dbus_c1 / bg_p90), 4)
+        snr_sub_mode = "implied_step_ratio"
+    else:
+        snr_sub = None
+        snr_sub_mode = "unavailable"
+
+    sub_mask = yb < thr_2
+    r_sub = _spearman_1d(pb[sub_mask], yb[sub_mask]) if int(sub_mask.sum()) >= 16 else None
+
+    sub_buried = (
+        snr_sub is not None
+        and snr_sub < 1.0
+        and (n_esub >= 6 or r_sub is None or abs(r_sub) < 0.30)
+    )
+    main_clear = (
+        snr_2 is not None
+        and snr_2 >= 1.0
+        and (snr_1 is None or snr_1 < 1.0 or snr_2 >= 1.35 * snr_1)
+    )
+
+    return {
+        "available": True,
+        "n_aligned": int(len(yb)),
+        "n_edges_thr1": n_e1,
+        "n_edges_thr2": n_e2,
+        "n_edges_sub": n_esub,
+        "snr_thr1": snr_1,
+        "snr_thr2": snr_2,
+        "snr_sub": snr_sub,
+        "snr_sub_mode": snr_sub_mode,
+        "r_sub_spearman": r_sub,
+        "promote_ok": bool(sub_buried and main_clear),
+    }
+
+
 def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
-                          fallback_thr_w: float = 10.0) -> tuple[float, dict]:
+                          fallback_thr_w: float = 10.0,
+                          pbus_pool: np.ndarray | pd.Series | None = None) -> tuple[float, dict]:
     """基于训练范围分路目标功率分布自动估计物理开态阈值 on_thr_w。
 
     遵循《调参实战手册》Step 1a 物理定阈准则：
@@ -184,10 +334,11 @@ def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
     hi_bound = max(0.30 * y_on_p05, 0.001)
     lo_bound = min(max(1.15 * y_off_p99, 0.001), hi_bound)
     clamped = float(np.clip(raw_thr, lo_bound, hi_bound))
-    resolved = _snap_nice_threshold(clamped, lo=lo_bound, hi=hi_bound)
-    resolved = float(np.clip(resolved, 0.001, 5000.0))
+    thr_1 = _snap_nice_threshold(clamped, lo=lo_bound, hi=hi_bound)
+    thr_1 = float(np.clip(thr_1, 0.001, 5000.0))
+    resolved = thr_1
 
-    # 谷底过渡带/多档待机歧义检测（同时检测谷底弥散与开态簇内部多档辅机双峰分裂）
+    # 谷底过渡带/多档待机歧义检测 + 三峰寄生待机簇跨越仲裁（两级递归 Otsu + 能量占比 + 母线 SNR）
     valley_lo = max(1.20 * y_off_p99, 1.0)
     valley_hi = 0.50 * y_on_p05
     if valley_hi > valley_lo:
@@ -196,40 +347,136 @@ def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
         valley_density = 0.0
 
     on_sub_eta = 0.0
-    if len(y_on) >= 20 and y_on_p95 > 2.5 * max(y_on_p10, 0.1):
-        _, on_sub_eta = _otsu_log1p(y_on)
+    v_2: float | None = None
+    thr_2: float | None = None
+    energy_share_c2: float | None = None
+    bus_obs: dict = {"available": False}
+    promoted_trimodal = False
+    verified_multigear = False
+
+    y_on_low_q = (
+        float(np.quantile(y_on, min(0.10, max(0.005, 6.0 / float(len(y_on))))))
+        if len(y_on) > 0 else 0.0
+    )
+    if len(y_on) >= 20 and y_on_p95 > 2.5 * max(y_on_low_q, 0.1):
+        v_2, on_sub_eta = _otsu_log1p(y_on)
+        c0 = y_off
+        c1 = y_nonneg[(y_nonneg >= y_otsu) & (y_nonneg < v_2)]
+        c2 = y_nonneg[y_nonneg >= v_2]
+        c01 = y_nonneg[y_nonneg < v_2]
+        if len(c1) >= 8 and len(c2) >= 16 and len(c01) >= 8:
+            c0_p50 = float(np.quantile(c0, 0.50)) if len(c0) > 0 else 0.0
+            c0_p99 = float(np.quantile(c0, 0.99)) if len(c0) > 0 else 0.0
+            c1_p50 = float(np.quantile(c1, 0.50))
+            c1_p90 = float(np.quantile(c1, 0.90))
+            c01_p98 = float(np.quantile(c01, 0.98))
+            c01_p99 = float(np.quantile(c01, 0.99))
+            c2_p05 = float(np.quantile(c2, 0.05))
+            c2_p10 = float(np.quantile(c2, 0.10))
+            c2_p50 = float(np.quantile(c2, 0.50))
+            lo_2 = max(1.15 * c01_p98, 0.001)
+            hi_2 = max(0.35 * c2_p05, 0.001)
+            energy_share_c2 = float(c2.sum() / max(float(y_on.sum()), 1e-9))
+            if lo_2 <= hi_2:
+                raw_2 = max(1.30 * c01_p98, 1.10 * c01_p99, c01_p98 + 0.01 * c2_p50)
+                cand_thr_2 = _snap_nice_threshold(float(np.clip(raw_2, lo_2, hi_2)), lo=lo_2, hi=hi_2)
+                thr_2 = float(np.clip(cand_thr_2, 0.001, 5000.0))
+                duty_c2 = float((y_nonneg >= thr_2).mean())
+                gate_a = (
+                    on_sub_eta >= 0.76
+                    and thr_2 >= max(2.0 * thr_1, thr_1 + 1e-6)
+                    and c2_p50 >= 4.0 * max(c1_p50, 1e-3)
+                    and duty_c2 >= 0.05
+                    and energy_share_c2 >= 0.88
+                )
+                bus_obs = _evaluate_bus_observability_for_trimodal(
+                    y_pool, pbus_pool, thr_1, thr_2, c0_p50=c0_p50, c1_p50=c1_p50
+                )
+                if gate_a:
+                    if bus_obs.get("available"):
+                        if bus_obs.get("promote_ok"):
+                            promoted_trimodal = True
+                        elif (bus_obs.get("snr_sub") is not None) and float(bus_obs["snr_sub"]) >= 1.2:
+                            verified_multigear = True
+                    else:
+                        # 无母线输入兜底：仅当零值断电簇 + 极低幅值寄生簇（<=8% 主簇功率）且主簇能量 >=95% 时晋升
+                        if (
+                            c0_p99 <= max(5.0, 0.005 * c2_p50)
+                            and c1_p90 <= 0.08 * max(c2_p50, 1e-9)
+                            and on_sub_eta >= 0.82
+                            and energy_share_c2 >= 0.95
+                        ):
+                            promoted_trimodal = True
+
+                if promoted_trimodal and thr_2 is not None:
+                    resolved = thr_2
+                    y_off_p98 = c01_p98
+                    y_off_p99 = c01_p99
+                    y_on_p05 = c2_p05
+                    y_on_p10 = c2_p10
+                    y_on_p50 = c2_p50
+                    v_lo2 = max(1.20 * c01_p98, 1.0)
+                    v_hi2 = 0.50 * c2_p05
+                    valley_density = (
+                        float(((y_nonneg >= v_lo2) & (y_nonneg <= v_hi2)).mean())
+                        if v_hi2 > v_lo2 else 0.0
+                    )
 
     reasons: list[str] = []
     confidence = "high"
+    stage_name = "auto_trimodal_standby_promoted" if promoted_trimodal else "auto_bimodal"
+    eff_eta = on_sub_eta if promoted_trimodal else otsu_eta
+
     if len(y) < 96:
         confidence = "low"
         reasons.append("SHORT_SERIES_LT_1DAY")
-    if otsu_eta < 0.72:
-        confidence = "low"
-        reasons.append(f"LOW_BIMODAL_SEPARABILITY(eta={otsu_eta:.3f}<0.72)")
-    if valley_density > 0.08:
-        confidence = "low"
-        reasons.append(f"INTERMEDIATE_PLATEAU_SUSPECTED(valley_ratio={valley_density:.3f}>0.08)")
-    if y_on_p95 > 2.5 * max(y_on_p10, 0.1) and on_sub_eta >= 0.72:
-        confidence = "low"
+
+    if promoted_trimodal:
         reasons.append(
-            f"MULTIMODAL_ON_GEAR_SUSPECTED(on_p10={y_on_p10:.1f},on_p95={y_on_p95:.1f},sub_eta={on_sub_eta:.3f})"
+            f"BURIED_STANDBY_CLUSTER_PROMOTED(thr1={thr_1:.4g}->thr2={resolved:.4g},"
+            f"sub_eta={on_sub_eta:.3f},c2_energy={energy_share_c2:.3f},"
+            f"snr_sub={bus_obs.get('snr_sub')},snr2={bus_obs.get('snr_thr2')})"
         )
-    if y_off_p99 > 0.25 * max(y_on_p05, 1e-6):
-        confidence = "low"
-        reasons.append("HIGH_STANDBY_NARROW_GAP")
-    if not reasons:
-        reasons.append("LOG_OTSU_BIMODAL_CLEAR")
+        if valley_density > 0.08:
+            confidence = "low"
+            reasons.append(f"INTERMEDIATE_PLATEAU_SUSPECTED(valley_ratio={valley_density:.3f}>0.08)")
+    else:
+        if otsu_eta < 0.72:
+            confidence = "low"
+            reasons.append(f"LOW_BIMODAL_SEPARABILITY(eta={otsu_eta:.3f}<0.72)")
+        if valley_density > 0.08:
+            confidence = "low"
+            reasons.append(f"INTERMEDIATE_PLATEAU_SUSPECTED(valley_ratio={valley_density:.3f}>0.08)")
+        if verified_multigear:
+            reasons.append(
+                f"IDENTIFIABLE_MULTIGEAR_KEPT_LOW_THR(thr1={thr_1:.4g},"
+                f"snr_sub={bus_obs.get('snr_sub')},sub_eta={on_sub_eta:.3f})"
+            )
+        elif y_on_p95 > 2.5 * max(y_on_p10, 0.1) and on_sub_eta >= 0.72:
+            confidence = "low"
+            reasons.append(
+                f"MULTIMODAL_ON_GEAR_SUSPECTED(on_p10={y_on_p10:.1f},on_p95={y_on_p95:.1f},sub_eta={on_sub_eta:.3f})"
+            )
+        if y_off_p99 > 0.25 * max(y_on_p05, 1e-6):
+            confidence = "low"
+            reasons.append("HIGH_STANDBY_NARROW_GAP")
+        if not reasons:
+            reasons.append("LOG_OTSU_BIMODAL_CLEAR")
 
     on_ratio = float((y_nonneg >= resolved).mean())
-    return resolved, {
+    out_info = {
         "configured": "auto",
         "resolved_on_thr_w": resolved,
-        "stage": "auto_bimodal",
+        "stage": stage_name,
         "confidence": confidence,
         "n_samples": int(len(y)),
-        "otsu_valley_w": round(y_otsu, 3),
-        "otsu_eta": round(otsu_eta, 4),
+        "otsu_valley_w": round(float(v_2 if promoted_trimodal and v_2 is not None else y_otsu), 3),
+        "otsu_eta": round(float(eff_eta), 4),
+        "first_valley_thr_w": round(thr_1, 3),
+        "second_valley_thr_w": round(thr_2, 3) if thr_2 is not None else None,
+        "sub_otsu_eta": round(on_sub_eta, 4) if on_sub_eta > 0 else None,
+        "c2_energy_share": round(energy_share_c2, 4) if energy_share_c2 is not None else None,
+        "bus_observability": bus_obs if bus_obs.get("available") else None,
         "y_off_p98": round(y_off_p98, 3),
         "y_off_p99": round(y_off_p99, 3),
         "y_on_p05": round(y_on_p05, 3),
@@ -239,22 +486,29 @@ def resolve_auto_on_thr_w(y_pool: np.ndarray | pd.Series,
         "on_ratio": round(on_ratio, 4),
         "reasons": reasons,
     }
+    return resolved, out_info
 
 
 def resolve_train_on_thr_w(user_key: str, user_cfg: dict,
-                           target_train_window: pd.Series | np.ndarray) -> tuple[float, dict]:
+                           target_train_window: pd.Series | np.ndarray,
+                           pbus_pool: pd.Series | np.ndarray | None = None) -> tuple[float, dict]:
     """解析训练阶段 on_thr_w：显式数值优先；配置为 'auto' 时自动探测并输出黄/红高亮日志。"""
     cfg_val = user_cfg.get("on_thr_w", 10.0)
     prov = (user_cfg.get("_provenance") or {}).get("on_thr_w", "default(硬编码)")
     if isinstance(cfg_val, str) and cfg_val.strip().lower() == "auto":
-        resolved, decision = resolve_auto_on_thr_w(target_train_window, fallback_thr_w=10.0)
+        resolved, decision = resolve_auto_on_thr_w(
+            target_train_window, fallback_thr_w=10.0, pbus_pool=pbus_pool
+        )
         decision["provenance"] = prov
         if decision.get("confidence") == "high":
+            extra_note = ""
+            if decision.get("stage") == "auto_trimodal_standby_promoted":
+                extra_note = f", 三峰跨越待机底噪 {decision.get('first_valley_thr_w')}->{resolved:.4g}"
             log.warning("%s", yellow_text(
                 f"[{user_key}] [AUTO-ON-THR] on_thr_w=auto 自动定阈生效 -> "
                 f"on_thr_w={resolved:.4g} (双峰分离度 eta={decision.get('otsu_eta')}, "
                 f"待机P99={decision.get('y_off_p99')}, 工况P10={decision.get('y_on_p10')}, "
-                f"开机率={decision.get('on_ratio', 0.0) * 100:.1f}%)"
+                f"开机率={decision.get('on_ratio', 0.0) * 100:.1f}%{extra_note})"
             ))
         else:
             log.warning("%s", red_text(
@@ -306,6 +560,38 @@ def _eval_chain_candidate(y_true: np.ndarray, pred: np.ndarray,
         "tn": tn,
         "off_day_fp": off_day_fp,
     }
+
+
+def _add_off_pred_quantile_candidates(
+    raw_cands: set[float],
+    off_preds: np.ndarray,
+    min_cand_w: float,
+    upper_guard_w: float,
+) -> None:
+    """自适应补充关态预测噪声分位候选点（统一保留 5% 抗噪安全裕度，高基数样本加密 P96~P99.5）。"""
+    if len(off_preds) >= 8:
+        for q in (0.75, 0.90, 0.95, 0.98, 0.99):
+            qv = round(float(np.quantile(off_preds, q)) * 1.05, 2)
+            if min_cand_w <= qv <= upper_guard_w:
+                raw_cands.add(qv)
+    if len(off_preds) >= 20:
+        for q in (0.96, 0.97, 0.985, 0.995):
+            qv = round(float(np.quantile(off_preds, q)) * 1.05, 2)
+            if min_cand_w <= qv <= upper_guard_w:
+                raw_cands.add(qv)
+
+
+def _apply_anti_collapse_guard(items: list, get_row_fn, tot_neg: int) -> tuple[list, bool]:
+    """反全开坍缩特异性护栏：当负样本 >=12 且存在 Spec>=0.50 的可行点时，剔除 Spec<0.25（TN->0）的退化点。"""
+    if tot_neg < 12 or len(items) <= 1:
+        return items, False
+    has_healthy_spec = any((float(get_row_fn(it)["tn"]) / float(tot_neg)) >= 0.50 for it in items)
+    if not has_healthy_spec:
+        return items, False
+    kept = [it for it in items if (float(get_row_fn(it)["tn"]) / float(tot_neg)) >= 0.25]
+    if kept and len(kept) < len(items):
+        return kept, True
+    return items, False
 
 
 def resolve_auto_decision_thr_w(
@@ -376,11 +662,7 @@ def resolve_auto_decision_thr_w(
             raw_cands.add(round(float(g), 4))
     # 自适应补充关态预测噪声分位点（兼顾小功率 1~5kW 设备与大功率工业设备）
     off_preds = eval_p[(eval_y < base_thr) & np.isfinite(eval_p) & (eval_p > 0)]
-    if len(off_preds) >= 8:
-        for q in (0.75, 0.90, 0.95, 0.98, 0.99):
-            qv = round(float(np.quantile(off_preds, q)) * 1.05, 2)
-            if min_cand_w <= qv <= upper_guard_w:
-                raw_cands.add(qv)
+    _add_off_pred_quantile_candidates(raw_cands, off_preds, min_cand_w, upper_guard_w)
 
     cands = sorted(c for c in raw_cands if 0.001 <= c <= 5000.0)
     if not cands:
@@ -392,8 +674,12 @@ def resolve_auto_decision_thr_w(
     ]
     baseline_row = min(rows, key=lambda r: abs(r["thr"] - base_thr))
     feasible = [r for r in rows if r["recall"] >= MIN_VAL_RECALL]
+    tot_neg_eval = int((eval_y < base_thr).sum())
+    feasible, collapse_guarded = _apply_anti_collapse_guard(feasible, lambda r: r, tot_neg_eval)
 
     reasons = list(fallback_reasons)
+    if collapse_guarded:
+        reasons.append("ANTI_COLLAPSE_SPEC_GUARD")
     confidence = "high" if not fallback_reasons else "low"
     drift_anchor_w: float | None = None
 
@@ -404,7 +690,24 @@ def resolve_auto_decision_thr_w(
         selected = best_any if best_any["f1"] > baseline_row["f1"] + 1e-6 else baseline_row
     else:
         best_f1 = max(r["f1"] for r in feasible)
-        if baseline_row["recall"] >= MIN_VAL_RECALL and (best_f1 - baseline_row["f1"]) < MIN_DECISION_F1_GAIN:
+        hi_rec_better = [
+            r for r in feasible
+            if r["f1"] >= baseline_row["f1"] and r["recall"] >= 0.97
+        ]
+        min_fp_hi_rec = min((r["fp"] for r in hi_rec_better), default=baseline_row["fp"])
+        sig_fp_cut = (
+            baseline_row["fp"] >= 8
+            and (baseline_row["fp"] - min_fp_hi_rec) >= max(5, int(np.ceil(0.35 * baseline_row["fp"])))
+        )
+        baseline_spec_collapsed = (
+            tot_neg_eval >= 12 and (float(baseline_row["tn"]) / float(tot_neg_eval)) < 0.25 and collapse_guarded
+        )
+        if (
+            baseline_row["recall"] >= MIN_VAL_RECALL
+            and (best_f1 - baseline_row["f1"]) < MIN_DECISION_F1_GAIN
+            and not sig_fp_cut
+            and not baseline_spec_collapsed
+        ):
             selected = baseline_row
             reasons.append("KEEP_ON_THR_NEAR_OPTIMAL")
         else:
@@ -1026,15 +1329,32 @@ def resolve_auto_postprocess_and_decision_thr(
                     continue
                 feasible_keys.append((c, m, k))
 
+    tot_neg_3d = int((eval_y < base_thr).sum())
+    feasible_keys, collapse_3d = _apply_anti_collapse_guard(
+        feasible_keys, lambda key: table[key], tot_neg_3d
+    )
+
     reasons = list(fallback_reasons) + list(bounds.get("reasons", []))
+    if collapse_3d:
+        reasons.append("ANTI_COLLAPSE_SPEC_GUARD")
     confidence = "high" if not fallback_reasons else "low"
     amp_span = max(upper_guard_w - base_thr, base_thr, 1.0)
+    off_preds_3d = eval_p[(eval_y < base_thr) & np.isfinite(eval_p) & (eval_p > 0)]
+    tau_floor = (
+        max(base_thr, min(float(np.quantile(off_preds_3d, 0.95)), upper_guard_w))
+        if len(off_preds_3d) >= 20 else base_thr
+    )
 
     def _occam_score(key: tuple[float, int, int]) -> tuple[float, int, int, float]:
         c_v, m_v, k_v = key
         r = table[key]
-        amp_ratio = max(0.0, c_v - base_thr) / amp_span if c_is_auto else 0.0
-        off_pen = (0.50 * r["off_day_fp"] / n_off_pts) if has_off_days else (0.15 * r["fp"] / max(1, len(eval_y)))
+        amp_ratio = max(0.0, c_v - tau_floor) / amp_span if c_is_auto else 0.0
+        if has_off_days:
+            off_pen = 0.50 * r["off_day_fp"] / n_off_pts
+        elif tot_neg_3d >= 12:
+            off_pen = 0.12 * r["fp"] / float(tot_neg_3d)
+        else:
+            off_pen = 0.15 * r["fp"] / max(1, len(eval_y))
         reg_score = (
             r["f1"]
             - off_pen
@@ -1069,6 +1389,7 @@ def resolve_auto_postprocess_and_decision_thr(
             and (c_best_anchor - cand_c) >= max(10.0, 0.20 * base_thr)
             and cand_row["f1"] >= anchor_best_row["f1"] - 0.002
             and cand_row["off_day_fp"] <= anchor_best_row["off_day_fp"]
+            and cand_row["fp"] <= anchor_best_row["fp"] + 2
         )
 
         if (cand_m, cand_k) != (m_anchor, k_anchor) and (
@@ -1488,14 +1809,17 @@ def resolve_joint_val_infer_decision_thr_w(
                 raw_cands.add(round(float(g), 4))
         for y_s, p_s in ((y_va, p_va), (y_inf, p_inf)):
             off_p = p_s[(y_s < on_thr) & np.isfinite(p_s) & (p_s > 0)]
-            if len(off_p) >= 8:
-                for q in (0.75, 0.90, 0.95, 0.98, 0.99):
-                    qv = round(float(np.quantile(off_p, q)) * 1.05, 2)
-                    if min_cand_w <= qv <= upper_guard_w:
-                        raw_cands.add(qv)
+            _add_off_pred_quantile_candidates(raw_cands, off_p, min_cand_w, upper_guard_w)
         cands = sorted(c for c in raw_cands if 0.001 <= c <= 5000.0)
     else:
         cands = [round(cur_dec, 4)]
+
+    tot_neg_inf = int((y_inf < on_thr).sum())
+    off_p_inf_all = p_inf[(y_inf < on_thr) & np.isfinite(p_inf) & (p_inf > 0)]
+    tau_floor_inf = (
+        max(on_thr, min(float(np.quantile(off_p_inf_all, 0.95)), upper_guard_w))
+        if len(off_p_inf_all) >= 20 else on_thr
+    )
 
     inf_pp = inf_meta.get("postprocess") or {}
     m_joint_auto = (
@@ -1558,6 +1882,9 @@ def resolve_joint_val_infer_decision_thr_w(
         val_feas_3d = [key for key in all_cand_3d if _mk_ok_val(*key)]
         val_peak_f1_3d = max((val_tab[key]["f1"] for key in val_feas_3d), default=0.0)
         inf_feas_3d = [key for key in all_cand_3d if _mk_ok_inf(*key)]
+        inf_feas_3d, collapse_inf_3d = _apply_anti_collapse_guard(
+            inf_feas_3d, lambda key: inf_tab[key], tot_neg_inf
+        )
 
         amp_span = max(upper_guard_w - on_thr, on_thr, 1.0)
 
@@ -1565,8 +1892,13 @@ def resolve_joint_val_infer_decision_thr_w(
             c_v, m_v, k_v = key
             ri = inf_tab[key]
             rv = val_tab[key]
-            amp_ratio = max(0.0, c_v - on_thr) / amp_span if len(cands) > 1 else 0.0
-            off_pen = (0.50 * ri["off_day_fp"] / inf_n_off) if inf_has_off else (0.15 * ri["fp"] / max(1, len(y_inf)))
+            amp_ratio = max(0.0, c_v - tau_floor_inf) / amp_span if len(cands) > 1 else 0.0
+            if inf_has_off:
+                off_pen = 0.50 * ri["off_day_fp"] / inf_n_off
+            elif tot_neg_inf >= 12:
+                off_pen = 0.12 * ri["fp"] / float(tot_neg_inf)
+            else:
+                off_pen = 0.15 * ri["fp"] / max(1, len(y_inf))
             score = (
                 ri["f1"]
                 - off_pen
@@ -1592,6 +1924,8 @@ def resolve_joint_val_infer_decision_thr_w(
         ]
         confidence = "high"
         reasons_3d: list[str] = []
+        if collapse_inf_3d:
+            reasons_3d.append("ANTI_COLLAPSE_SPEC_GUARD")
         heteropeak_override = False
         val_capped_candidate: float | None = None
 
@@ -1608,6 +1942,20 @@ def resolve_joint_val_infer_decision_thr_w(
                 reasons_3d.append("INFER_RECALL_ONLY_FALLBACK")
 
         cur_3d = (cur_key, post_min_on, post_fill_off)
+        if joint_feas_3d and tot_neg_inf >= 12 and inf_tab[cur_3d]["recall"] >= MIN_VAL_RECALL:
+            non_down_collapse = [
+                key for key in joint_feas_3d
+                if not (
+                    key[0] < cur_dec - 1e-6
+                    and inf_tab[key]["fp"] > inf_tab[cur_3d]["fp"]
+                    and (float(inf_tab[key]["tn"]) / float(tot_neg_inf)) < 0.50
+                )
+            ]
+            if non_down_collapse:
+                if len(non_down_collapse) < len(joint_feas_3d) and "ANTI_DOWNWARD_COLLAPSE_GUARD" not in reasons_3d:
+                    reasons_3d.append("ANTI_DOWNWARD_COLLAPSE_GUARD")
+                joint_feas_3d = non_down_collapse
+
         if not joint_feas_3d:
             confidence = "low"
             reasons_3d.append("RECALL_BELOW_095_GUARD")
@@ -1626,6 +1974,7 @@ def resolve_joint_val_infer_decision_thr_w(
                 and (cur_dec - cand_joint_key[0]) >= max(10.0, 0.20 * on_thr)
                 and cand_inf_r["f1"] >= cur_inf_r["f1"] - 0.002
                 and cand_inf_r["off_day_fp"] <= cur_inf_r["off_day_fp"]
+                and cand_inf_r["fp"] <= cur_inf_r["fp"] + 2
             )
             if (
                 cur_3d in joint_feas_3d
@@ -1712,6 +2061,9 @@ def resolve_joint_val_infer_decision_thr_w(
     val_feas = [c for c in cands if val_map[c]["recall"] >= MIN_VAL_RECALL]
     val_peak_f1 = max((val_map[c]["f1"] for c in val_feas), default=0.0)
     inf_feas = [c for c in cands if inf_map[c]["recall"] >= MIN_VAL_RECALL]
+    inf_feas, collapse_inf_1d = _apply_anti_collapse_guard(
+        inf_feas, lambda c: inf_map[c], tot_neg_inf
+    )
 
     # 计算无历史 val 否决约束的纯 infer 链最优候选（严格受 infer_recall >= 0.95 与训练物理上限 upper_guard_w 保护）
     pure_inf_c: float | None = None
@@ -1730,20 +2082,21 @@ def resolve_joint_val_infer_decision_thr_w(
         )
 
     joint_feas = [
-        c for c in cands
-        if inf_map[c]["recall"] >= MIN_VAL_RECALL
-        and (not val_feas or (val_map[c]["recall"] >= MIN_VAL_RECALL and val_map[c]["f1"] >= val_peak_f1 - 0.02))
+        c for c in inf_feas
+        if (not val_feas or (val_map[c]["recall"] >= MIN_VAL_RECALL and val_map[c]["f1"] >= val_peak_f1 - 0.02))
     ]
     confidence = "high"
     reasons: list[str] = []
+    if collapse_inf_1d:
+        reasons.append("ANTI_COLLAPSE_SPEC_GUARD")
     heteropeak_override = False
     val_capped_candidate: float | None = None
 
     if not joint_feas:
         # 极端跨期偏移兜底：放宽 val_F1 下限但仍尝试兼顾 infer_recall >= 0.95 与 val_recall >= 0.93
         joint_feas = [
-            c for c in cands
-            if inf_map[c]["recall"] >= MIN_VAL_RECALL and val_map[c]["recall"] >= 0.93
+            c for c in inf_feas
+            if val_map[c]["recall"] >= 0.93
         ]
         if joint_feas:
             confidence = "low"
@@ -1754,6 +2107,20 @@ def resolve_joint_val_infer_decision_thr_w(
             confidence = "low"
             heteropeak_override = True
             reasons.append("INFER_RECALL_ONLY_FALLBACK")
+
+    if joint_feas and tot_neg_inf >= 12 and inf_map[cur_key]["recall"] >= MIN_VAL_RECALL:
+        non_down_1d = [
+            c for c in joint_feas
+            if not (
+                c < cur_dec - 1e-6
+                and inf_map[c]["fp"] > inf_map[cur_key]["fp"]
+                and (float(inf_map[c]["tn"]) / float(tot_neg_inf)) < 0.50
+            )
+        ]
+        if non_down_1d:
+            if len(non_down_1d) < len(joint_feas) and "ANTI_DOWNWARD_COLLAPSE_GUARD" not in reasons:
+                reasons.append("ANTI_DOWNWARD_COLLAPSE_GUARD")
+            joint_feas = non_down_1d
 
     if not joint_feas:
         confidence = "low"

@@ -18,6 +18,7 @@ from nilm.pipeline.auto_thresholds import (
     log_auto_decision_thr_train,
     resolve_auto_decision_thr_w,
     resolve_auto_on_thr_w,
+    resolve_auto_postprocess_and_decision_thr,
     resolve_infer_thresholds,
     resolve_joint_val_infer_decision_thr_w,
     resolve_train_on_thr_w,
@@ -1170,6 +1171,331 @@ def test_joint_val_infer_3d_auto_postprocess_sync(tmp_path: Path, base_cfg: dict
     assert tr_meta_after["post_min_on"] == res_joint["resolved_post_min_on"]
     assert inf_meta_after["post_min_on"] == res_joint["resolved_post_min_on"]
     assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+
+# ---------------------------------------------------------------- 14. 901 原型：三峰寄生待机簇跨越 + 尺度不变性校验
+def test_trimodal_buried_standby_promoted_901_archetype(caplog):
+    rng = np.random.default_rng(901)
+    n = 96 * 20
+    idx = pd.date_range("2026-05-01", periods=n, freq="15min")
+    y = np.zeros(n, dtype=np.float64)
+    # 模拟全开机日三峰分布（无全天关机休息日）：每天含短时彻底断电归零簇 (<2.5W, ~8%)、
+    # 四路叠加待机簇 (70~130W, ~6%) 与主工作簇 (720~2050W, ~86%)，令一级对数 Otsu 落在 ~10W 首谷
+    for d in range(20):
+        s = d * 96
+        y[s : s + 8] = rng.uniform(0.0, 2.2, 8)
+        y[s + 8 : s + 14] = rng.uniform(70.0, 130.0, 6)
+        y[s + 14 : s + 96] = rng.uniform(720.0, 2050.0, 82)
+    y_ser = pd.Series(y, index=idx)
+
+    # 模拟 PT*CT=12000 高倍率二次侧母线功率（单位 W）：背景基荷约 3.2W ± 0.035W（折算一次侧 ±420W 波动），
+    # 故 90W 分路待机边沿（二次侧仅 0.0075W）完全淹没于母线底噪，而 1400W 主工作簇（二次侧 ~0.12W）清晰可辨
+    bg_sec_w = 3.2 + 0.4 * np.sin(2 * np.pi * (np.arange(n) % 96) / 96.0) + rng.normal(0.0, 0.035, n)
+    pbus_sec_w = pd.Series(bg_sec_w + y / 12000.0, index=idx)
+
+    thr_sec, info_sec = resolve_auto_on_thr_w(y_ser, pbus_pool=pbus_sec_w)
+    assert info_sec["stage"] == "auto_trimodal_standby_promoted"
+    assert info_sec["confidence"] == "high"
+    assert info_sec["first_valley_thr_w"] <= 25.0
+    assert 140.0 <= thr_sec <= 260.0
+    assert any("BURIED_STANDBY_CLUSTER_PROMOTED" in r for r in info_sec["reasons"])
+    assert info_sec["bus_observability"]["snr_sub"] < 1.0
+    assert info_sec["bus_observability"]["snr_thr2"] >= 1.0
+
+    # 尺度不变性验证：将母线乘以 12.0（模拟一次侧 kW 口径），定阈与信噪比完全一致
+    pbus_pri_kw = pbus_sec_w * 12.0
+    thr_pri, info_pri = resolve_auto_on_thr_w(y_ser, pbus_pool=pbus_pri_kw)
+    assert thr_pri == pytest.approx(thr_sec, rel=1e-6)
+    assert info_pri["bus_observability"]["snr_sub"] == pytest.approx(
+        info_sec["bus_observability"]["snr_sub"], rel=1e-5
+    )
+
+    # 训练日志验证：高亮黄字且包含三峰跨越提示
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        tr_thr, _ = resolve_train_on_thr_w(
+            USER_KEY,
+            {"on_thr_w": "auto", "_provenance": {"on_thr_w": USER_KEY}},
+            y_ser,
+            pbus_pool=pbus_sec_w,
+        )
+    assert tr_thr == thr_sec
+    assert any(
+        "\033[93m" in r.message and "三峰跨越待机底噪" in r.message
+        for r in caplog.records
+    )
+
+
+# ---------------------------------------------------------------- 15. 真多档位设备保护：低速档在母线上清晰可辨时严禁误晋升
+def test_trimodal_identifiable_low_gear_kept_low_thr_protection():
+    rng = np.random.default_rng(2026)
+    n = 96 * 16
+    idx = pd.date_range("2026-06-01", periods=n, freq="15min")
+    y = np.zeros(n, dtype=np.float64)
+    # 模拟双速风机/水泵：0~25 关机 (<2W)，25~45 真低速档 (~180W)，45~85 高速档 (~1600W)，85~96 关机
+    for d in range(16):
+        s = d * 96
+        y[s : s + 25] = rng.uniform(0.0, 2.0, 25)
+        y[s + 25 : s + 45] = 180.0 + rng.normal(0.0, 6.0, 20)
+        y[s + 45 : s + 85] = 1600.0 + rng.normal(0.0, 25.0, 40)
+        y[s + 85 : s + 96] = rng.uniform(0.0, 2.0, 11)
+    y_ser = pd.Series(y, index=idx)
+    # 干净母线（背景抖动仅 ±12W），0 <-> 180W 低速档启停在母线上产生清晰 ~180W 阶跃（SNR >> 1.2）
+    pbus_clean = pd.Series(500.0 + y + rng.normal(0.0, 12.0, n), index=idx)
+
+    thr, info = resolve_auto_on_thr_w(y_ser, pbus_pool=pbus_clean)
+    assert info["stage"] == "auto_bimodal"
+    assert thr < 60.0
+    assert any("IDENTIFIABLE_MULTIGEAR_KEPT_LOW_THR" in r for r in info["reasons"])
+    assert info["bus_observability"]["snr_sub"] >= 1.2
+
+
+# ---------------------------------------------------------------- 16. 全开机日（off_days=0）防 TN->0 常开坍缩、MSE 底噪跨越与双链防下坠
+def test_all_active_days_anti_collapse_and_mse_floor_crossing(tmp_path: Path):
+    rng = np.random.default_rng(9012)
+    n_va = 96 * 6
+    idx_va = pd.date_range("2026-06-01", periods=n_va, freq="15min")
+    y_va = np.zeros(n_va, dtype=np.float64)
+    # 每天 10 个停机点 (~90W 待机)、86 个开机点 (~1400W)，即 off_days=0、占空比 89.6%
+    for d in range(6):
+        s = d * 96
+        y_va[s : s + 10] = rng.uniform(75.0, 125.0, 10)
+        y_va[s + 10 : s + 96] = rng.uniform(750.0, 1950.0, 86)
+
+    # 模型在真关态 (<130W) 输出 135~190W MSE 回归底噪，另有 ~25% 停机点带 230~265W 尖峰
+    off_mask_va = y_va < 130.0
+    p_va = np.where(off_mask_va, rng.uniform(135.0, 190.0, n_va), y_va * 0.96)
+    off_idx_va = np.flatnonzero(off_mask_va)
+    p_va[off_idx_va[::4]] = rng.uniform(230.0, 265.0, len(off_idx_va[::4]))
+
+    # (A) 在 on_thr_w=130W 处（真停机点全部 <130W，共 60 个负样本，但模型底噪 >=135W 致 130W 处 TN=0 常开坍缩，F1 仍有 ~0.945）：
+    #     1D 与 3D 校准器均须触发 ANTI_COLLAPSE_SPEC_GUARD 并跨越底噪上沿，严禁停留在 130W
+    dec_low_base, info_low_base = resolve_auto_decision_thr_w(
+        y_train=y_va,
+        y_val=y_va,
+        pred_val=p_va,
+        val_index=idx_va,
+        on_thr_w=130.0,
+        post_min_on=1,
+        post_fill_off=3,
+        calibrated_model="transformer",
+    )
+    assert "ANTI_COLLAPSE_SPEC_GUARD" in info_low_base["reasons"]
+    assert dec_low_base >= 195.0
+
+    dec_3d_low, _, _, dec_info_3d_low, _ = resolve_auto_postprocess_and_decision_thr(
+        y_train=y_va,
+        y_val=y_va,
+        pred_val=p_va,
+        val_index=idx_va,
+        on_thr_w=130.0,
+        cfg_decision_thr_w="auto",
+        cfg_post_min_on="auto",
+        cfg_post_fill_off="auto",
+        train_index=idx_va,
+        calibrated_model="transformer",
+    )
+    assert dec_3d_low >= 195.0
+    assert dec_info_3d_low["val_f1_selected"] > 0.985
+
+    # (B) 当 on_thr_w=200W（在 200W 处仍有 >=15 个 230~265W 关态虚报，F1 差值 <0.015）：
+    #     高分位加密候选 + 显著消 FP 放行门将阈值抬升至 ~270W+，大幅清除残留 FP
+    dec_200, info_200 = resolve_auto_decision_thr_w(
+        y_train=y_va,
+        y_val=y_va,
+        pred_val=p_va,
+        val_index=idx_va,
+        on_thr_w=200.0,
+        post_min_on=1,
+        post_fill_off=3,
+        calibrated_model="transformer",
+    )
+    assert dec_200 >= 265.0
+    sel_row_200 = min(info_200["candidates"], key=lambda r: abs(r["thr"] - dec_200))
+    base_row_200 = min(info_200["candidates"], key=lambda r: abs(r["thr"] - 200.0))
+    assert sel_row_200["fp"] <= 3 and base_row_200["fp"] >= 12
+
+    # (C) 双链收口（1D 与 3D）：全开机日下严禁向下滑落造成 TN=0，而应向上收敛至无坍缩高特异区间
+    n_inf = 96 * 8
+    idx_inf = pd.date_range("2026-07-01", periods=n_inf, freq="15min")
+    y_inf = np.zeros(n_inf, dtype=np.float64)
+    for d in range(8):
+        s = d * 96
+        y_inf[s : s + 10] = rng.uniform(75.0, 125.0, 10)
+        y_inf[s + 10 : s + 96] = rng.uniform(750.0, 1950.0, 86)
+    off_mask_inf = y_inf < 200.0
+    p_inf = np.where(off_mask_inf, rng.uniform(130.0, 195.0, n_inf), y_inf * 0.96)
+    off_idx_inf = np.flatnonzero(off_mask_inf)
+    p_inf[off_idx_inf[::5]] = rng.uniform(225.0, 268.0, len(off_idx_inf[::5]))
+
+    tr_sim_dir = tmp_path / "sim_tr"
+    inf_sim_dir = tmp_path / "sim_inf"
+    (inf_sim_dir / INFERENCE_RESULT_REL).parent.mkdir(parents=True, exist_ok=True)
+    (tr_sim_dir / "predictions").mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame({
+        "timestamp": idx_va.strftime("%Y-%m-%d %H:%M:%S"),
+        "split": ["val"] * n_va,
+        "target": y_va,
+        "pred_transformer": p_va,
+    }).to_csv(tr_sim_dir / "predictions" / "train_predictions.csv", index=False)
+
+    pd.DataFrame({
+        "timestamp": idx_inf.strftime("%Y-%m-%d %H:%M:%S"),
+        "target": y_inf,
+        "pred": p_inf,
+        "on_thr_w": 200.0,
+        "decision_thr_w": 200.0,
+        "target_state": (y_inf >= 200.0).astype(int),
+        "pred_state": (p_inf >= 200.0).astype(int),
+    }).to_csv(inf_sim_dir / INFERENCE_RESULT_REL, index=False)
+
+    for post_cfg in ("explicit", "auto"):
+        tr_meta_sim = {
+            "best_model": "transformer",
+            "on_thr_w": 200.0,
+            "decision_thr_w": 200.0,
+            "decision_thr_w_configured": "auto",
+            "post_min_on": 1,
+            "post_fill_short_off": 3,
+            "post_min_on_configured": "auto" if post_cfg == "auto" else 1,
+            "post_fill_short_off_configured": "auto" if post_cfg == "auto" else 3,
+            "postprocess_bounds": {"m_max": 4, "k_max": 3},
+            "decision_thr_w_decision": {"y_on_p10": 820.0, "upper_guard_w": 656.0},
+        }
+        inf_meta_sim = {
+            "model": "transformer",
+            "on_thr_w": 200.0,
+            "decision_thr_w": 200.0,
+            "post_min_on": 1,
+            "post_fill_short_off": 3,
+            "post_min_on_configured": "auto" if post_cfg == "auto" else 1,
+            "post_fill_short_off_configured": "auto" if post_cfg == "auto" else 3,
+        }
+        (tr_sim_dir / "meta.json").write_text(json.dumps(tr_meta_sim), encoding="utf-8")
+        (inf_sim_dir / "meta.json").write_text(json.dumps(inf_meta_sim), encoding="utf-8")
+
+        j_thr, j_info = resolve_joint_val_infer_decision_thr_w(
+            tr_sim_dir, inf_sim_dir
+        )
+        assert j_thr is not None and j_thr >= 260.0
+        assert j_info["infer_after"]["f1"] >= 0.99
+        assert j_info["infer_after"]["fp"] <= 5
+        assert j_info["infer_after"]["recall"] >= 0.98
+
+
+# ---------------------------------------------------------------- 17. 端到端 901 原型全链路回归（四分路合并 + 高倍率母线 + 全开机日 + 审计零异常）
+def test_end_to_end_901_trimodal_all_active_days_pipeline_and_audit(tmp_path: Path, base_cfg: dict):
+    import yaml
+
+    rng = np.random.default_rng(901901)
+    user_901 = "800080270901_4200008005677"
+    device, user = user_901.split("_")
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "outputs"
+
+    for mode_dir, start_dt, days in (("trains", "2026-05-01", 16), ("infers", "2026-05-17", 6)):
+        d = data_root / mode_dir / user_901
+        d.mkdir(parents=True, exist_ok=True)
+        n15 = 96 * days
+        idx15 = pd.date_range(start_dt, periods=n15, freq="15min")
+        # 构造 p1+p2+p3+p4 四路空调分路：全开机日（无全天关机日），
+        # 每日 00:00~01:45 短时断电归零 (<1.8)，01:45~03:30 四路各 22 待机合 ~88，03:30~24:00 主运行 ~1400
+        total_br = np.zeros(n15, dtype=np.float64)
+        for day_i in range(days):
+            s = day_i * 96
+            total_br[s : s + 7] = rng.uniform(0.0, 1.8, 7)
+            total_br[s + 7 : s + 14] = 88.0 + rng.normal(0.0, 6.0, 7)
+            total_br[s + 14 : s + 96] = 1400.0 + 180.0 * np.sin(np.linspace(0, np.pi, 82)) + rng.normal(0.0, 25.0, 82)
+        total_br = np.clip(total_br, 0.0, None)
+
+        branch_df = pd.DataFrame({
+            "time": idx15.strftime("%Y-%m-%d %H:%M:%S"),
+            "p1": np.round(total_br * 0.30, 3),
+            "p2": np.round(total_br * 0.25, 3),
+            "p3": np.round(total_br * 0.25, 3),
+            "p4": np.round(total_br * 0.20, 3),
+        })
+
+        # 构造 PT*CT=12000（pt=120, ct=100）二次侧 5min 母线（W）：
+        # apply_pt_ct 后一次侧 kW = p_sec_w * 12；令一次侧母线 = 背景 2800 ± 320 + total_br，
+        # 使 ~88 待机完全淹没于母线波动而 ~1400 主运行簇清晰可辨！
+        n5 = 288 * days
+        idx5 = pd.date_range(start_dt, periods=n5, freq="5min")
+        br_5m = np.repeat(total_br, 3)
+        bg_5m = 2800.0 + 350.0 * np.sin(2 * np.pi * (np.arange(n5) % 288) / 288.0) + rng.normal(0.0, 190.0, n5)
+        p_pri_units = np.clip(bg_5m + br_5m, 600.0, None)
+        ptotal_sec_w = p_pri_units / 12.0
+        pa = ptotal_sec_w / 3.0
+        pb = ptotal_sec_w / 3.0
+        pc = ptotal_sec_w - pa - pb
+        ua = np.full(n5, 57.7) + rng.normal(0.0, 0.1, n5)
+        ub = np.full(n5, 57.7) + rng.normal(0.0, 0.1, n5)
+        uc = np.full(n5, 57.7) + rng.normal(0.0, 0.1, n5)
+        pf = np.clip(0.93 + rng.normal(0.0, 0.01, n5), 0.75, 0.99)
+        bus_df = pd.DataFrame({
+            "event_time": idx5.strftime("%Y-%m-%d %H:%M:%S"),
+            "load_iden_data0": ua, "load_iden_data1": ub, "load_iden_data2": uc,
+            "load_iden_data3": pa / (ua * pf), "load_iden_data4": pb / (ub * pf),
+            "load_iden_data5": pc / (uc * pf),
+            "load_iden_data6": pa, "load_iden_data7": pb, "load_iden_data8": pc,
+            "load_iden_data9": pf, "load_iden_data10": pf, "load_iden_data11": pf,
+        })
+        s_code, e_code = idx5[0].strftime("%y%m%d"), idx5[-1].strftime("%y%m%d")
+        bus_df.to_csv(d / f"e241_{device}_{user}-Ch1-{s_code}-{e_code}.csv", index=False)
+        branch_df.to_csv(d / f"{user}-{s_code}-{e_code}.csv", index=False)
+
+    full_base = dict(base_cfg)
+    full_base["metrics"] = [
+        "mae", "rmse", "r2", "sae",
+        "f1", "accuracy", "precision", "recall", "tp", "fp", "fn", "tn",
+    ]
+    base_file = tmp_path / "base.yaml"
+    base_file.write_text(yaml.safe_dump(full_base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tf_file = tmp_path / "user_configs.json"
+    tf_file.write_text(json.dumps({
+        "_default": {"pt_ratio": 1.0, "ct_ratio": 1.0},
+        user_901: {
+            "target_col": "p1+p2+p3+p4",
+            "pt_ratio": 120.0,
+            "ct_ratio": 100.0,
+            "on_thr_w": "auto",
+            "decision_thr_w": "auto",
+            "post_min_on": "auto",
+            "post_fill_short_off": "auto",
+            "pbus_mode": "auto",
+            "split_ratios": [0.65, 0.20, 0.15],
+            "split_strategy": "stratified_day",
+        },
+    }), encoding="utf-8")
+
+    info = run_batch(
+        tf_file,
+        base_config_path=base_file,
+        data_root=data_root,
+        output_root=out_root,
+        stages=("train", "infer"),
+        force=True,
+    )
+    assert (pd.read_csv(info["status_csv"])["status"] == Status.OK).all()
+    tr_dir = latest_done_dir(out_root / user_901 / "train")
+    inf_dir = latest_done_dir(out_root / user_901 / "infer")
+    assert tr_dir is not None and inf_dir is not None
+
+    tr_meta = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    # 验证第一道防线：on_thr_w 自动跨越 ~88W 待机簇（P99≈100W）晋升至主工作簇下沿前走廊（115~380）
+    assert tr_meta["on_thr_w_decision"]["stage"] == "auto_trimodal_standby_promoted"
+    assert 115.0 <= float(tr_meta["on_thr_w"]) <= 380.0
+
+    # 验证第二道防线：推理端绝不发生 pred_state 全 1 坍缩（TN > 0 且 F1 优异）
+    calibrate_and_sync_joint_decision_thr(user_901, tr_dir, inf_dir)
+    inf_res = pd.read_csv(inf_dir / INFERENCE_RESULT_REL)
+    tot_neg = int((inf_res["target_state"] == 0).sum())
+    tn = int(((inf_res["target_state"] == 0) & (inf_res["pred_state"] == 0)).sum())
+    assert tot_neg >= 20
+    assert tn >= int(0.60 * tot_neg)
+    assert audit_main(["--run-root", str(out_root / user_901)]) == 0
+
 
 
 
