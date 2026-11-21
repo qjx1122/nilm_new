@@ -37,6 +37,7 @@ NICE_ON_THRESHOLDS: tuple[float, ...] = (
 STANDARD_DECISION_GRID: tuple[float, ...] = (
     0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0,
     60.0, 80.0, 100.0, 120.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 450.0, 500.0,
+    600.0, 750.0, 1000.0,
 )
 
 MIN_VAL_RECALL = 0.95
@@ -305,6 +306,7 @@ def resolve_auto_decision_thr_w(
     train_index: pd.DatetimeIndex | None = None,
     calibrated_model: str = "",
     pbus_mode: str = "raw",
+    upper_guard_override: float | None = None,
 ) -> tuple[float, dict]:
     """在选定模型的 val 验证集上执行带三重护栏与抗漂移裕度的零泄漏 decision_thr_w 校准。
 
@@ -348,7 +350,10 @@ def resolve_auto_decision_thr_w(
     if len(y_on_ref) == 0:
         y_on_ref = eval_y[eval_y >= base_thr]
     y_on_p10 = float(np.quantile(y_on_ref, 0.10))
-    upper_guard_w = max(base_thr, UPPER_ON_P10_RATIO * y_on_p10)
+    if upper_guard_override is not None and np.isfinite(upper_guard_override) and upper_guard_override > 0:
+        upper_guard_w = max(base_thr, float(upper_guard_override))
+    else:
+        upper_guard_w = max(base_thr, UPPER_ON_P10_RATIO * y_on_p10)
     min_cand_w = max(0.001, 0.60 * base_thr)
 
     raw_cands: set[float] = {round(base_thr, 4)}
@@ -604,10 +609,12 @@ def check_offline_decision_drift(
     post_min_on: int,
     post_fill_off: int,
     model_name: str,
+    upper_guard_w: float | None = None,
 ) -> dict | None:
     """只读离线跨期漂移诊断：存在推理分路真值时检测 decision_thr_w 是否发生显著跨月偏移。
 
     严格零泄漏：本函数在 inference_result.csv 生成完毕后只读运行，绝不修改任何推理预测结果；
+    优先使用训练集物理上限 upper_guard_w（0.80*P10(y_train_on)），避免短期推理子集分位数偏低漏扫高档阈值（如 2844 的 500kW）；
     同时覆盖「低占空比 F1 跌破 0.95」与「高占空比大户（如 733）虚报激增且重扫可大幅削减 FP>=60%」两类场景。
     """
     y_arr = np.asarray(y_infer_true, dtype=np.float64).reshape(-1)
@@ -627,6 +634,7 @@ def check_offline_decision_drift(
         post_min_on=post_min_on,
         post_fill_off=post_fill_off,
         calibrated_model=model_name,
+        upper_guard_override=upper_guard_w,
     )
     gain = float(rec_info.get("val_f1_selected", 0.0)) - float(cur["f1"])
     shift = abs(rec_thr - current_dec_thr_w)
@@ -780,6 +788,23 @@ def resolve_joint_val_infer_decision_thr_w(
 
     val_feas = [c for c in cands if val_map[c]["recall"] >= MIN_VAL_RECALL]
     val_peak_f1 = max((val_map[c]["f1"] for c in val_feas), default=0.0)
+    inf_feas = [c for c in cands if inf_map[c]["recall"] >= MIN_VAL_RECALL]
+
+    # 计算无历史 val 否决约束的纯 infer 链最优候选（严格受 infer_recall >= 0.95 与训练物理上限 upper_guard_w 保护）
+    pure_inf_c: float | None = None
+    if inf_feas:
+        pure_inf_peak_f1 = max(inf_map[c]["f1"] for c in inf_feas)
+        pure_top = [c for c in inf_feas if inf_map[c]["f1"] >= pure_inf_peak_f1 - 0.0025]
+        pure_inf_c = min(
+            pure_top,
+            key=lambda c: (
+                inf_map[c]["off_day_fp"],
+                inf_map[c]["fp"],
+                -inf_map[c]["f1"],
+                -inf_map[c]["recall"],
+                abs(c - cur_dec),
+            ),
+        )
 
     joint_feas = [
         c for c in cands
@@ -788,8 +813,11 @@ def resolve_joint_val_infer_decision_thr_w(
     ]
     confidence = "high"
     reasons: list[str] = []
+    heteropeak_override = False
+    val_capped_candidate: float | None = None
+
     if not joint_feas:
-        # 极端跨期偏移兜底：放宽 val_F1 下限但仍严守 infer_recall >= 0.95 与 val_recall >= 0.93
+        # 极端跨期偏移兜底：放宽 val_F1 下限但仍尝试兼顾 infer_recall >= 0.95 与 val_recall >= 0.93
         joint_feas = [
             c for c in cands
             if inf_map[c]["recall"] >= MIN_VAL_RECALL and val_map[c]["recall"] >= 0.93
@@ -798,9 +826,12 @@ def resolve_joint_val_infer_decision_thr_w(
             confidence = "low"
             reasons.append("RELAXED_VAL_F1_FLOOR_FOR_SEVERE_SHIFT")
     if not joint_feas:
-        joint_feas = [c for c in cands if inf_map[c]["recall"] >= MIN_VAL_RECALL]
-        confidence = "low"
-        reasons.append("INFER_RECALL_ONLY_FALLBACK")
+        joint_feas = list(inf_feas)
+        if joint_feas:
+            confidence = "low"
+            heteropeak_override = True
+            reasons.append("INFER_RECALL_ONLY_FALLBACK")
+
     if not joint_feas:
         confidence = "low"
         reasons.append("RECALL_BELOW_095_GUARD")
@@ -817,11 +848,11 @@ def resolve_joint_val_infer_decision_thr_w(
             and f1_gain < 0.002
             and fp_saved < max(3, int(0.20 * cur_inf["fp"]))
         ):
-            best_c = round(cur_dec, 4)
-            reasons.append("DUAL_CHAIN_CONSISTENT_KEEP")
+            joint_best_c = round(cur_dec, 4)
+            joint_reason = "DUAL_CHAIN_CONSISTENT_KEEP"
         else:
             top_cands = [c for c in joint_feas if inf_map[c]["f1"] >= best_inf_f1 - 0.0025]
-            best_c = min(
+            joint_best_c = min(
                 top_cands,
                 key=lambda c: (
                     inf_map[c]["off_day_fp"],
@@ -831,12 +862,50 @@ def resolve_joint_val_infer_decision_thr_w(
                     abs(c - cur_dec),
                 ),
             )
-            reasons.append("DUAL_CHAIN_JOINT_OPTIMIZED")
+            joint_reason = "DUAL_CHAIN_JOINT_OPTIMIZED"
+
+        # 升级 ①（《调参实战手册》Step 4 铁律——双链异峰以 infer 链为准）：
+        # 当历史季节 val 召回贴线（如 2844: val 仅放行 [6,20]）把阈值卡死在低位，
+        # 而当期 infer 因基荷偏移在更高阈值（<= 0.80*P10(y_train_on) 且 infer_recall >= 0.95）
+        # 可显著提升 infer_F1 (>=0.02) 或大幅削减虚报 (FP>=15 且砍掉 >=50%) 时，解除历史 val 一票否决。
+        if pure_inf_c is not None:
+            j_inf = inf_map[joint_best_c]
+            p_inf_row = inf_map[pure_inf_c]
+            shift_vs_joint = abs(pure_inf_c - joint_best_c)
+            f1_gain_vs_joint = p_inf_row["f1"] - j_inf["f1"]
+            fp_cut_vs_joint = (
+                (j_inf["fp"] - p_inf_row["fp"]) / max(j_inf["fp"], 1)
+                if j_inf["fp"] > 0 else 0.0
+            )
+            if (
+                shift_vs_joint >= max(15.0, 0.20 * max(joint_best_c, 1.0))
+                and (
+                    f1_gain_vs_joint >= 0.02
+                    or (j_inf["fp"] >= 15 and fp_cut_vs_joint >= 0.50 and f1_gain_vs_joint >= 0.005)
+                )
+            ):
+                val_capped_candidate = float(joint_best_c)
+                best_c = pure_inf_c
+                heteropeak_override = True
+                reasons.append(
+                    f"CROSS_SEASON_INFER_DOMINANT_OVERRIDE("
+                    f"val_capped={joint_best_c:.4g}->infer_opt={pure_inf_c:.4g},"
+                    f"infer_f1_gain={f1_gain_vs_joint:+.4f},fp_cut={fp_cut_vs_joint:.1%})"
+                )
+            else:
+                best_c = joint_best_c
+                reasons.append(joint_reason)
+        else:
+            best_c = joint_best_c
+            reasons.append(joint_reason)
 
     cur_key = round(cur_dec, 4)
     return float(best_c), {
         "stage": "joint_val_infer_calibrated",
         "confidence": confidence,
+        "heteropeak_override": heteropeak_override,
+        "val_capped_candidate_w": val_capped_candidate,
+        "pure_infer_optimal_w": pure_inf_c,
         "model": model_name,
         "on_thr_w": on_thr,
         "previous_decision_thr_w": cur_dec,
@@ -1138,14 +1207,34 @@ def calibrate_and_sync_joint_decision_thr(
         )
         info["synced"] = True
         info["sync_result"] = sync_res
-        severe_shift = (shift >= max(40.0, 0.35 * max(prev_thr, 1.0))) or (info.get("confidence") == "low")
-        msg = (
-            f"[{user_key}] [AUTO-DEC-THR-SYNC] 双链联合收口生效：检测到跨期偏移 "
-            f"train_val={tr_prev:.4g} -> 双链最优 decision_thr_w={new_thr:.4g} "
-            f"(model={info['model']}, infer_F1: {inf_before['f1']:.4f}->{inf_after['f1']:.4f}, "
-            f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_recall={inf_after['recall']:.4f}, "
-            f"val_F1={val_after['f1']:.4f})，已零重训同步刷新 train+infer 全套产物！"
-        )
+        hetero = bool(info.get("heteropeak_override", False))
+        severe_shift = hetero or (shift >= max(40.0, 0.35 * max(prev_thr, 1.0))) or (info.get("confidence") == "low")
+        if hetero:
+            val_cap_s = info.get("val_capped_candidate_w")
+            cap_note = f"历史val受召回约束卡在 {val_cap_s:.4g}" if isinstance(val_cap_s, (int, float)) else f"train_val={tr_prev:.4g}"
+            msg = (
+                f"[{user_key}] [AUTO-DEC-THR-SYNC] 检测到跨季双链异峰（{cap_note}，当期 infer 最优为 "
+                f"decision_thr_w={new_thr:.4g}），遵循调参铁律按 infer 链定阈 "
+                f"(model={info['model']}, infer_F1: {inf_before['f1']:.4f}->{inf_after['f1']:.4f}, "
+                f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_recall={inf_after['recall']:.4f}, "
+                f"历史val_recall={val_after['recall']:.4f})，已零重训同步刷新 train+infer 全套产物！"
+            )
+        elif severe_shift:
+            msg = (
+                f"[{user_key}] [AUTO-DEC-THR-SYNC] 双链联合收口生效：检测到显著跨期偏移 "
+                f"train_val={tr_prev:.4g} -> 双链最优 decision_thr_w={new_thr:.4g} "
+                f"(model={info['model']}, infer_F1: {inf_before['f1']:.4f}->{inf_after['f1']:.4f}, "
+                f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_recall={inf_after['recall']:.4f}, "
+                f"val_F1={val_after['f1']:.4f})，已零重训同步刷新 train+infer 全套产物！"
+            )
+        else:
+            msg = (
+                f"[{user_key}] [AUTO-DEC-THR-SYNC] 双链联合微调收口："
+                f"train_val={tr_prev:.4g} -> 双链最优 decision_thr_w={new_thr:.4g} "
+                f"(model={info['model']}, infer_F1: {inf_before['f1']:.4f}->{inf_after['f1']:.4f}, "
+                f"infer_FP: {inf_before['fp']}->{inf_after['fp']}, infer_recall={inf_after['recall']:.4f}, "
+                f"val_F1={val_after['f1']:.4f})，已零重训同步刷新 train+infer 全套产物"
+            )
         log.warning("%s", red_text(msg) if severe_shift else yellow_text(msg))
     else:
         info["synced"] = False

@@ -40,6 +40,8 @@ def _write_bimodal_user_dir(
     working_w: float = 680.0,
     bg_bus_kw: float = 220.0,
     seed: int = 42,
+    warmup_points: int = 0,
+    warmup_w: float = 18.0,
 ) -> Path:
     """构造真实双峰工业负荷数据（含全关日、待机纹波带与白天开机段），用于端到端 auto 阈值验证。"""
     rng = np.random.default_rng(seed)
@@ -57,6 +59,8 @@ def _write_bimodal_user_dir(
         day_arr = np.clip(standby_w * 0.7 + rng.normal(0.0, standby_w * 0.12, 96), 0.5, standby_w)
         if not is_off_day:
             day_arr[32:72] = working_w + rng.normal(0.0, 15.0, 40)
+            if warmup_points > 0:
+                day_arr[32:32 + warmup_points] = warmup_w
         p1[sl] = day_arr
 
     branch_df = pd.DataFrame({
@@ -628,5 +632,150 @@ def test_joint_val_infer_calibration_and_zero_retrain_sync_closed_loop(tmp_path:
     assert isinstance(saved_tf[USER_KEY]["on_thr_w"], float)
     assert any(p.name.startswith("time_filters.bak.auto") for p in tmp_path.iterdir())
     assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+
+def test_2844_archetype_cross_season_heteropeak_override_and_upper_guard(
+    tmp_path: Path, base_cfg: dict, caplog
+):
+    """回归 2844 原型：
+    1) 历史季节 val 召回紧贴 0.95（>=30kW 时 val_recall < 0.95），仅放行非空窄缝 [6, 20]；
+    2) 推理期盛夏基荷抬升产生高幅关态虚报（~465kW），且短期推理子集 P10(y_infer_on)=550kW
+       （若不透传训练集 upper_guard_w=547.2kW，子集 0.80*P10=440kW 会漏扫 500kW）；
+    3) 验证升级 ②：check_offline_decision_drift 透传 train_upper_guard_w 后准确扫到 ~500kW；
+    4) 验证升级 ①：双链收口器检测到跨季双链异峰（val 卡在 20 vs infer 最优 500），
+       自动解除旧季节 val 窄缝否决，输出红字 [AUTO-DEC-THR-SYNC]，将 train+infer 原子同步至 ~500kW，
+       并 100% 通过 audit_user_run 对账门禁。
+    """
+    import yaml
+
+    full_base = dict(base_cfg)
+    full_base["metrics"] = [
+        "mae", "rmse", "r2", "sae",
+        "f1", "accuracy", "precision", "recall", "tp", "fp", "fn", "tn",
+    ]
+    base_file = tmp_path / "base_2844.yaml"
+    base_file.write_text(yaml.safe_dump(full_base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "outputs"
+    # 在训练集注入每日早班前 3 个点（3/40=7.5% < 10%）的 18W 预热段：
+    # - P10(y_train_on) 仍位于 ~680W 主峰（train_upper_guard_w = 0.80*P10 ≈ 544W > 500W）；
+    # - 但模型在 val 折该 7.5% 预热点预测约 18W，使 thr>=25W 时 val_recall=0.925 < 0.95，完美复刻 2844 窄缝！
+    _write_bimodal_user_dir(
+        data_root, USER_KEY, "trains", days=16, start="2026-04-01",
+        standby_w=3.0, working_w=700.0, bg_bus_kw=10.0, seed=71,
+        warmup_points=3, warmup_w=18.0,
+    )
+
+    # 推理集使用 working_w=550W（自身 0.80*P10 ≈ 430W < 500W），检验必须依赖透传的 train_upper_guard_w
+    _write_bimodal_user_dir(
+        data_root, USER_KEY, "infers", days=8, start="2026-07-01",
+        standby_w=3.0, working_w=550.0, bg_bus_kw=10.0, seed=72,
+    )
+
+    tf_file = tmp_path / "time_filters.json"
+    tf_file.write_text(json.dumps({
+        USER_KEY: {
+            "target_col": "p1",
+            "on_thr_w": 10.0,
+            "decision_thr_w": "auto",
+            "pbus_mode": "scaled",
+            "split_ratios": [0.6, 0.2, 0.2],
+            "split_strategy": "stratified_day",
+            "post_min_on": 1,
+            "post_fill_short_off": 3,
+        }
+    }), encoding="utf-8")
+
+    run_batch(
+        tf_file,
+        base_config_path=base_file,
+        data_root=data_root,
+        output_root=out_root,
+        stages=("train", "infer"),
+        force=True,
+    )
+    tr_dir = latest_done_dir(out_root / USER_KEY / "train")
+    inf_dir = latest_done_dir(out_root / USER_KEY / "infer")
+    assert tr_dir is not None and inf_dir is not None
+
+    # 校验 train/meta.json：训练单跑因 val 预热段召回约束停在低位（<=20W），但物理上限 >500W
+    tr_meta_init = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    best_model = tr_meta_init["best_model"]
+    train_guard = float(tr_meta_init["train_upper_guard_w"])
+    val_init_thr = float(tr_meta_init["decision_thr_w"])
+    assert train_guard > 500.0
+    assert val_init_thr <= 20.0
+
+    # 模拟 2844 7 月盛夏基荷抬升：关态出现大量 465W 虚报（高于推理子集自身 0.80*P10≈430W，低于训练物理上限 ~544W），开机预测 530W
+    inf_csv = inf_dir / INFERENCE_RESULT_REL
+    inf_df = pd.read_csv(inf_csv)
+    inf_on_mask = inf_df["target_state"].to_numpy(dtype=int) == 1
+    inf_off_idx = inf_df.index[~inf_on_mask].to_numpy()
+    inf_df.loc[inf_on_mask, "pred"] = 530.0
+    inf_df.loc[inf_off_idx, "pred"] = 5.0
+    n_hot_fp = min(len(inf_off_idx), max(40, len(inf_off_idx) // 2))
+    inf_df.loc[inf_off_idx[:n_hot_fp], "pred"] = 465.0
+    inf_df.to_csv(inf_csv, index=False)
+    sync_decision_thr_artifacts(USER_KEY, tr_dir, inf_dir, val_init_thr, reason="inject_summer_drift")
+
+    # 验证升级 ②：check_offline_decision_drift 透传 train_guard (>500W) 时能突破推理子集 ~430W 上限扫到 >=470~500W
+    inf_ts = pd.DatetimeIndex(pd.to_datetime(inf_df["timestamp"]))
+    drift_sub_only = check_offline_decision_drift(
+        user_key=USER_KEY,
+        y_infer_true=inf_df["target"].to_numpy(dtype=float),
+        pred_infer=inf_df["pred"].to_numpy(dtype=float),
+        infer_index=inf_ts,
+        on_thr_w=10.0,
+        current_dec_thr_w=val_init_thr,
+        post_min_on=1,
+        post_fill_off=3,
+        model_name=best_model,
+        upper_guard_w=None,
+    )
+    drift_with_train_guard = check_offline_decision_drift(
+        user_key=USER_KEY,
+        y_infer_true=inf_df["target"].to_numpy(dtype=float),
+        pred_infer=inf_df["pred"].to_numpy(dtype=float),
+        infer_index=inf_ts,
+        on_thr_w=10.0,
+        current_dec_thr_w=val_init_thr,
+        post_min_on=1,
+        post_fill_off=3,
+        model_name=best_model,
+        upper_guard_w=train_guard,
+    )
+    assert drift_sub_only is not None and drift_sub_only["drift_detected"] is False
+    assert (
+        drift_with_train_guard is not None
+        and drift_with_train_guard["drift_detected"] is True
+        and drift_with_train_guard["recommended_decision_thr_w"] >= 470.0
+    )
+
+    # 验证升级 ①：双链收口器解除历史 val 窄缝（<=20W）一票否决，采用当期 infer 最优（~500W），红字告警并同步双侧
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        sync_res = calibrate_and_sync_joint_decision_thr(USER_KEY, tr_dir, inf_dir)
+
+    assert sync_res is not None
+    assert sync_res["synced"] is True
+    assert sync_res["heteropeak_override"] is True
+    assert sync_res["val_capped_candidate_w"] <= 20.0
+    resolved_thr = sync_res["resolved_decision_thr_w"]
+    assert 470.0 <= resolved_thr <= train_guard
+    assert any("CROSS_SEASON_INFER_DOMINANT_OVERRIDE" in r for r in sync_res["reasons"])
+    assert any(
+        "\033[91m" in r.message and "[AUTO-DEC-THR-SYNC]" in r.message and "检测到跨季双链异峰" in r.message
+        for r in caplog.records
+    )
+
+    # 双侧 train + infer 产物已原子同步为同一个 resolved_thr，保留训练期 val 初值留痕，且 audit 全绿
+    tr_meta_final = json.loads((tr_dir / "meta.json").read_text(encoding="utf-8"))
+    inf_meta_final = json.loads((inf_dir / "meta.json").read_text(encoding="utf-8"))
+    assert tr_meta_final["decision_thr_w"] == pytest.approx(resolved_thr)
+    assert inf_meta_final["decision_thr_w"] == pytest.approx(resolved_thr)
+    assert tr_meta_final["decision_thr_w_val_initial"] == pytest.approx(val_init_thr)
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
 
 

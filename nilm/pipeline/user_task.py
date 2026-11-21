@@ -36,6 +36,7 @@ from nilm.models import MODEL_REGISTRY
 from nilm.models.base import BaseModel
 from nilm.models.constraints import apply_constraints
 from nilm.pipeline.auto_thresholds import (
+    UPPER_ON_P10_RATIO,
     check_offline_decision_drift,
     log_auto_decision_thr_train,
     resolve_auto_decision_thr_w,
@@ -1063,6 +1064,13 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                                      f"split_strategy={user_cfg['split_strategy']}",
                                      pbus_note, on_thr_note, dec_thr_note])
         best = summary.get("overall_best")
+        y_tr_meta = splits["train"][1][:, 0]
+        y_tr_on_meta = y_tr_meta[y_tr_meta >= on_thr]
+        train_y_on_p10 = round(float(np.quantile(y_tr_on_meta, 0.10)), 3) if len(y_tr_on_meta) > 0 else None
+        train_upper_guard_w = (
+            round(max(float(on_thr), UPPER_ON_P10_RATIO * float(train_y_on_p10)), 3)
+            if train_y_on_p10 is not None else float(on_thr)
+        )
 
         _dump(out / "meta.json", {
             "user_key": user_key, "mode": mode, "target_cols": target_cols,
@@ -1081,6 +1089,8 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "decision_thr_w_configured": cfg_dec_thr_raw,
             "decision_thr_w_decision": dec_decision,
             "model_decision_thr_w": model_dec_map,
+            "train_y_on_p10": train_y_on_p10,
+            "train_upper_guard_w": train_upper_guard_w,
             "post_min_on": post_min_on,
             "post_fill_short_off": post_fill_off,
             "quality": {"bus": q_bus, "branch": q_br},
@@ -1365,6 +1375,17 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         drift_advice = None
         if branch_c is not None and "have" in locals() and have is not None and len(have) > 0:
             try:
+                train_upper_guard = meta.get("train_upper_guard_w")
+                if train_upper_guard is None:
+                    train_upper_guard = (meta.get("decision_thr_w_decision") or {}).get("upper_guard_w")
+                if train_upper_guard is None:
+                    tp_csv = train_dir / "predictions" / "train_predictions.csv"
+                    if tp_csv.exists():
+                        tp_tr = pd.read_csv(tp_csv, usecols=["split", "target"])
+                        y_tr_ref = tp_tr.loc[tp_tr["split"] == "train", "target"].to_numpy(dtype=float)
+                        y_tr_on = y_tr_ref[y_tr_ref >= on_thr]
+                        if len(y_tr_on) > 0:
+                            train_upper_guard = max(float(on_thr), UPPER_ON_P10_RATIO * float(np.quantile(y_tr_on, 0.10)))
                 drift_advice = check_offline_decision_drift(
                     user_key=user_key,
                     y_infer_true=have.to_numpy(dtype=float),
@@ -1375,6 +1396,7 @@ def run_user_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     post_min_on=post_min_on,
                     post_fill_off=post_fill_off,
                     model_name=model_name,
+                    upper_guard_w=float(train_upper_guard) if train_upper_guard is not None else None,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("[%s] 离线漂移诊断跳过: %s", user_key, e)
