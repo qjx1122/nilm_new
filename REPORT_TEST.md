@@ -1052,3 +1052,74 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
   - **零样本（856）**：`OK model=transformer n=1627`（`pt100/ct60`，9无效+7 day_gate）；离线指标未贴，待回收 `offline_metrics.json` 判读。
 - 是否进入 REPORT.md：否（未达标，不入稳定结论）
 - 遗留问题：①778 `ct150 vs 160` 以实跑 `160` 为准，预检期望文本待同步；②`_default` 缺 `pt/ct/branch` 键（靠默认 `1.0` 兜底，建议补显式）；③856离线指标待贴；④`A扩池/B分组` 待拍板
+
+
+## [2026-09-10] 专题：五大核心参数（pbus_mode / on_thr_w / decision_thr_w / post_min_on / post_fill_short_off）自动定参体系架构与典型用户实证边界专题分析
+
+- 类型：实验专题 / 验证专题（算法机制梳理 + 多原型单测/端到端守卫 + `901` 真实极端工况边界定量归因）
+- 目标与假设：
+  - 系统梳理并形式化沉淀工商业 NILM 流水线五大核心超参数（`pbus_mode`、`on_thr_w`、`decision_thr_w`、`post_min_on`、`post_fill_short_off`）的零泄漏自动定参机制、参数间因果耦合顺序、护栏数学不等式、落盘契约与 CLI 收口闭环；
+  - 对照多类典型现场原型（`733` 大母线微跳变欠拟合、`778` 跨期母线漂移、`2844` 跨季双链异峰、`815` 低幅底噪滤除、`901` 四路合并 + 大厂母线完全淹没 `TARGET_EDGE_BURIED_IN_BUS` + 显式 `infer_model` 强绑），验证自动定参的有效域并定量界定极端复合工况下的失效边界与改进准则。
+- 方法 / 数据 / 参数：
+  - 核心实现模块：`nilm/pipeline/auto_thresholds.py`、`nilm/pipeline/user_task.py`、`nilm/pipeline/user_config.py`、`nilm/pipeline/pooled.py`、`scripts/auto_run_steps2to5.py`；
+  - 测试与审计验证：`tests/test_auto_thresholds.py`（18 项专项测试）、`tests/test_batch.py`（含 `733/778/tiny_gain/collapse` 验证集双向验收守卫）、`scripts/audit_user_run.py`（`T1~T4 / I1~I10` 双侧一致性门禁），全量套件 **257/257 通过**；
+  - 真实极端工况实录：用户 `800080270901_4200008005677`（`target_col=p1+p2+p3+p4`，`pt=1, ct=1`，`base_optimal.yaml` 4 模型，训练有效池 `37` 天 `3539` 点 `split={train:2199, val:670, test:670}`，推理 `8` 天 `711` 点）两轮全 `"auto"` 实跑日志（`20261121_235333` 与 `20261122_003731`）。
+- 用户执行命令（含实录路径）：
+  - 本地实跑一键命令（Windows PowerShell `test_gpu_modelscopeEx`，产物 `outputs/800080270901_4200008005677/{train/20261122_003731, infer/20261122_003804}`）：
+    `python scripts/auto_run_steps2to5.py --user-key 800080270901_4200008005677 --target-col p1+p2+p3+p4 --on-thr auto --decision-thr auto --min-on auto --fill-off auto --pbus-mode auto --force`
+  - 沙箱全量回归验证命令：
+    `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q`（`257 passed`）
+- 结果 / 结论：
+
+### 1. 五大参数自动定参机制与数学判据总表
+
+全部 5 个参数均遵循 **“显式配置 100% 优先 → 未配保持历史默认向后兼容 → `"auto"` 严格零测试集泄漏 → 全决策链写入 `meta.json` 可审计”** 四大契约：
+
+| 参数 | 配置域 / 历史默认 | 自动定参阶段与核心算法 | 硬护栏与数学门禁 | 关键落盘字段（`meta.json`） |
+|---|---|---|---|---|
+| **`on_thr_w`** | 正数或 `"auto"`（未配默认 `10.0`） | **Step A 真值定界（`resolve_auto_on_thr_w`）**：① 训练窗非 `test` 池初算 + `bad_days/day_gate` 剔除坏天后二次重刷 `[AUTO-ON-THR-REFRESH]`；② $\log(1+P)$ 空间一级 Otsu 寻谷（最大类间方差比 $\eta$）；③ 二/三级递归 Otsu 识别寄生待机簇 $C_1$ 与主工作簇 $C_2$；④ 同向母线阶跃 `dir_dbus = sign(Δy)·Δpbus` 反向否决仲裁。 | · 一级走廊：`[1.15·P99(y_off), hi_bound]`（多路合并窄走廊放宽至 `min(max(0.50·P05, y_otsu), 0.70·P05)`）<br>· 真多档一票否决：`snr_sub ≥ 1.2` 且同号率 `≥ 0.65` 且 `snr_thr2 ≥ 1.2` 保低阈<br>· 三峰晋升：`sub_eta ≥ 0.76~0.78`、`c2` 能量占比 `≥ 88%~90%`、`P90(c1) ≤ 0.25·P50(c2)` | `on_thr_w`, `on_thr_w_configured`, `on_thr_w_decision`（含 `stage`, `otsu_eta`, `sub_otsu_eta`, `bus_observability`, `refreshed_after_day_filter`） |
+| **`post_min_on`** | `0..96` 整数或 `"auto"`（未配默认 `1`） | **Step B1 阶段一真值定界 + Step D 阶段二协同校准**：① 在严格相邻 `15min` 连续真值块上提取未截断完整开态游程 $L_{\text{on}}$；② 分位数初界 `clip(floor(0.75·P10(L_on)), 1, 8)` + 真值自回放定硬上界 $M_{\max}$；③ 在 `{1..M_max}` 内与 `decision_thr_w` 联合寻优。 | · 真值自回放硬上界：`GT_On_Loss(enforce_min_on(s_gt, m)) ≤ 0.5%`（含短促真开脉冲时自动锁 `M_max=1`）<br>· 奥卡姆复杂度正则：`0.0004·(m - 1)`，净增益 `<0.002` 且减虚报 `<3` 时保持 `m=1` | `post_min_on`, `postprocess_bounds.m_max`, `postprocess_decision`, `model_postprocess_params` |
+| **`post_fill_short_off`** | `0..96` 整数或 `"auto"`（未配默认 `3`） | **Step B2 阶段一真值定界 + Step D 阶段二协同校准**：① 在 `k ∈ {0..6}` 上对连续真值块自回放 `fill_short_off(s_gt, k)` 定硬上界 $K_{\max}$；② 在 `{0..K_max}` 内与 `(decision_thr_w, post_min_on)` 联合寻优。 | · 真值防桥接上界：真关膨胀率 `≤ 1.0%`，且日内短停机 `≥5` 段时真停机被桥接占比 `≤ 10%`（保护循环启停/午休停机）<br>· **全关日零新增桥接硬约束**：`off_day_fp(c,m,k) ≤ off_day_fp(c,m,0)` | `post_fill_short_off`, `postprocess_bounds.k_max`, `postprocess_decision`, `model_postprocess_params` |
+| **`pbus_mode`** | `"auto"` / `"raw"` / `"scaled"`（默认 `"auto"`） | **Step C 三步零泄漏验证闭环**：① 统一默认先跑抗漂移基态 `"raw"`；② 仅当序列模型在 `train+val` 检出带宽 `< on_thr_w` 坍缩、`R²<0` 或 `R²/MAE` 显著劣于同场非坍缩基线时触发候选 `"scaled"` 重训；③ 验证集正面对决通过后切 `"scaled"`，推理自动继承。 | · 坍缩恢复：`raw` 坍缩而 `scaled` 不坍缩且 `val F1 ≥ raw`<br>· 常规双向门：`val MAE` 降 `≥ 5.0%` 且 `val F1(@on_thr)` 跌 `≤ 0.015`<br>· 二次侧救援门：`train R² +≥0.20`、`val R² +≥0.03`、`val RMSE -≥5.0%`、`val MAE ≤ 1.005×` 且 `val F1(@on_thr)` 跌 `≤ 0.015` | `pbus_mode`, `pbus_mode_configured`, `pbus_mode_decision`（含 `fallback_reasons`, `val_acceptance`） |
+| **`decision_thr_w`** | 正数、`"on_thr"` 或 `"auto"`（默认 `"auto"`） | **Step D 验证集校准 + Step E `(val+infer)` 双链收口**：① 零泄漏选校准模型（显式 `infer_model` 优先，否则 `val` 投票冠军 `best_val`）；② 训练期在 `[0.6·on_thr_w, upper_guard_w]` 联合游程寻优；③ Step 5 后若有推理真值，执行 `(val+infer)` 双链三维收口并零重训原子同步双侧产物。 | · 物理上限：`upper_guard_w = max(on_thr_w, 0.80·P10(y_train_on))`<br>· 召回硬底线：`recall ≥ 0.95`<br>· 反坍缩特异性护栏：存在 `Spec ≥ 0.50` 时剔除 `Spec < 0.25` 低阈点<br>· `scaled` 平台抗漂移锚定 + 跨季异峰解耦按当期 `infer` 定阈 | `decision_thr_w`, `decision_thr_w_decision`, `model_decision_thr_w`, `train_upper_guard_w`, `joint_calibration_decision` |
+
+---
+
+### 2. 参数间顺序耦合关系与传播效应分析
+
+五大参数构成严格的有向无环依赖图（DAG）：
+1. **`on_thr_w` 为全局根节点**：直接定义 `target_state = (y ≥ on_thr_w)`，进而同时控制：
+   - 阶段一游程定界输入序列 `s_gt` 及其输出 `(M_max, K_max)`；
+   - `pbus_mode="auto"` 坍缩判据（`band < on_thr_w`）与验证集验收门的 `@on_thr F1` 切点；
+   - `decision_thr_w` 的物理护栏天花板 `upper_guard_w = 0.80 × P10(y_train[y_train ≥ on_thr_w])` 及负样本集合 `{y < on_thr_w}`。
+2. **校准模型选择是连接回归器与判卷链的枢纽**：
+   - 当基线线性/画像模型（如 `ridge` 带 `off_weight=5.0`）胜出时，其关态预测压制在近零带（`< on_thr_w`），`decision_thr_w` 触发 `KEEP_ON_THR_NEAR_OPTIMAL` 自然停留在 `on_thr_w` 附近，游程亦保持低复杂度锚点 `(1, min(3, K_max))`；
+   - 当无关态加权的深度 MSE 模型（`transformer`）在低信噪比母线下被强制选为推理模型时，其预测向条件期望收缩形成高关态均值地板（如 `250~500W`），必然触发反坍缩护栏将 `decision_thr_w` 推向 `upper_guard_w` 上沿并激活高阶游程滤波 `(m>1)`。
+
+---
+
+### 3. 多原型实证表现与 `901` 极端复合场景定量归因
+
+#### 3.1 标准原型自动定参表现汇总
+| 原型场景 | 代表户 | 核心矛盾 | 五参数自动定参动作与验证结果 |
+|---|---|---|---|
+| 大母线小负荷欠拟合 | `733` | `raw` 下深度模型梯度微弱预测坍缩；跨月母线基荷上移 | `pbus_mode` 检出欠拟合自动切 `scaled`；双链收口解除旧 `val` 压制对齐当期 `infer` 高阈，消除虚报且 `F1` 恢复 `0.985` ✓ |
+| 跨期母线分布漂移 | `778` | 切 `scaled` 虽训得好但验证集关态虚报激增（`val F1` 跌 `0.0377`） | `pbus_mode` 被 `VAL_F1_DEGRADED(>0.015)` 精准拦截，安全留用抗漂移 `raw` ✓ |
+| 跨季双链异峰 | `2844` | 6 月轻载 `val` 最优低阈 vs 7 月重载基荷抬升 `infer` 最优 `400W` | 双链收口识别 `CROSS_SEASON_HETERO_PEAK`，在 `train_upper_guard_w` 内按当期 `infer` 定阈并零重训同步双侧产物 ✓ |
+| 低幅全关虚报 | `815` | `10W` 真值阈下 `[10, 50)W` 关态低幅幻觉占虚报 `68.6%` | `on_thr_w≈10W` 守住真值，`(decision_thr_w, post)` 自动上移至 `50W` 砍除低幅虚报且 `recall≥0.998` ✓ |
+| 间歇循环/短脉冲负荷 | 合成守卫 | 盲用默认 `fill_off=3` 桥接真停机间隙、盲增 `min_on` 抹除短真开 | 阶段一真值回放自动将间歇负荷 `K_max` 收窄至 `0~1`、短脉冲负荷 `M_max` 锁死 `1` ✓ |
+
+#### 3.2 `800080270901_4200008005677`（`901`）两轮实跑演进与 `(300, 500)` vs `(200, 200)` 根因拆解
+`901` 同时叠加了 **① 四路变频空调合并（`p1+p2+p3+p4`）+ ② 未配变比二次侧微弱值（`pt=1, ct=1`）+ ③ 总厂母线完全淹没分路边沿（`TARGET_EDGE_BURIED_IN_BUS`）+ ④ 本地 `time_filters.json` 残留 `"infer_model": "transformer"` 强绑** 四重极端条件：
+1. **首轮（`cdfc401` 修复前）死锁于 `(15, 15)`**：三峰晋升被总母线 `snr_thr2 < 1.0` 硬捆绑拦截，`on_thr_w` 退守 `15W`，进而将 `upper_guard_w = 0.80 × 60W` 锁死在 `96W` 以下，导致 `transformer(raw)` 全天候预测 `>200W` 发生全 1 坍缩（`test tn=0/108, infer tn=0/77`）。
+2. **次轮（`cdfc401` 修复后，`20261122_003731`）跨越待机但过冲至 `(300, 500), post=(4,2)`**：
+   - **`on_thr_w=300W` 成因**：反向否决制成功放行三峰跨越（`15.0 -> 300`），但二级 Otsu 谷底 `v_2 ≈ 350W` 将 `[160, 350)W` 内的 15min 启停爬坡均值与单台变频低频巡航点一并划入 `< v_2` 池 `c01`，令 `待机P99 (c01_p99) = 300.0W`，经 `1.08 × c01_p99` 与放宽后的 `hi_2` 定在 `300W`。对比两轮正负样本数可知，`test` 中有 **`199/670` 点（`29.7%`）**、`infer` 中有 **`252/711` 点（`35.4%`）** 落在 `[15, 300)W`——其中 `[200, 300)W` 的单机轻载运行点被翻转为 `target_state = 0`，使单机低频运行日整天真阳性清零（“伪全关日”，日 `F1 = 0`）；
+   - **`pbus_mode` 拒切 `scaled` 成因**：在未校准裸切点 `@on_thr=300W` 上，`scaled` 因验证集母线偏移（`sae=0.4439`）仅 `40` 点 `<300W`（`val F1=0.7234` vs `raw 0.7727`），触发 `VAL_F1_DEGRADED(drop=0.0493>0.015)` 被拒，错失 `scaled` 在 `test` 上 `MAE 531.4W -> 357.8W`、`R² 0.579 -> 0.807` 的显著回归收益；
+   - **`decision_thr_w=500W` 成因**：同场训练实测 **`ridge`（`val MAE=175.1W, R²=0.889, F1=0.9929, fp=0`）与 `history_profile`（`val MAE=165.4W, F1=0.9958, fp=1`）全面碾压 `transformer(raw)`（`val MAE=390.0W, F1=0.7727, fp=210`）**，且 `train` 已评出 `best=ridge`；但本地配置残留 `"infer_model": "transformer"` 强绑了 `transformer(raw)`。由于 `transformer(raw)` 关态预测在 `200W` 处 `test tn=0/307`、`infer tn=11/329`（`Spec < 0.04`），反坍缩护栏剔除 `200W` 后沿 `upper_guard_w=512W` 顶格选出 `500W, post=(4,2)`，进一步把 `300~499W` 轻载时段削顶漏报。
+
+- 是否进入 REPORT.md（稳定结论）：是（候选）——①「五大核心参数零泄漏自动定参闭环遵循 `on_thr_w → (M_max,K_max) → pbus_mode → 校准模型选择 → (decision_thr_w, m, k) → 双链三维同步` 单向耦合契约」；②「在 `TARGET_EDGE_BURIED_IN_BUS` 母线淹没场景下禁止在配置中盲目锁死 `"infer_model": "transformer"`，应由 4 模型自动择优（`ridge/history_profile`）兜底；多路变频合并回路需警惕 `[160, 300)W` 跨刻/低频过渡尾端对三峰 `c01_p99` 的抬升效应」。
+- 遗留问题：
+  1. `resolve_auto_on_thr_w` 三峰晋升定阈基准可进一步由 `< v_2` 全池 `c01_p98/p99` 优化为“待机主密度峰上肩部（剔除谷底稀疏爬坡过渡带）”，使 `901` 类多路变频回路自动精准锚定 `~180~200W`；
+  2. `_accept_scaled_candidate` 的 `F1` 退化门禁可引入候选模式各自验证集校准后的链口径 `val_f1_selected` 联合评判，避免未校准 `@on_thr` 单切点误杀大幅改善 `R²/RMSE` 的 `scaled` 模型；
+  3. `auto_run_steps2to5.py` 可增加 `--infer-model` 覆盖参数（支持 `"auto"` 清除历史强绑）或对显著劣于 `best_model` 的显式 `infer_model` 输出红色性能退化告警。
+

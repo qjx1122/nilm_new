@@ -1,7 +1,7 @@
 # TUNING_GUIDE.md — 工商业负荷辨识调参运维人话版（详细版）
 
 > **给谁看**：完全不懂算法的工程师、运维、交付、现场实施同学。只要会 `复制粘贴 PowerShell 命令`、`用 Excel 打开 CSV`、`看懂“开/关”`，就能按本手册把一个从未见过的新设备从 0 接到生产，并判断能不能上线。  
-> **版本**：v1.1 详细版（2026-09-18，对齐 `REPORT.md v1.1 + NILM_DATA_DICT v0.2.10 + REPORT_TEST 18专题 + base_optimal lag5[5,1,2,3,4]`）+ Q16 `DATA_MISSING_BUS` 空批次修复（2026-09-18）+ Step4 800080270815 双链解读（2026-09-20）+ Step1a 定阈（2026-09-21）｜协议：`BOOTSTRAP.md v2.3`｜分支：`arena/01a0896c-nilm-new`  
+> **版本**：v1.2 详细版（2026-09-10，对齐 `REPORT.md v1.1 + NILM_DATA_DICT v0.2.10 + REPORT_TEST 专题集 + base_optimal lag5[5,1,2,3,4]`）+ 五大核心参数（`pbus_mode / on_thr_w / decision_thr_w / post_min_on / post_fill_short_off`）自动定参专题详解与 `901` 边界复盘｜协议：`BOOTSTRAP.md v2.2`｜分支：`arena/01a0896c-nilm-new`  
 > **一句话定位**：用总线侧 5 分钟电表（电压电流有功功率因数）去猜分路侧 15 分钟电表（某一路 `p1/p2/p3...` 的有功）此刻是“开 1”还是“关 0”、功率是多少瓦。模型只看过去 24 小时（96 点）的功率走势，不看高频谐波。
 
 **怎么用本手册**：按顺序读，`Step 0-7` 是必做流水线（`Step1` 拆 `1a探数定阈(5min)+1b写配置`，仍计8步）；`§4-6` 是解释为什么；`§7-9` 是上线门禁与排障；`附录` 是可直接复制的模板。遇到报错先查 `§9 战史`，再查 `§10 FAQ`。
@@ -13,13 +13,13 @@
 1. [三个前置灵魂问题](#1-三个前置灵魂问题)
 2. [数据：最少要什么、放哪、叫什么、要不要洗](#2-数据最少要什么放哪叫什么要不要洗)
 3. [从 0 到上线的 8 步（粘贴即跑，含输出怎么验）](#3-从-0-到上线的-8-步粘贴即跑含输出怎么验)
-4. [两个阈值到底是什么（on_thr vs decision，人话+图）](#4-两个阈值到底是什么on_thr-vs-decision人话图)
+4. [两个阈值与五大参数自动定参专题详解（pbus_mode / on_thr_w / decision_thr_w / post_min_on / post_fill_short_off）](#4-两个阈值与五大参数自动定参专题详解pbus_mode--on_thr_w--decision_thr_w--post_min_on--post_fill_short_off)
 5. [模型怎么选（4 选 1 自动，为什么不能单押）](#5-模型怎么选4-选-1-自动为什么不能单押)
 6. [推理后看哪两个表（能力 vs 交付）](#6-推理后看哪两个表能力-vs-交付)
 7. [生产 7 项放行（缺一不可，含不合格长什么样）](#7-生产-7-项放行缺一不可含不合格长什么样)
 8. [部署架构与日常运维（批量、断点、月历）](#8-部署架构与日常运维批量断点月历)
-9. [战史：我们犯过的 7 个错（别再踩）](#9-战史我们犯过的-7-个错别再踩)
-10. [常见问题 16 问](#10-常见问题-16-问)
+9. [战史：我们犯过的 8 个错（别再踩）](#9-战史我们犯过的-8-个错别再踩)
+10. [常见问题 18 问](#10-常见问题-18-问)
 11. [附录：模板与速查卡](#11-附录模板与速查卡)
 
 ---
@@ -301,18 +301,180 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 
 ---
 
-## 4. 两个阈值到底是什么（on_thr vs decision，人话+图）
+## 4. 两个阈值与五大参数自动定参专题详解（pbus_mode / on_thr_w / decision_thr_w / post_min_on / post_fill_short_off）
+
+### 4.1 两个阈值到底是什么（`on_thr_w` vs `decision_thr_w`，人话+图）
 
 ```
-真值侧（考卷答案）              预测侧（判卷标准）
-target --on_thr--> target_state   pred --decision_thr--> pred_state --min_on/fill_off--> 最终 0/1
-  10W 恒定                       30→400 可调，月扫重定
+真值侧（考卷答案）              预测侧（判卷标准 + 游程整形）
+target --on_thr--> target_state   pred --decision_thr--> 裸0/1 --min_on(去毛刺)--> --fill_off(填短坑)--> 最终 pred_state
+  物理开机边界（冻结）               按模型底噪与跨月基荷校准，支持零重训离线重扫/双链同步
 ```
 
-* **`on_thr_w`（真值阈）**：什么算真的开。`target ≥ on_thr` 才算开 1。**改它 = 改答案**，需重算审计与历史对比。按电器最小档定：10W是“有没有人用”，50W是“是不是在干活”（2842 p1 稳态 700W 取 50）。
-* **`decision_thr_w`（预测阈）**：模型猜多少才报开。`pred ≥ decision` 才报开，完事 `去短开1窗（<1不存在，恒空）+填短关3窗（≤45min）`。**改它 = 改判卷标准**，不改权重，可离线扫上千次。
-* **为什么分开**：2844 真开机 500-1000W，全关幻觉 <500W，10W 真值线与 400W 预测线差 50 倍。能力口径（`raw≥on_thr`）看模型准不准，交付口径（`pred_state≥decision`）看用户收到准不准，两口径之差就是你调阈值的战场，混一起就没法既评模型又调交付。
-* **游程**：`enforce_min_on 1` 恒空（防闪断），`fill_short_off 3` 仅填两侧皆开的 ≤3 窗短关断（全关日 `fp 150→152 +2` 即此）。
+* **`on_thr_w`（真值阈）**：什么算真的开。`target ≥ on_thr_w` 才算真开 `1`。**改它 = 改考卷标准答案**，会影响开机段统计、分层切分、游程物理上界与评估基准，定准后必须冻结。按电器最小工作档定：`10W` 是“有没有电/单台洁净待机”，`50W` 是“是不是在干活”（`2842 p1` 稳态 `700W` 取 `50W`），多路合并（如 `p1+p2+p3+p4`）需越过总待机功率带且低于单台最小工作档。
+* **`decision_thr_w`（预测阈）**：模型猜多少瓦才报开。先按 `pred ≥ decision_thr_w` 得初判 `0/1`，再依次经 **`enforce_min_on(post_min_on)`（抹除不足 `m` 个点的短开脉冲）** 与 **`fill_short_off(post_fill_short_off)`（回填两侧皆真开且 `≤ k` 个点的短关凹坑）** 产出最终交付列 `pred_state`。**改它与游程参数 = 改判卷标准**，不改模型权重，可毫秒级零重训重算上千次。
+* **为什么必须分开**：`2844` 真开机 `500~1000W`、关态底噪幻觉 `<500W`，`10W` 真值线与 `400W` 预测线差 `40` 倍。能力口径（`metrics_daily.csv`，`pred ≥ on_thr_w` 裸判）看模型本身准不准；交付口径（`metrics_daily_chain.csv`，`pred_state`）看交付给业务方的 `0/1` 准不准。两口径混在一起就既无法客观选模型，也无法消除回归底噪虚报。
+
+---
+
+### 4.2 五大参数自动定参全景架构与执行时序耦合链
+
+系统支持对 **`on_thr_w`、`pbus_mode`、`decision_thr_w`、`post_min_on`、`post_fill_short_off`** 五个核心参数独立或全量配置 `"auto"`（**铁律：显式数值配置 100% 优先于 `"auto"`，未写时保持历史硬编码默认值 `10.0 / auto / 10.0 / 1 / 3` 向后兼容，全链路决策写入 `meta.json` 留痕**）。
+
+五个参数并非孤立运行，而是严格遵循**“真值定界 → 特征缩放仲裁 → 零泄漏选校准模型 → 三维判决链校准 → 推理双链收口”**的单向因果时序链：
+
+```
+[Step A: 真值物理定阈]  on_thr_w="auto"
+   ├─ 训练时间窗预估（排除 splits.test.include 零泄漏）
+   └─ invalid_data_days + quality.day_gate 剔除缺测坏天后自动重刷 [AUTO-ON-THR-REFRESH]
+         │
+         ├──► 锁死真值标签 target_state = (target >= on_thr_w)
+         ├──► 锁死后续护栏上界基准 P10(y_train_on) -> upper_guard_w = 0.80 × P10(y_train_on)
+         ▼
+[Step B: 游程阶段一定界]  post_min_on / post_fill_short_off = "auto"
+   └─ 在严格连续 15min 真值块上自回放，锁死物理安全盒 (M_max, K_max)
+         │   · enforce_min_on 真开折损率 ≤ 0.5%  --> M_max
+         │   · fill_short_off 真关膨胀率 ≤ 1.0% 且短停机桥接占比 ≤ 10% --> K_max
+         ▼
+[Step C: 母线特征缩放仲裁]  pbus_mode="auto"
+   ├─ 第1轮：默认先跑抗漂移基态 pbus_mode="raw"（pbus 原值 + 物理零点锚定）
+   ├─ 第2轮：仅当序列模型在 train+val 出现真实欠拟合/坍缩时，启动候选 pbus_mode="scaled" 重训
+   └─ 第3轮：验证集双向门禁（MAE 增益 ≥5% 或 R²+RMSE 重度欠拟合救援，且 F1 不退化 ≤0.015）决出胜出模式
+         │
+         ▼
+[Step D: 零泄漏选校准模型 + 三维协同校准]  decision_thr_w + (post_min_on, post_fill_short_off) = "auto"
+   ├─ 目标模型：显式 infer_model 优先，否则按 val 集综合投票选 best_val（严禁偷看 test）
+   └─ 在 c ∈ [0.6·on_thr_w, upper_guard_w] × m ∈ [1..M_max] × k ∈ [0..K_max] 内联合寻优：
+         · 召回硬底线 recall ≥ 0.95 + 反全开坍缩特异性护栏（剔除 Spec < 0.25）
+         · 全关日防桥接硬约束 off_day_fp(c,m,k) ≤ off_day_fp(c,m,0) + 奥卡姆惰性锚点
+         │
+         ▼
+[Step E: 推理继承 + (val + infer) 双链联合收口]  auto_run_steps2to5.py
+   ├─ 推理默认继承 train/meta.json 中对应模型的阈值、游程与 pbus_mode
+   └─ 若 infer 含分路真值：执行 (val + infer) 三维联合复核（兼容跨季异峰按当期 infer 定阈），
+      毫秒级零重训原子重写 train + infer 双侧 CSV/JSON，确保 audit_user_run.py 100% 全绿对齐
+```
+
+> **核心工程直觉**：`on_thr_w` 处于整条链的最上游——它一旦偏低（如卡在待机底噪 `15W`），会把 `upper_guard_w` 锁死在 `0.80×60W=48~96W`，导致下游 `decision_thr_w` 跨不过回归底噪；反之它一旦偏高（如越过单机轻载切到 `300W`），又会把轻载真开点翻转为“真关态”，抬高 `upper_guard_w` 并倒逼 `decision_thr_w` 冲高。理解这条耦合链，就能一眼看透所有自动定参日志。
+
+---
+
+### 4.3 参数 ①：`on_thr_w="auto"`（分路真值物理开机阈值自动定参）
+
+* **代码入口**：`nilm/pipeline/auto_thresholds.py::resolve_auto_on_thr_w`、`nilm/pipeline/user_task.py`（训练初算 + `day_gate` 后重刷）。
+* **人话目标**：自动在分路功率直方图的“关机/待机底噪堆”与“真正干活功率堆”之间找到干净谷底，把阈值定在**待机上沿加一点安全余量**的位置。
+* **四步核心逻辑**：
+  1. **零泄漏样本池与坏天剔除二次重刷**：仅统计 `train` 时间窗且主动剔除 `splits.test.include` 锚定区间；当 `invalid_data_days` 或 `quality.day_gate` 剔除了通讯中断/全零缺测坏天后，自动在纯净合格天上二次重算（输出黄色 `[AUTO-ON-THR-REFRESH]`），隔绝假零值坏天对首谷的污染，并同步刷新 `branch_sessions.csv` 与质量报告。
+  2. **一级对数域 Otsu 双峰寻谷**：对非负分路功率做 $\log(1+P)$ 变换（兼顾几瓦待机与数千瓦运行跨越 3 个数量级的尺度），最大化类间方差比 $\eta \in [0, 1]$ 切出谷底 $y_{\text{otsu}}$：
+     * 初值：`raw_thr = max(min_floor, 1.40 × P99(y_off), P99(y_off) + 0.01 × P50(y_on))`；
+     * 走廊夹逼与刻度圆整：常规单设备夹逼在 `[1.15 × P99(y_off), 0.30 × P05(y_on)]`；当多路合并出现“多台同时待机接近单台轻载 30%”（`1.15 × P99(y_off) > 0.30 × P05(y_on)` 且 `< 0.60 × P05(y_on)`）时自动放宽上界至 `min(max(0.50 × P05, y_otsu), 0.70 × P05)` 防止走廊倒挂切穿待机带，再圆整到 `10/15/20/50/100/200...` 等标准刻度得 `thr_1`。
+  3. **多峰寄生待机跨越仲裁 + 母线同向阶跃反向否决制**：
+     * 工商业多联机/多路合并常呈三模态甚至四模态：`0W（拉闸断电）` + `60~150W（电控板/曲轴加热器寄生待机）` + `450~2500W（单台/多台压缩机制冷）`。一级 Otsu 会先切在 `0W` 与 `60W` 之间的 `15W`；
+     * 算法自动对 `y_on` 执行二级 Otsu（若次级低簇 `c1` 内部仍含“待机 + 单台轻载”双峰且 `sub1_eta ≥ 0.76`，再做三级下探剥离单台轻载），提取候选主工作阈 `thr_2`；
+     * **怎么区分 `60~150W` 是“不算开的寄生待机”还是“必须算开的真低速档（如双速水泵低频档）”？——物理守恒反向否决制**：
+       计算分路跳变时刻母线**同向有效阶跃** `dir_dbus = sign(Δy) × Δpbus` 相对平稳背景波动 `P90(|Δpbus|)` 的信噪比 `snr_sub` 与同号一致率 `sub_sign_rate`：
+       - **一票否决（保护真多档设备）**：若 `snr_sub ≥ 1.2` 且 `sub_sign_rate ≥ 0.65` 且主簇 `snr_thr2 ≥ 1.2`，证明该低功率档在总母线上有清晰同向阶跃，属可辨识真低速档，**严禁跨越，保留低阈 `thr_1`**（记录 `IDENTIFIABLE_MULTIGEAR_KEPT_LOW_THR`）；
+       - **放行跨越（过滤寄生待机）**：只要未触发真多档否决，无论是母线清晰印证待机被淹没（`snr_sub < 1.0` 且 `snr_thr2 ≥ 1.0`），还是大厂总母线背景波动过大将整条分路淹没（`TARGET_EDGE_BURIED_IN_BUS`，`snr_thr2 < 1.0`）但分路自身呈强三峰且主簇能量绝对主导（`sub_eta ≥ 0.78`、`P50(c2) ≥ 4.5 × P50(c1)`、`P90(c1) ≤ 0.25 × P50(c2)`、`c2 能量占比 ≥ 90%`），均自动晋升至 `thr_2`（记录 `stage="auto_trimodal_standby_promoted"`）。
+  4. **分级告警机制**：分离度高且谷底干净时打**亮黄日志 `[AUTO-ON-THR]`**；若全常开/全常关、低分离度（`η < 0.55`）、谷底稠密或检出多档位歧义，打**亮红日志 `[AUTO-ON-THR-WARN]`** 提示人工结合铭牌复核。
+
+---
+
+### 4.4 参数 ②：`pbus_mode="auto"`（母线功率特征缩放模式三步验证闭环）
+
+* **代码入口**：`nilm/pipeline/user_task.py`（`_resolve_pbus_mode_initial`、`_should_fallback_raw_to_scaled`、`_accept_scaled_candidate`）。
+* **两种物理模式的本质取舍**：
+  * **`"raw"`（默认抗漂移基态）**：母线有功相关特征保持原始物理量纲（不进 `z-score`），`proportional` 按物理总功率非负分摊。优点是**天然锚定 `0 kW` 物理零点**，7 月/8 月工厂基荷整体抬升时不会把关机段拉出大面积虚报（`2842/2844/778/856` 均稳留 `raw`）。
+  * **`"scaled"`（小信号/未配变比救场态）**：`pbus` 纳入训练集 `z-score` 标准化（均值 0、方差 1），`proportional` 改为带截距最小二乘线性回归。优点是**消除“大母线微跳变”或“`PT=1, CT=1` 二次侧 `0.1~0.2 kW` 微小数值”导致的深度序列模型梯度消失与预测全 0 坍缩**（如 `733` 从 `test F1=0.0` 救回 `0.985`）；代价是对跨月母线基荷均值漂移更敏感（如 `778` 切 `scaled` 后虚报翻倍）。
+* **零泄漏三步闭环（废除静态千瓦阈值盲跳）**：
+  1. **Step 1 统一先试 `raw`**：所有 `"auto"` 用户无条件先完整跑一轮 `raw`（记录 `DEFAULT_RAW_BEFORE_VAL_CHECK`），若各模型在 `train + val` 拟合健康，一遍即完零额外耗时。
+  2. **Step 2 欠拟合触发检测（仅看 `train + val`）**：检查序列模型（`lstm / cnn1d / transformer`）是否存在以下任一真实病灶：
+     * 预测带宽坍缩：`train` 或 `val` 上 `P95(pred) - P5(pred) < on_thr_w`（记录 `*_RAW_COLLAPSED`）；
+     * 负决定系数：`train R² < 0` 或 `val R² < 0`（记录 `*_NEGATIVE_R2`）；
+     * 显著劣于同场基线：当同场非坍缩 `ridge / history_profile` 基线 `val R² ≥ 0.25` 时，序列模型同时满足 `train R² < base_train_R² - 0.03`、`val R² < base_val_R² - 0.02` 且 `val MAE > base_val_MAE`（记录 `*_UNDERFIT_VS_BASELINE`）。
+  3. **Step 3 验证集双向验收门 + 二次侧救援门（严禁看 `test`）**：启动候选 `scaled` 重训后，在 `val` 上逐一验收触发重训的序列模型（全部通过才切换，任一不过则留用 `raw`）：
+     * **坍缩恢复通道**：若 `raw` 发生带宽坍缩，`scaled` 解除坍缩且 `val F1 (@on_thr)` 不低于 `raw` → **通过**（`RECOVERED_FROM_COLLAPSE`）；
+     * **常规双向门禁**：`val MAE` 相对降低 **`≥ 5.0%`**，且 `val F1 (@on_thr)` 下跌 **`≤ 0.015`** → **通过**（`VAL_DUAL_GATE_PASS`）；
+     * **二次侧重度欠拟合 `R²+RMSE` 救援门**：针对 `PT=1, CT=1` 微弱母线场景，若 `train R²` 跃升 **`≥ 0.20`**、`val R²` 提升 **`≥ 0.03`**、`val RMSE` 相对下降 **`≥ 5.0%`**、`val MAE ≤ 1.005 × raw_MAE` 且 `val F1 (@on_thr)` 下跌 **`≤ 0.015`** → **通过**（`VAL_R2_RMSE_RESCUE_PASS`）；
+     * **一票否决留用 `raw`**：凡出现 `scaled` 仍坍缩、`MAE/RMSE` 增益不足或 `val F1 (@on_thr)` 退化 `> 0.015`（如 `778` 跌 `0.0377`），打印 `[AUTO-REJECT-SCALED]` 自动退回 `raw`；通过则打印**亮红 `[AUTO-FALLBACK]`** 切换为 `scaled`，推理端通过 `meta.json["pbus_mode"]` 自动继承。
+
+---
+
+### 4.5 参数 ③：`decision_thr_w="auto"`（预测侧判卷阈值双阶段校准与跨季收口）
+
+* **代码入口**：`resolve_auto_decision_thr_w`（训练期单链）、`resolve_joint_val_infer_decision_thr_w` + `sync_decision_thr_artifacts`（推理后双链联合收口）。
+* **阶段一（训练期零泄漏验证集校准）**：
+  1. **零泄漏选校准模型（`select_calibration_model_zero_leakage`）**：若配置了显式 `infer_model` 则以该模型为准；否则**仅用 `val` 集指标**（过滤 `val` 坍缩模型后按 8 指标投票选 `best_val`，绝不触碰 `test`），同时为场内每个模型分别算出专属 `model_decision_thr_w[model]` 存入 `meta.json`。
+  2. **候选网格生成**：覆盖 `[0.6 × on_thr_w, upper_guard_w]` 内固定刻度、分路量级比例点及关态预测噪声高分位点（`P75 ~ P99.5 × 1.05` 抗噪余量）。
+  3. **四道硬护栏选优**：
+     * **物理上限护栏**：`upper_guard_w = max(on_thr_w, 0.80 × P10(y_train_on))`，严防高阈值切穿真开机最低功率档；
+     * **召回底线护栏**：`val_recall ≥ 0.95`（宁可留少量虚报，绝不把真开机砍成大面积漏报）；
+     * **反全开坍缩特异性护栏（`_apply_anti_collapse_guard`）**：当验证集负样本 `≥ 12` 且存在特异性 `Spec = TN/(TN+FP) ≥ 0.50` 的健康候选点时，强制剔除 `Spec < 0.25`（`TN → 0` 全报 1 坍缩）的低阈值点，驱动阈值自动跨过 MSE 回归模型的关态非零均值地板；
+     * **惰性保持门与 `scaled` 抗漂移锚点**：若最优候选相对 `on_thr_w` 的 `F1` 增益 `< 0.003`、无 `≥ 35%` 虚报大幅削减且 `on_thr_w` 未发生特异性坍缩，则保持 `decision_thr_w = on_thr_w`（`KEEP_ON_THR_NEAR_OPTIMAL`）；若 `pbus_mode == "scaled"`，则在 `F1` 峰值容差 `0.008`、`recall ≥ 0.96` 平台期内向 `min(max(1.35 × P99(off_preds), 1.25 × thr), 0.70 × P10(y_on))` 右移留足抗跨月基荷漂移裕度（`SCALED_ANTI_DRIFT_MARGIN`）。
+* **阶段二（Step 5 推理后 `(val + infer)` 双链联合收口与零重训原子同步）**：
+  * 当 `infer` 目录含分路真值（离线验收/月扫调优场景）时，`auto_run_steps2to5.py` 在 Step 5 后自动调用 `calibrate_and_sync_joint_decision_thr`：
+    - **双链同峰/有交集**：在同时满足 `val` 与 `infer` 双侧高分容差带（`best_f1 - 0.015`）的交集中，选双链综合 `F1` 最高、全关日 `FP` 最低的稳健点；
+    - **跨季双链异峰（`CROSS_SEASON_HETERO_PEAK`，如 `2844` 6月 vs 7月、`733` 4-6月 vs 8月）**：当历史季节 `val` 与当期 `infer` 最优带无交集时，自动解除过时 `val` 的窄缝否决，在训练集物理护栏上限 `train_upper_guard_w`、`infer_recall ≥ 0.95` 及防下探坍缩护栏（`ANTI_DOWNWARD_COLLAPSE_GUARD`）约束下**以当期 `infer` 链为准定阈**（严格落实 Step 4 铁律）；
+    - **毫秒级零重训原子同步**：若定稿值与训练初值不同，自动重写 `train_predictions.csv`、`metrics_daily_chain.csv`、`state_strategy_metrics.csv`、`inference_result.csv` 及双侧 `meta.json`（完整保留 `decision_thr_w_val_initial` 历史留痕），确保双侧 `decision_thr_w` 100% 对齐并通过 `audit_user_run.py` 全部一致性门禁。
+
+---
+
+### 4.6 参数 ④ & ⑤：`post_min_on="auto"` 与 `post_fill_short_off="auto"`（游程两阶段物理定界 + 三维协同校准）
+
+* **代码入口**：`resolve_postprocess_physical_bounds`（阶段一真值定界）、`resolve_auto_postprocess_and_decision_thr`（阶段二协同寻优）。
+* **人话职责**：
+  * **`post_min_on`（最小开机持续点数，单位：15min 点）**：抹除关机期间偶尔冒头 `1~m-1` 个点的孤立预测尖峰毛刺（`m=1` 表示不去毛刺；`m=4` 表示不足 1 小时的短脉冲全抹零）。**设太大会把真短开机段抹掉！**
+  * **`post_fill_short_off`（最大短关回填点数，单位：15min 点）**：把**左右紧邻皆为开机 `1`** 且长度 `≤ k` 个点的短暂功率跌落凹坑填回 `1`（`k=0` 表示不回填；`k=3` 表示回填 `≤ 45min` 的短凹坑）。**设太大会把启停循环冷机的真实停机间隙或午休停机桥接成常开！**
+* **两阶段零泄漏算法**：
+  1. **阶段一：连续 15min 真值块物理安全定界 `(M_max, K_max)`（零模型依赖）**
+     * 先按相邻时间差 `== 15min` 切分严格连续块（`_split_contiguous_15m_blocks`），杜绝跨日抽样或通讯缺口拼出假游程；
+     * **定 `M_max`**：提取两端未截断的完整真开游程 `L_on`，取分位数初界（`≥5` 段取 `clip(floor(0.75 × P10(L_on)), 1, 8)`，`3~4` 段取 `clip(floor(0.60 × min(L_on)), 1, 4)`，`<3` 段锁 `1`），再在连续真值块上自回放 `enforce_min_on(s_gt, m)`，强制要求**真开态点数折损率 `≤ 0.5%`**（只要存在真实 15~30min 短促开机，自动锁死 `M_max = 1`）；
+     * **定 `K_max`**：在 `k ∈ {0..6}` 上对连续真值块自回放 `fill_short_off(s_gt, k)`，强制要求**被错误桥接的真关态膨胀率 `≤ 1.0%`**，且当日内短停机间隙 `≥ 5` 段时**真实停机次数被桥接占比 `≤ 10%`**（遇到间歇启停压缩机或高频循环泵时自动把 `K_max` 收窄至 `0~1`，遇到连续全天长班次空调则放开至 `2~3`）。
+  2. **阶段二：验证集 `(decision_thr_w, post_min_on, post_fill_short_off)` 三维协同寻优 + 奥卡姆正则**
+     * 支持单参数解耦配置（如 `post_min_on=2, post_fill_short_off="auto"` 时仅在 `k ∈ {0..K_max}` 上搜索）；
+     * 在安全盒 `{1..M_max} × {0..K_max}` 内与 `decision_thr_w` 联合评估，施加**全关日零新增桥接护栏** `off_day_fp(c, m, k) ≤ off_day_fp(c, m, 0)`（严禁 `fill_short_off` 在全关天把两个孤立噪点连成一片大片虚报！）；
+     * 施加奥卡姆复杂度罚分 `0.0004 × (m - 1) + 0.0003 × |k - k_anchor|` 与最小净增益门（`F1` 净增 `< 0.002` 且 `FP` 净减 `< 3` 时保持低复杂度锚点 `(1, min(3, K_max))`，记录 `KEEP_POSTPROC_ANCHOR`）。
+
+---
+
+### 4.7 控制台日志标识、落盘留痕与一键同步命令速查
+
+| 日志标签 | 颜色 | 触发阶段与含义 | 对应 `meta.json` 审计字段 |
+|---|---|---|---|
+| `[AUTO-ON-THR]` | 亮黄 | `on_thr_w="auto"` 高置信度双峰/三峰跨越定阈生效 | `on_thr_w`, `on_thr_w_decision` |
+| `[AUTO-ON-THR-REFRESH]` | 亮黄 | `bad_days / day_gate` 剔除坏天后在纯净合格天重校准 `on_thr_w` | `on_thr_w_decision.refreshed_after_day_filter` |
+| `[AUTO-ON-THR-WARN]` | 亮红 | 低分离度、常开/常关或真多档歧义告警，提示人工核对铭牌 | `on_thr_w_decision.reasons` |
+| `[AUTO-FALLBACK]` | 亮红 | `pbus_mode="auto"` 检出 `raw` 欠拟合且 `scaled` 通过验证集验收，切换 `scaled` | `pbus_mode`, `pbus_mode_decision.val_acceptance` |
+| `[AUTO-REJECT-SCALED]` | 默认 WARN | 候选 `scaled` 未过验证集 `MAE/R²+RMSE` 或 `F1` 退化门，安全留用 `raw` | `pbus_mode_decision.stage="post_fallback_rejected"` |
+| `[AUTO-DEC-THR]` | 亮黄/亮红 | 训练期验证集 `decision_thr_w` 自动校准结果（低召回/低F1变红） | `decision_thr_w_decision`, `model_decision_thr_w` |
+| `[AUTO-POSTPROC]` | 亮黄/亮红 | 游程 `(post_min_on, post_fill_short_off)` 两阶段定界与协同校准结果 | `postprocess_bounds`, `postprocess_decision`, `model_postprocess_params` |
+| `[AUTO-DEC-THR-SYNC]` | 亮黄/亮红 | Step 5 后 `(val + infer)` 双链三维收口对齐或跨季异峰同步重写完成 | `infer/meta.json["joint_calibration_decision"]` |
+
+```powershell
+# 1) 新用户或存量用户全参数自动定参一键跑通（Step 2→3→5→双链收口→Step 4 扫描）：
+python scripts/auto_run_steps2to5.py --user-key <device>_<user> --target-col p1 --on-thr auto --decision-thr auto --min-on auto --fill-off auto --pbus-mode auto --force
+
+# 2) 自动跑完确认指标满意后，一键将定稿数值写回 configs/time_filters.json（自动备份 .bak.auto）：
+python scripts/auto_run_steps2to5.py --user-key <device>_<user> --stage sync-thr --save-config
+
+# 3) 人工微调判卷侧参数（无需重训模型！毫秒级同步刷新 train + infer 全部报表并通过审计）：
+python scripts/auto_run_steps2to5.py --user-key <device>_<user> --stage sync-thr --decision-thr 200 --min-on 1 --fill-off 3 --save-config
+```
+
+---
+
+### 4.8 自动定参已知边界与人工覆写实战判据（`901` 深度复盘）
+
+自动定参覆盖了 90% 以上的常规双峰与标准三峰工况，但在**“多路合并变频轻载 + 大厂总母线淹没 + 未配 PT/CT + 历史强绑劣质 `infer_model`”**四重极端叠加时（典型代表：`800080270901_4200008005677`，目标 `p1+p2+p3+p4`，`pt=1, ct=1`），会出现从 `on_thr_w=300` 到 `decision_thr_w=500` 的连锁偏移。遇到此类现象请按以下三步秒级定位与处置：
+
+1. **现象特征**：`on_thr_w="auto"` 定在 `300W`（日志显示 `待机P99=300.0, 工况P10=660.0`），`decision_thr_w="auto"` 冲顶至 `500W, post=(4,2)`，全局 `infer_F1=0.867` 看似尚可，但逐日表 `metrics_daily_chain.csv` 多天 `F1=0` 崩盘。
+2. **三层真实根因**：
+   * **根因 ①（`on_thr_w` 受 15min 跨刻爬坡与单机低频尾端抬升）**：二级 Otsu 谷底 `v_2 ≈ 350W` 把 `[160, 350)W` 内的 15 分钟启停爬坡均值与单台变频低频巡航点划入了 `< v_2` 池，令 `c01_p99 = 300W`，定阈 `300W` 误将占全样本约 `30%~35%` 的 `[15, 300)W` 轻载时段翻转为“真关态（`0`）”，单台低频运行日整天变成“伪全关天（`TP=0 → 日 F1=0`）”；
+   * **根因 ②（`time_filters.json` 残留 `"infer_model": "transformer"` 强绑劣质模型）**：该户 `pt=1, ct=1` 且分路跳变完全淹没在大厂母线背景中（`TARGET_EDGE_BURIED_IN_BUS`），同场 `ridge`（`val F1=0.9929, fp=0`）与 `history_profile`（`val F1=0.9958, fp=1`）表现极佳且训练已评定 `best=ridge`，但历史配置写死了 `"infer_model": "transformer"`，强制用重度欠拟合的 `transformer(raw)`（关态预测 100% 落在 `200~550W`）做校准与推理；
+   * **根因 ③（`@on_thr` 裸切拒切 `scaled` + 反坍缩护栏推高 `decision_thr_w`）**：`pbus_mode="auto"` 在未校准 `@300W` 切点上裸算 `val F1` 因验证集母线偏移拒切 `scaled`；而在 `transformer(raw)` 上 `200W` 处 `TN≈0`（`Spec < 0.25`），反坍缩护栏依法剔除 `200W` 并顶到 `upper_guard_w=512W` 选出 `500W`。
+3. **标准处置口诀（遇到多路合并 + 母线淹没必查）**：
+   * **一查 `infer_model`**：打开 `configs/time_filters.json` 检查该户是否残留了手工写死的 `"infer_model"`——删掉它，让 4 模型自动择优（`best_model`）选出 `ridge / history_profile`；
+   * **二看 `PT/CT` 与轻载档**：核实现场互感器变比填入 `pt_ratio / ct_ratio`；若多路合并存在 `200~300W` 单机变频低频档，按台账单机最小工作功率显式固化 `"on_thr_w": 200.0`；
+   * **三用 `sync-thr` 秒级验证**：改判卷侧参数直接跑 `--stage sync-thr --decision-thr 200 --min-on 1 --fill-off 3` 零重训对比日表，改真值侧 `on_thr_w` 则加 `--force` 重训重推。
 
 ---
 
@@ -384,7 +546,7 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 ---
 
-## 9. 战史：我们犯过的 7 个错（别再踩）
+## 9. 战史：我们犯过的 8 个错（别再踩）
 
 1. **W-1 跨天拼窗（高危）**：按数组位置滑窗，把切分锚定造成的时间洞拼进 24h 窗，800有 50.5% 窗被污染最长 4.99 天，`transformer` 位置编码全错。现按 `间隔≠15min` 即分段，段头用段内首行填充，`common.schema.segment_bounds` 全局原语，守卫 13 项。
 2. **目标错（OQ-13）**：2842 `p1+p2`、2844 `p3+p4` 训完才发现真目标 `p1/p2`，旧结论 `SAE 0.372→0.0039` 全降级。**先定 target_col 再跑。**
@@ -393,10 +555,11 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 5. **阈值看错表**：`decision 10` 看 `offline F1` 说无效，实则 `offline` 契约上就不进 `decision`。**看能力调模型，看交付调阈值。**
 6. **单文件加载**：`--base-config` 只读一个文件，`default.yaml` 不参与（曾致 2844 试点被全范围门禁拦）。`day_gate` 必须各 base 文件同步，`test_config_defaults` 守卫。
 7. **多工作副本**：`nilm_model_tune` 与 `.../nilm_new` 并存致运行时缺键，以产物 `decision_thr_w` 列为准，执行包必含 `Select-String` 预检（`仓库预检≠运行时生效`，`audit` 以产物自描述为准）。
+8. **`901` 四路合并强绑 `infer_model` + 轻载过渡带连锁冲高**：`800080270901`（`p1+p2+p3+p4`，`pt=1, ct=1` 大厂母线淹没）在本地 `time_filters.json` 残留了 `"infer_model": "transformer"`，旁路了同场 `val F1=0.993` 的冠军 `ridge`；叠加 15min 爬坡与单机低频尾端把 `on_thr_w="auto"` 推至 `300W`（翻转 `30%+` 轻载真值），使 `transformer(raw)` 在反坍缩护栏下冲顶 `decision_thr_w=500W`，导致单机轻载日逐日 `F1=0`。**切记：除特殊指定外勿在 `time_filters.json` 写死 `infer_model`，多路变频轻载回路须核对单台最小档显式锚定 `on_thr_w`（见 `§4.8`）。**
 
 ---
 
-## 10. 常见问题 16 问
+## 10. 常见问题 18 问
 
 **Q1: 我只有 7 天数据能上线吗？** 能跑但不建议当生产。`history/proportional` 可先当影子，`transformer` 等 30 天再切。  
 **Q2: `on_thr` 和 `decision` 能否统一成 400？** 别。会把 10-400W 真开点重定义为关，报表好看但漏报被洗掉（`target [10,400)` 约 21 点）。  
@@ -413,22 +576,25 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 **Q13: 审计报“期望唯一用户目录 实际:['infer','train']”怎么办？** 这是 `--run-root` 指向歧义：`outputs/<user>` 本身已含 `train/infer`，旧版脚本误判为父目录。v2026-09-18 已兼容——`--run-root outputs/<user>`（形式 A）与 `--run-root outputs --user-key <user>`（形式 B）均可；旧版请升级 `scripts/audit_user_run.py` 或改用形式 B。你的 `800080270856_4206810972139` 即此例：`python scripts/audit_user_run.py --run-root outputs/800080270856_4206810972139 --expect-n 2629 --expect-confusion 1036,77,21,1495 --expect-off-day-fp 18 --baseline-run outputs/800080270856_4206810972139` 已可直接过。  
 **Q14: Step 6 审计2项 `总混淆/全关日fp` 没过，要改文档还是删掉？** **不删，留作可选回归门禁（I8），文档加注即可。** `I8` 的 `1036,77,21,1495/18` 是 `2844` 快照，`800080270856` 实测 `580,19,9,2021/0`（0全关天）必然 `✗`——这是抄模板所致，不是缺陷。正确用法见 Step 6 黄框：新用户第1次不带 `--expect-*` 看真实值，第2次再固化；也可一直省略 `I8`，`T1-T7/I1-I7/I9-I10` 已保核心正确性。本次 `2✗` 已判 `800080270856` 生产可放行（`F1 0.976`），改实测期望即全绿。  
 **Q15: Step 4 选阈值报 `OSError: Invalid argument: '.../train/*/predictions/train_predictions.csv'` 怎么办？** 这是 **Windows PowerShell 未展开 `*` 通配**（bash 会展开，PowerShell 不会），`pd.read_csv('.../*/...')` 直接当文件名打开必然 `Errno 22`。已在 `scripts/threshold_sweep.py v2026-09-19` 修复：脚本内部 `glob` 自动展开 `*?[]`，排序取最新时间戳目录，PowerShell/bash 均可（建议 `--csv ".../*/..."` 加引号防 bash 提前展开）。你的 `800080270733_4206673297219` 即此例：`python scripts/threshold_sweep.py --csv "outputs/800080270733_4206673297219/train/*/predictions/train_predictions.csv" --pred-col pred_transformer --state-col pred_state_transformer --split test --thresholds 10,30,50,100,150,200,300,400,500 --min-on 1 --fill-off 3` 升级后即过；旧版请手动替换 `*` 为真实时间戳如 `train/20260103_000000/predictions/train_predictions.csv` 或用 `$csv=(Get-ChildItem ... | Sort | Select -Last 1).FullName` 取最新。  
-**Q16: 一键脚本 `Step5 推理` 报 `KeyError: STATUS_COLUMNS / DATA_MISSING_BUS : data/infers/<user> 不存在` 怎么办？** 这是 **该用户无 `data/infers/<user>` 推理数据**（如 `800080270750_4206668913762` `trains 18 / infers 16` 中缺该目录），一键第二段 `--stage infer` 空批次所致。已在 `nilm/pipeline/batch.py v2026-09-18` 修复：空批次不再 `KeyError`，改为写 `batch_status.csv DATA_MISSING_BUS` 并正常结束（`batch_status 1 行 0 OK`）；`scripts/auto_run_steps2to5.py` 已改为 `--stage train` 分段 + 缺 `infer` 自动 `WARN 跳过`（`WARN Step5 跳过：data/infers/<user> 不存在`），`阈值 infer 链` 同步 `WARN 跳过`，`train 链阈值` 仍正常。**无需处理，按提示继续即可；需推理请另备 `data/infers/<user>/e241_...-Ch1-*.csv` 后 `--stage infer` 或 `--skip-infer` 仅训。** 旧版临时绕过：`python scripts/auto_run_steps2to5.py --user-key <key> --stage train` 或 `--skip-infer`。
+**Q16: 一键脚本 `Step5 推理` 报 `KeyError: STATUS_COLUMNS / DATA_MISSING_BUS : data/infers/<user> 不存在` 怎么办？** 这是 **该用户无 `data/infers/<user>` 推理数据**（如 `800080270750_4206668913762` `trains 18 / infers 16` 中缺该目录），一键第二段 `--stage infer` 空批次所致。已在 `nilm/pipeline/batch.py v2026-09-18` 修复：空批次不再 `KeyError`，改为写 `batch_status.csv DATA_MISSING_BUS` 并正常结束（`batch_status 1 行 0 OK`）；`scripts/auto_run_steps2to5.py` 已改为 `--stage train` 分段 + 缺 `infer` 自动 `WARN 跳过`（`WARN Step5 跳过：data/infers/<user> 不存在`），`阈值 infer 链` 同步 `WARN 跳过`，`train 链阈值` 仍正常。**无需处理，按提示继续即可；需推理请另备 `data/infers/<user>/e241_...-Ch1-*.csv` 后 `--stage infer` 或 `--skip-infer` 仅训。** 旧版临时绕过：`python scripts/auto_run_steps2to5.py --user-key <key> --stage train` 或 `--skip-infer`。  
+**Q17: 新用户接入时，五个核心参数（`pbus_mode / on_thr_w / decision_thr_w / post_min_on / post_fill_short_off`）可以全部填 `"auto"` 吗？什么时候必须改回手工数值？** **可以且推荐新用户首跑全填 `"auto"`**（`auto_run_steps2to5.py` 对新用户默认全 `"auto"`）。首跑完成后看两条线索：① 若控制台全是亮黄提示（无亮红 `[AUTO-ON-THR-WARN]`）且 `metrics_daily_chain.csv` 逐日 `F1` 稳定达标，可直接加 `--stage sync-thr --save-config` 将定稿值固化入库；② 若出现亮红 `[AUTO-ON-THR-WARN]`、或像 `901` 那样多路变频合并回路存在 `200~300W` 轻载巡航档导致逐日表出现伪全关日 `F1=0`，则按台账最小工作档显式指定 `--on-thr 200`（显式数值永远 100% 优先于 `"auto"`）。  
+**Q18: 为什么命令行传了 `--on-thr auto --decision-thr auto`，推理时还是没用训练评出的 `best=ridge`，反而用了 `transformer`？** 因为 `auto_run_steps2to5.py` 生成临时 `overlay` 时只覆盖命令行显式传入的阈值/缩放键，原 `configs/time_filters.json` 该用户节点中若存有历史遗留的 `"infer_model": "transformer"` 会原样保留生效（详见 `§4.8`）。删掉 `time_filters.json` 中该用户的 `"infer_model"` 字段后重跑，校准与推理即自动对齐 `best_model`。
 
 ---
 
 ## 11. 附录：模板与速查卡
 
-### A. 新用户 `time_filters.json` 模板
+### A. 新用户 `time_filters.json` 模板（推荐首跑全 `"auto"`，跑通验收后 `--save-config` 固化）
 
 ```json
 {
   "900080270900_4200000000001": {
     "target_col": "p2",
-    "on_thr_w": 10.0,
-    "decision_thr_w": 30.0,
-    "post_min_on": 1,
-    "post_fill_short_off": 3,
+    "on_thr_w": "auto",
+    "decision_thr_w": "auto",
+    "pbus_mode": "auto",
+    "post_min_on": "auto",
+    "post_fill_short_off": "auto",
     "quality": {"day_gate": true, "min_on_day_ratio": 0.2},
     "train": {"include": [["2025-07-10","2026-06-30"]], "exclude": []},
     "infer": {"include": [["2026-07-01","2026-07-31"]], "exclude": []},
@@ -444,10 +610,14 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 ### B. 命令速查（PowerShell / bash 通用）
 
 ```powershell
-# 一键 Step 2-5（推荐新用户 800080270733_4206673297219，自动 train→window→infer→双链扫阈，缺配置自动补 p1/10/30/day_gate，* 通配已兼容 PowerShell）
+# 一键 Step 2-5（新用户缺配置自动补全 auto + day_gate；已有用户可显式传 auto 走临时 overlay 试跑）
 python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219
+python scripts/auto_run_steps2to5.py --user-key 800080270901_4200008005677 --target-col p1+p2+p3+p4 --on-thr auto --decision-thr auto --min-on auto --fill-off auto --pbus-mode auto --force
+# 零重训双链收口同步 / 固化写回 configs/time_filters.json（自动备份 .bak.auto）
+python scripts/auto_run_steps2to5.py --user-key 800080270733_4206673297219 --stage sync-thr --save-config
+python scripts/auto_run_steps2to5.py --user-key 800080270901_4200008005677 --stage sync-thr --decision-thr 200 --min-on 1 --fill-off 3 --save-config
 .\scripts\one_click_733.ps1                                   # 等价 PowerShell 封装
-python scripts/auto_run_steps2to5.py --help                  # --stage all|train|infer|threshold / --force / --skip-train|skip-infer
+python scripts/auto_run_steps2to5.py --help                  # --stage all|train|infer|threshold|sync-thr / --save-config / --force
 # 单户训练+推理（分步，同上一键的底层）
 python scripts/run_batch_users.py --time-filter-config configs/time_filters.json --base-config configs/base_optimal.yaml --data-root data --output-root outputs --user-key 900080270900_4200000000001
 # 阈值扫（* 通配已兼容 PowerShell，v2026-09-19）
