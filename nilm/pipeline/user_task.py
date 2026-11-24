@@ -194,6 +194,11 @@ def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
                       for b in ref_models
                       if "train" in results_by_split[b] and "r2" in results_by_split[b]["train"]]
             best_ref_tr = max(ref_tr) if ref_tr else None
+            ref_tr_maes_all = [results_by_split[b]["train"]["mae"]["macro"]
+                               for b in ref_models
+                               if "train" in results_by_split[b]
+                               and "mae" in results_by_split[b]["train"]]
+            best_ref_tr_mae = min(ref_tr_maes_all) if ref_tr_maes_all else None
             if val_r2 is not None:
                 ref_val = [results_by_split[b]["val"]["r2"]["macro"]
                            for b in ref_models
@@ -216,6 +221,23 @@ def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
                         f"train_r2={tr_r2:.4f}<{best_ref_tr:.4f}-0.03, "
                         f"val_r2={val_r2:.4f}<{best_ref_val:.4f}-0.02{mae_tag})")
                     continue
+                # 大母线小分路（prop_train_r2 < -1）重度训练欠拟合兜底：当 val 含非典型日压低 ridge 基线 R²
+                # 使 val_r2 擦边卡在 -0.012~-0.02（如 733 差 0.0004），但训练误差 >1.8x 基线且 val MAE 劣 >8% 时放行候选重训
+                if (prop_tr_r2 < -1.0
+                        and best_ref_tr is not None and best_ref_val is not None
+                        and tr_r2 < best_ref_tr - 0.12
+                        and tr_mae is not None and best_ref_tr_mae is not None
+                        and tr_mae > best_ref_tr_mae * 1.8
+                        and val_r2 < best_ref_val - 0.012
+                        and val_mae is not None and best_ref_val_mae is not None
+                        and val_mae > best_ref_val_mae * 1.08):
+                    reasons.append(
+                        f"{seq_name}_SEVERE_RAW_UNDERFIT("
+                        f"train_r2={tr_r2:.4f}<{best_ref_tr:.4f}-0.12, "
+                        f"train_mae={tr_mae:.2f}>{best_ref_tr_mae:.2f}*1.8, "
+                        f"val_r2={val_r2:.4f}<{best_ref_val:.4f}-0.012, "
+                        f"val_mae={val_mae:.2f}>{best_ref_val_mae:.2f}*1.08)")
+                    continue
                 hp_val = (results_by_split.get("history_profile", {})
                           .get("val", {}).get("r2", {}).get("macro"))
                 hp_val_mae = (results_by_split.get("history_profile", {})
@@ -228,11 +250,6 @@ def _should_fallback_raw_to_scaled(results_by_split: dict[str, dict],
                         f"val_r2={val_r2:.4f}<{hp_val:.4f}-0.02, prop_train_r2={prop_tr_r2:.2f})")
                     continue
             elif best_ref_tr is not None:
-                ref_tr_maes = [results_by_split[b]["train"]["mae"]["macro"]
-                               for b in ref_models
-                               if "train" in results_by_split[b]
-                               and "mae" in results_by_split[b]["train"]]
-                best_ref_tr_mae = min(ref_tr_maes) if ref_tr_maes else None
                 tr_mae_worse = (tr_mae is None or best_ref_tr_mae is None
                                 or tr_mae > best_ref_tr_mae)
                 if tr_r2 < best_ref_tr - 0.05 and tr_mae_worse:
@@ -797,10 +814,15 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
 
         auto_split_meta = None
         per_split_feature_isolation = False
+        feature_isolation_mode = "none"
         if user_cfg["split_strategy"] == "auto":
+            # 预先识别非缺数有效样本掩码（纯完整性布尔探测，零标签振幅参与），避免重采样网格 NaN 行虚增残缺天点数
+            probe_feat = build_features(bus_al, lags=lags_cfg, rolling_windows=roll_cfg)
+            valid_row_mask = (~probe_feat.isna().any(axis=1)) & (~target.isna())
             raw_base_masks, auto_split_meta = resolve_auto_quality_split(
                 bus_al.index, user_cfg["split_ratios"],
                 daily_quality=daily_q, target=target, on_thr_w=on_thr,
+                valid_mask=valid_row_mask,
             )
             raw_masks = anchor_splits(bus_al.index, raw_base_masks, user_cfg.get("splits"))
             raw_masks = repair_empty_splits(raw_masks, bus_al.index, user_cfg["split_ratios"])
@@ -831,19 +853,42 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     else:
                         on_thr_decision["zero_test_leakage_verified"] = True
 
-            # 零泄漏闭环（L-3）：按 train/val/test 三折独立构造滞后与 24h 滚动特征，阻断跨折母线渗透
+            # 分层因果前缀特征隔离（L-3 升级）：
+            # 1) train 严格仅由 bus_al[train] 计算（绝不混入任何 val/test 时刻）；
+            # 2) val 仅由 bus_al[train|val] 向后因果计算后截取 val（绝不混入任何 test 时刻，且连续交界日不丢点、不重置 24h 滚动）；
+            # 3) test 由 bus_al[train|val|test] 向后因果计算后截取 test（与真实在线电表因果历史完全一致，不丢首日 5 点）。
+            m_tr_raw = raw_masks["train"].to_numpy(bool)
+            m_va_raw = raw_masks["val"].to_numpy(bool)
+            m_te_raw = raw_masks["test"].to_numpy(bool)
             sub_frames_f: dict[str, pd.DataFrame] = {}
             sub_frames_y: dict[str, pd.Series] = {}
-            for sname in ("train", "val", "test"):
-                sm = raw_masks[sname].to_numpy()
-                if sm.any():
-                    s_feat = build_features(bus_al.loc[sm], lags=lags_cfg, rolling_windows=roll_cfg)
-                    sf, sy = drop_invalid_rows(s_feat, target.loc[sm])
-                    sub_frames_f[sname] = sf
-                    sub_frames_y[sname] = sy
-                else:
-                    sub_frames_f[sname] = pd.DataFrame()
-                    sub_frames_y[sname] = pd.Series(dtype=np.float64)
+
+            if m_tr_raw.any():
+                f_tr_only = build_features(bus_al.loc[m_tr_raw], lags=lags_cfg, rolling_windows=roll_cfg)
+                sub_frames_f["train"], sub_frames_y["train"] = drop_invalid_rows(f_tr_only, target.loc[m_tr_raw])
+            else:
+                sub_frames_f["train"], sub_frames_y["train"] = pd.DataFrame(), pd.Series(dtype=np.float64)
+
+            if m_va_raw.any():
+                m_tr_va = m_tr_raw | m_va_raw
+                f_tr_va = build_features(bus_al.loc[m_tr_va], lags=lags_cfg, rolling_windows=roll_cfg)
+                va_idx = bus_al.index[m_va_raw]
+                sub_frames_f["val"], sub_frames_y["val"] = drop_invalid_rows(f_tr_va.loc[va_idx], target.loc[va_idx])
+            else:
+                sub_frames_f["val"], sub_frames_y["val"] = pd.DataFrame(), pd.Series(dtype=np.float64)
+
+            if m_te_raw.any():
+                m_all_assigned = m_tr_raw | m_va_raw | m_te_raw
+                f_all_causal = (
+                    probe_feat if m_all_assigned.all()
+                    else build_features(bus_al.loc[m_all_assigned], lags=lags_cfg, rolling_windows=roll_cfg)
+                )
+                te_idx = bus_al.index[m_te_raw]
+                sub_frames_f["test"], sub_frames_y["test"] = drop_invalid_rows(
+                    f_all_causal.loc[te_idx], target.loc[te_idx]
+                )
+            else:
+                sub_frames_f["test"], sub_frames_y["test"] = pd.DataFrame(), pd.Series(dtype=np.float64)
 
             tot_iso_rows = sum(len(df_) for df_ in sub_frames_f.values())
             if (len(sub_frames_f["train"]) >= window
@@ -858,9 +903,9 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
                     for sname in ("train", "val", "test")
                 }
                 per_split_feature_isolation = True
+                feature_isolation_mode = "causal_prefix_train_val_test"
             else:
-                feat = build_features(bus_al, lags=lags_cfg, rolling_windows=roll_cfg)
-                f, y = drop_invalid_rows(feat, target)
+                f, y = drop_invalid_rows(probe_feat, target)
                 if len(f) < window * 2:
                     raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE,
                                         f"有效样本 {len(f)} < 2×L({window})")
@@ -893,6 +938,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             auto_meta=auto_split_meta, pool_curation=pool_curation,
         )
         split_decision["per_split_feature_isolation"] = per_split_feature_isolation
+        split_decision["feature_isolation_mode"] = feature_isolation_mode
         log.info("[%s] 切分（%s）: %s", user_key, user_cfg["split_strategy"], split_sizes)
         if user_cfg["split_strategy"] == "auto":
             bs_tr = split_decision["by_split"]["train"]

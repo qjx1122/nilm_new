@@ -720,6 +720,21 @@ def test_resolve_auto_pbus_mode_boundaries():
         res_ok, {"transformer": {"train": 3.0, "val": 3.0}}, 10.0)
     assert fb_c is True and any("TRAIN_COLLAPSED" in r for r in fb_cr)
 
+    # 2f) 复现 733 边界案例：val 含异常周日压低 ridge val R²=0.7847，使 transformer val R²=0.7651 距 -0.02 仅差 0.0004，
+    #     但 prop_train_r2=-31.83 且训练重度欠拟合 (train_r2=0.7219, train_mae=126.42>1.8x, val_mae=96.29>1.08x) -> 触发候选重训！
+    res_733_run2_edge = {
+        "history_profile": {"train": {"r2": {"macro": 0.7953}, "mae": {"macro": 60.1379}, "f1": {"macro": 0.9468}},
+                            "val": {"r2": {"macro": 0.6766}, "mae": {"macro": 86.8312}, "f1": {"macro": 0.9719}}},
+        "proportional": {"train": {"r2": {"macro": -31.8348}, "mae": {"macro": 1776.8952}, "f1": {"macro": 0.5774}},
+                         "val": {"r2": {"macro": -25.3292}, "mae": {"macro": 1399.6438}, "f1": {"macro": 0.6474}}},
+        "ridge": {"train": {"r2": {"macro": 0.9160}, "mae": {"macro": 59.7877}, "f1": {"macro": 0.7700}},
+                  "val": {"r2": {"macro": 0.7847}, "mae": {"macro": 88.6477}, "f1": {"macro": 0.7383}}},
+        "transformer": {"train": {"r2": {"macro": 0.7219}, "mae": {"macro": 126.4172}, "f1": {"macro": 0.7031}},
+                        "val": {"r2": {"macro": 0.7651}, "mae": {"macro": 96.2856}, "f1": {"macro": 0.8589}}},
+    }
+    fb_edge, fb_edge_r = _should_fallback_raw_to_scaled(res_733_run2_edge, bands_ok, 10.0)
+    assert fb_edge is True and any("SEVERE_RAW_UNDERFIT" in r for r in fb_edge_r)
+
     # ---- 第3步：验证集 MAE + F1 双向验收门禁（严禁看 test 零泄漏）----
     # 3a) 733 真改善：val MAE 81.2->56.4 (-30.5% >= 5%) 且 val F1 0.9120->0.9480 不退化 -> 验收通过！
     res_733_scaled = {

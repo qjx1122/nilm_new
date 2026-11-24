@@ -84,19 +84,30 @@ def build_day_quality_profiles(
     daily_quality: pd.DataFrame | None = None,
     target: pd.Series | None = None,
     on_thr_w: float | None = None,
+    valid_mask: pd.Series | np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """构建逐自然日「质量-连续块-工况」画像表，供 split_strategy='auto' 与审计落盘共用。"""
+    """构建逐自然日「质量-连续块-工况」画像表，供 split_strategy='auto' 与审计落盘共用。
+
+    当传入 valid_mask（去除了原始缺数及滞后 NaN 后的布尔有效掩码）时，n_points 与
+    effective_score 按真实有效样本点统计，避免重采样网格上的 NaN 空行掩盖半天掉线（如 733 户 06-15 仅 58 点）。
+    """
     days = _days(index)
     cols = [
         "date", "day_ts", "n_points", "bus_score", "branch_score",
-        "min_side_score", "mean_score", "tier", "is_on",
+        "min_side_score", "effective_score", "mean_score", "tier", "is_on",
         "gap_before", "gap_after", "block_id", "block_len", "is_island",
     ]
     if not days:
         return pd.DataFrame(columns=cols)
 
     norm_idx = index.normalize()
-    pt_counts = pd.Series(1, index=norm_idx).groupby(level=0).sum().to_dict()
+    if valid_mask is not None:
+        vm = np.asarray(valid_mask, dtype=bool)
+        if len(vm) != len(index):
+            raise ValueError(f"valid_mask 长度 {len(vm)} 与 index 长度 {len(index)} 不一致")
+        pt_counts = pd.Series(vm.astype(np.int64), index=norm_idx).groupby(level=0).sum().to_dict()
+    else:
+        pt_counts = pd.Series(1, index=norm_idx).groupby(level=0).sum().to_dict()
 
     dq_map: dict[str, tuple[float, float]] = {}
     if daily_quality is not None and len(daily_quality) > 0 and "date" in daily_quality.columns:
@@ -138,6 +149,7 @@ def build_day_quality_profiles(
         else:
             bs, brs = inferred, inferred
         min_s = float(min(bs, brs))
+        eff_s = float(min(min_s, inferred))
         mean_s = float(0.5 * (bs + brs))
         if min_s >= 95.0 and n_pts >= 88:
             tier = "A"
@@ -153,6 +165,7 @@ def build_day_quality_profiles(
             "bus_score": round(bs, 2),
             "branch_score": round(brs, 2),
             "min_side_score": round(min_s, 2),
+            "effective_score": round(eff_s, 2),
             "mean_score": round(mean_s, 2),
             "tier": tier,
             "is_on": None if state_map is None else bool(state_map.get(d, False)),
@@ -400,12 +413,15 @@ def _pick_best_two_slices(
     stub48 = (prof["n_points"] < 48).to_numpy(np.float64)
     island = prof["is_island"].to_numpy(np.float64)
     gap_before = prof["gap_before"].to_numpy(bool)
+    outage_c = (gap_before & (prof["tier"] == "C").to_numpy(bool)).astype(np.float64)
 
     ps_score = np.concatenate([[0.0], np.cumsum(min_scores)])
     ps_ta = np.concatenate([[0.0], np.cumsum(tier_a)])
     ps_tc = np.concatenate([[0.0], np.cumsum(tier_c)])
     ps_s48 = np.concatenate([[0.0], np.cumsum(stub48)])
     ps_isl = np.concatenate([[0.0], np.cumsum(island)])
+    ps_gap = np.concatenate([[0], np.cumsum(gap_before.astype(np.int64))])
+    ps_outc = np.concatenate([[0.0], np.cumsum(outage_c)])
 
     if has_state:
         on_arr = prof["is_on"].to_numpy(bool).astype(np.int64)
@@ -465,23 +481,30 @@ def _pick_best_two_slices(
             tc_terms = []
             s48_terms = []
             isl_terms = []
+            tot_tc_eval = 0.0
+            tot_outc_eval = 0.0
             for s0, s1, slen in ((v0, v1, n_va), (t0, t1, n_te)):
                 if slen > 0:
                     q_terms.append((ps_score[s1] - ps_score[s0]) / (100.0 * slen))
                     ta_terms.append((ps_ta[s1] - ps_ta[s0]) / slen)
-                    tc_terms.append((ps_tc[s1] - ps_tc[s0]) / slen)
+                    tc_cnt = ps_tc[s1] - ps_tc[s0]
+                    tc_terms.append(tc_cnt / slen)
+                    tot_tc_eval += tc_cnt
+                    tot_outc_eval += (ps_outc[s1] - ps_outc[s0])
                     s48_terms.append((ps_s48[s1] - ps_s48[s0]) / slen)
                     if slen >= 2:
                         isl_terms.append((ps_isl[s1] - ps_isl[s0]) / slen)
             q_util = (
                 35.0 * (float(np.mean(q_terms)) if q_terms else 1.0)
                 + 8.0 * (float(np.mean(ta_terms)) if ta_terms else 0.0)
-                - 12.0 * (float(np.mean(tc_terms)) if tc_terms else 0.0)
+                - 18.0 * (float(np.mean(tc_terms)) if tc_terms else 0.0)
+                - 2.5 * tot_tc_eval
+                - 6.0 * tot_outc_eval
                 - 10.0 * (float(np.mean(s48_terms)) if s48_terms else 0.0)
                 - 6.0 * (float(np.mean(isl_terms)) if isl_terms else 0.0)
             )
 
-            # 连续性与天然断口复用评分
+            # 连续性、天然断口复用、折内断口重罚与人为单日孤岛惩罚
             cuts: set[int] = set()
             if n_va > 0:
                 if 0 < v0 < n:
@@ -494,9 +517,32 @@ def _pick_best_two_slices(
                 if 0 < t1 < n:
                     cuts.add(t1)
             nat_cuts = sum(1 for c in cuts if gap_before[c])
+            # 停电恢复后首日半天残缺（c-1 紧邻断口且为 C 级，c 起恢复为 A 级满点天）：将残缺恢复日留给 train 视作准天然切口
+            recovery_cuts = sum(
+                1 for c in cuts
+                if (not gap_before[c]) and c >= 1 and gap_before[c - 1]
+                and tier_c[c - 1] > 0.5 and tier_a[c] > 0.5
+            )
             art_cuts = len(cuts) - nat_cuts
 
-            # train 被切成的区间段数（越少越好，1 段最优）
+            # val / test 内部吞入离线断口数（每吞入 1 个断口就把评估折切成碎片段）与切割制造的新单日孤岛数
+            internal_gaps = 0
+            induced_islands = 0
+            for s0, s1, slen in ((v0, v1, n_va), (t0, t1, n_te)):
+                if slen >= 2:
+                    internal_gaps += int(ps_gap[s1] - ps_gap[s0 + 1])
+                    if gap_before[s0 + 1] and island[s0] < 0.5:
+                        induced_islands += 1
+                    if gap_before[s1 - 1] and island[s1 - 1] < 0.5:
+                        induced_islands += 1
+            for c in cuts:
+                if not gap_before[c]:
+                    if c >= 1 and gap_before[c - 1] and island[c - 1] < 0.5 and tier_c[c - 1] < 0.5:
+                        induced_islands += 1
+                    if (c + 1 == n or gap_before[c + 1]) and island[c] < 0.5 and tier_c[c] < 0.5:
+                        induced_islands += 1
+
+            # train 被切成的区间段数（越少越好，1 段最优）及时序因果保护（禁止无故把好天留在 test 之后反哺 train）
             intervals = sorted([(s0, s1) for s0, s1, sl in ((v0, v1, n_va), (t0, t1, n_te)) if sl > 0])
             tr_segs = 0
             cursor = 0
@@ -506,7 +552,24 @@ def _pick_best_two_slices(
                 cursor = s1
             if cursor < n:
                 tr_segs += 1
-            cont_util = 2.5 * nat_cuts - 6.0 * art_cuts - 4.0 * max(0, tr_segs - 1)
+            future_tail_pen = 0.0
+            if cursor < n:
+                tail_len = n - cursor
+                tail_tc = float(ps_tc[n] - ps_tc[cursor])
+                if tail_len > 0 and (tail_tc / tail_len) < 0.5:
+                    future_tail_pen = 10.0 + 1.5 * (tail_len - tail_tc)
+            split_apart_pen = 6.0 if (n_va > 0 and n_te > 0 and v0 < t0 and v1 < t0) else 0.0
+            eff_art_cuts = max(0, art_cuts - recovery_cuts)
+            cont_util = (
+                2.5 * nat_cuts
+                + 2.0 * recovery_cuts
+                - 6.0 * eff_art_cuts
+                - 4.0 * max(0, tr_segs - 1)
+                - 9.0 * internal_gaps
+                - 6.0 * induced_islands
+                - future_tail_pen
+                - split_apart_pen
+            )
 
             # 开关均衡度与时序近端偏好
             bal_util = -(25.0 * mean_skew + 15.0 * max_skew) if has_state else 0.0
@@ -533,6 +596,8 @@ def _pick_best_two_slices(
                     "mean_off_skew": round(float(mean_skew), 4),
                     "natural_gap_cuts": int(nat_cuts),
                     "artificial_cuts": int(art_cuts),
+                    "internal_gaps": int(internal_gaps),
+                    "induced_islands": int(induced_islands),
                     "utility_score": round(float(total_util), 4),
                 }
 
@@ -588,6 +653,7 @@ def resolve_auto_quality_split(
     daily_quality: pd.DataFrame | None = None,
     target: pd.Series | None = None,
     on_thr_w: float | None = None,
+    valid_mask: pd.Series | np.ndarray | None = None,
 ) -> tuple[dict[str, pd.Series], dict]:
     """基于每日数据质量、连续自然日块与开/关工况的确定性自动切分器。"""
     if len(ratios) != 3 or abs(sum(ratios) - 1.0) > 1e-6:
@@ -596,8 +662,10 @@ def resolve_auto_quality_split(
         empty = {name: pd.Series(dtype=bool, index=index) for name in SPLIT_NAMES}
         return empty, {"resolved_mode": "auto_empty", "n_days": 0}
 
-    prof = build_day_quality_profiles(index, daily_quality=daily_quality,
-                                      target=target, on_thr_w=on_thr_w)
+    prof = build_day_quality_profiles(
+        index, daily_quality=daily_quality,
+        target=target, on_thr_w=on_thr_w, valid_mask=valid_mask,
+    )
     days = prof["day_ts"].tolist()
     n_days = len(days)
 
@@ -611,27 +679,79 @@ def resolve_auto_quality_split(
             "off_day_scarcity": "tiny_pool",
         }
 
-    n_tr, n_va, n_te = _compute_day_quotas(n_days, ratios)
+    n_tr_base, n_va_base, n_te_base = _compute_day_quotas(n_days, ratios)
     has_state = prof["is_on"].notna().all()
-
     if has_state:
         tot_on = int(prof["is_on"].sum())
         tot_off = n_days - tot_on
-        req_on, req_off, off_scarcity = _compute_state_floors(tot_on, tot_off, n_tr, n_va, n_te)
     else:
         tot_on = tot_off = 0
-        req_on = (0, 0, 0)
-        req_off = (0, 0, 0)
-        off_scarcity = "no_target_state"
 
     skew_cap = 0.25 if (has_state and n_days >= 12 and tot_on > 0 and tot_off > 0) else None
-    best_pair, diag = _pick_best_two_slices(
-        prof, n_va, n_te,
-        has_state=has_state,
-        req_on=req_on,
-        req_off=req_off,
-        enforce_skew_cap=skew_cap,
-    )
+
+    # 弹性 ±1 天配额对齐（N >= 14 时启用）：当死守 round(N*0.2) 会迫使 val/test 跨越离线断口
+    # 或吞入断口后半天残缺恢复日（如 733 户 39 天下 8+8=16 越过 06-13~14 断口）时，允许微调 ±1 天贴合连续满点块
+    cand_quotas: list[tuple[int, int]] = [(n_va_base, n_te_base)]
+    if n_days >= 14 and n_va_base >= 3 and n_te_base >= 3:
+        max_diff = max(1, abs(n_va_base - n_te_base) + 1)
+        for dv in (-1, 0, 1):
+            for dt in (-1, 0, 1):
+                if dv == 0 and dt == 0:
+                    continue
+                c_va = n_va_base + dv
+                c_te = n_te_base + dt
+                c_tr = n_days - c_va - c_te
+                if c_va >= 2 and c_te >= 2 and c_tr >= max(4, n_tr_base - 2) and abs(c_va - c_te) <= max_diff:
+                    cand_quotas.append((c_va, c_te))
+
+    best_overall_key: tuple | None = None
+    best_pair: tuple[int, int] | None = None
+    diag: dict = {}
+    n_tr, n_va, n_te = n_tr_base, n_va_base, n_te_base
+    req_on = (0, 0, 0)
+    req_off = (0, 0, 0)
+    off_scarcity = "no_target_state"
+
+    target_va = n_days * float(ratios[1])
+    target_te = n_days * float(ratios[2])
+    base_quota_err = abs(n_va_base - target_va) + abs(n_te_base - target_te)
+
+    for c_va, c_te in cand_quotas:
+        c_tr = n_days - c_va - c_te
+        if has_state:
+            c_req_on, c_req_off, c_scarcity = _compute_state_floors(tot_on, tot_off, c_tr, c_va, c_te)
+        else:
+            c_req_on, c_req_off, c_scarcity = (0, 0, 0), (0, 0, 0), "no_target_state"
+
+        c_pair, c_diag = _pick_best_two_slices(
+            prof, c_va, c_te,
+            has_state=has_state,
+            req_on=c_req_on,
+            req_off=c_req_off,
+            enforce_skew_cap=skew_cap,
+        )
+        if c_pair is None:
+            continue
+        dev_days = abs(c_va - n_va_base) + abs(c_te - n_te_base)
+        cand_quota_err = abs(c_va - target_va) + abs(c_te - target_te)
+        extra_quota_err = max(0.0, cand_quota_err - base_quota_err)
+        adj_util = float(c_diag.get("utility_score", 0.0)) - 2.2 * extra_quota_err
+        c_key = (
+            1 if (c_diag.get("cover_ok", False) and c_diag.get("skew_ok", True)) else 0,
+            1 if c_diag.get("cover_ok", False) else 0,
+            round(adj_util, 6),
+            -dev_days,
+            c_tr,
+        )
+        if best_overall_key is None or c_key > best_overall_key:
+            best_overall_key = c_key
+            best_pair = c_pair
+            c_diag = dict(c_diag)
+            c_diag["utility_score"] = round(adj_util, 4)
+            c_diag["quota_adjusted_days"] = int(dev_days)
+            diag = c_diag
+            n_tr, n_va, n_te = c_tr, c_va, c_te
+            req_on, req_off, off_scarcity = c_req_on, c_req_off, c_scarcity
 
     use_polarized = (
         has_state
@@ -660,7 +780,9 @@ def resolve_auto_quality_split(
         else:
             mode_name = "auto_contiguous_quality_blocks"
     else:
-        # 极化分布（如前 30 天全关 + 后 30 天全开）：在开/关子序列内部分别挑选高分连续块
+        # 极化分布（如前 30 天全关 + 后 30 天全开）：回退基准比例配额并在开/关子序列内部分别挑选高分连续块
+        n_tr, n_va, n_te = n_tr_base, n_va_base, n_te_base
+        req_on, req_off, off_scarcity = _compute_state_floors(tot_on, tot_off, n_tr, n_va, n_te)
         q_on, q_off = _allocate_stratified_quotas(
             tot_on, tot_off, n_tr, n_va, n_te, req_on, req_off
         )
@@ -710,10 +832,13 @@ def summarize_split_decision(
     on_thr_w: float | None = None,
     auto_meta: dict | None = None,
     pool_curation: dict | None = None,
+    valid_mask: pd.Series | np.ndarray | None = None,
 ) -> dict:
     """对最终生效的 train/val/test 掩码生成结构化质量与工况对账摘要（写入 meta.json）。"""
-    prof = build_day_quality_profiles(index, daily_quality=daily_quality,
-                                      target=target, on_thr_w=on_thr_w)
+    prof = build_day_quality_profiles(
+        index, daily_quality=daily_quality,
+        target=target, on_thr_w=on_thr_w, valid_mask=valid_mask,
+    )
     prof_by_day = {row["day_ts"]: row for _, row in prof.iterrows()}
     norm_idx = index.normalize()
 
@@ -726,6 +851,7 @@ def summarize_split_decision(
             if i == 0 or (d - s_days[i - 1]).days > 1:
                 n_blocks += 1
         scores = [float(prof_by_day[d]["min_side_score"]) for d in s_days if d in prof_by_day]
+        eff_scores = [float(prof_by_day[d]["effective_score"]) for d in s_days if d in prof_by_day]
         tier_a_cnt = sum(1 for d in s_days if d in prof_by_day and prof_by_day[d]["tier"] == "A")
         tier_c_cnt = sum(1 for d in s_days if d in prof_by_day and prof_by_day[d]["tier"] == "C")
         if target is not None and on_thr_w is not None:
@@ -744,6 +870,7 @@ def summarize_split_decision(
             "off_days": off_cnt,
             "off_day_ratio": off_ratio,
             "mean_min_side_score": round(float(np.mean(scores)), 2) if scores else None,
+            "mean_effective_score": round(float(np.mean(eff_scores)), 2) if eff_scores else None,
             "tier_a_days": int(tier_a_cnt),
             "tier_c_days": int(tier_c_cnt),
         }
@@ -755,7 +882,11 @@ def summarize_split_decision(
         "by_split": by_split,
     }
     if auto_meta:
-        for k in ("off_day_scarcity", "natural_gap_cuts", "artificial_cuts", "max_off_skew", "utility_score"):
+        for k in (
+            "off_day_scarcity", "natural_gap_cuts", "artificial_cuts",
+            "internal_gaps", "induced_islands", "quota_adjusted_days",
+            "max_off_skew", "utility_score",
+        ):
             if k in auto_meta:
                 out[k] = auto_meta[k]
     if pool_curation:
@@ -767,7 +898,8 @@ def initial_split(index: pd.DatetimeIndex, ratios: list[float],
                   strategy: str = "stratified_day",
                   target: pd.Series | None = None,
                   on_thr_w: float | None = None,
-                  daily_quality: pd.DataFrame | None = None) -> dict[str, pd.Series]:
+                  daily_quality: pd.DataFrame | None = None,
+                  valid_mask: pd.Series | np.ndarray | None = None) -> dict[str, pd.Series]:
     """初始策略切分，返回 {'train','val','test'} 布尔 mask（互斥）。
 
     - auto               : 基于 daily_quality + target/on_thr_w 自动搜索连续高质量块；
@@ -781,6 +913,7 @@ def initial_split(index: pd.DatetimeIndex, ratios: list[float],
             daily_quality=daily_quality,
             target=target,
             on_thr_w=on_thr_w,
+            valid_mask=valid_mask,
         )
         return masks
 
@@ -850,7 +983,8 @@ def build_split_masks(index: pd.DatetimeIndex, ratios: list[float], strategy: st
                       splits_spec: dict | None = None,
                       target: pd.Series | None = None,
                       on_thr_w: float | None = None,
-                      daily_quality: pd.DataFrame | None = None) -> dict[str, pd.Series]:
+                      daily_quality: pd.DataFrame | None = None,
+                      valid_mask: pd.Series | np.ndarray | None = None) -> dict[str, pd.Series]:
     """完整切分流程：初始策略 → 锚定 → 比例修复。
 
     - auto               : 支持传入 daily_quality + target/on_thr_w 进行质量与工况联合连续块切分；
@@ -860,6 +994,7 @@ def build_split_masks(index: pd.DatetimeIndex, ratios: list[float], strategy: st
         index, ratios, strategy,
         target=target, on_thr_w=on_thr_w,
         daily_quality=daily_quality,
+        valid_mask=valid_mask,
     )
     masks = anchor_splits(index, masks, splits_spec)
     masks = repair_empty_splits(masks, index, ratios)

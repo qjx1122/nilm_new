@@ -451,8 +451,9 @@ def test_e2e_auto_split_reconciles_100_percent_with_qualified_days_detail(tmp_pa
     assert sdec["by_split"]["val"]["mean_min_side_score"] >= 95.0
     assert sdec["by_split"]["test"]["mean_min_side_score"] >= 95.0
 
-    # 6. L-3 独立特征隔离与 L-4 on_thr_w 零测试泄漏标记均已生效
+    # 6. L-3 分层因果前缀特征隔离与 L-4 on_thr_w 零测试泄漏标记均已生效
     assert sdec["per_split_feature_isolation"] is True
+    assert sdec["feature_isolation_mode"] == "causal_prefix_train_val_test"
     assert meta["on_thr_w_decision"]["zero_test_leakage_verified"] is True
 
     # 7. 验证 auto_run_steps2to5 对 --split-strategy auto 的原 JSON 写回门禁（仅 --force + --save-config 才更新）
@@ -476,3 +477,132 @@ def test_e2e_auto_split_reconciles_100_percent_with_qualified_days_detail(tmp_pa
         ran_train=True, fresh_train_done=True,
     )
     assert json.loads(orig_tf.read_text(encoding="utf-8"))[ukey]["split_strategy"] == "auto"
+
+
+def test_auto_split_733_outage_gap_and_post_outage_recovery_day():
+    """复刻 733 户真实 39 天日历（06-13~14 断口 + 06-15 停电恢复仅 58 点 + 3744 重采样网格含 148 个 NaN）：
+    验证 valid_mask 准确识别残缺天、val 绝不跨离线断口吞入 06-12 孤岛或 06-15 恢复日，切出干净单段 [06-16..06-22]。
+    """
+    exact_pts_733 = {
+        "2026-04-19": 91,
+        "2026-05-21": 91, "2026-05-22": 96, "2026-05-23": 96, "2026-05-24": 96,
+        "2026-05-25": 95, "2026-05-26": 90, "2026-05-27": 96, "2026-05-28": 96,
+        "2026-05-29": 96, "2026-05-30": 96, "2026-05-31": 96, "2026-06-01": 96,
+        "2026-06-02": 82, "2026-06-03": 95, "2026-06-04": 96, "2026-06-05": 95,
+        "2026-06-06": 96, "2026-06-07": 96, "2026-06-08": 96, "2026-06-09": 96,
+        "2026-06-10": 96, "2026-06-11": 94, "2026-06-12": 96,
+        "2026-06-15": 58,
+        "2026-06-16": 96, "2026-06-17": 96, "2026-06-18": 96, "2026-06-19": 96,
+        "2026-06-20": 96, "2026-06-21": 96, "2026-06-22": 96,
+        "2026-06-23": 96, "2026-06-24": 65, "2026-06-25": 52, "2026-06-26": 96,
+        "2026-06-27": 96, "2026-06-28": 96, "2026-06-29": 96,
+    }
+    grid_parts = [pd.date_range(d, periods=96, freq="15min") for d in exact_pts_733]
+    grid_idx = grid_parts[0].append(grid_parts[1:])
+    valid_mask = np.zeros(len(grid_idx), dtype=bool)
+    offset = 0
+    for _, k in exact_pts_733.items():
+        valid_mask[offset + (96 - k): offset + 96] = True
+        offset += 96
+    assert valid_mask.sum() == 3596
+
+    target = pd.Series(560.0, index=grid_idx)
+    target.loc[grid_idx.normalize() == pd.Timestamp("2026-06-08")] = 2.0
+    dq = pd.DataFrame({
+        "date": list(exact_pts_733.keys()),
+        "bus_score": [99.4 if k >= 90 else (92.0 if k >= 60 else 86.0) for k in exact_pts_733.values()],
+        "branch_score": [99.4 if k >= 90 else (92.0 if k >= 60 else 86.0) for k in exact_pts_733.values()],
+        "qualified": [1] * 39,
+    })
+
+    prof = build_day_quality_profiles(grid_idx, dq, target, 10.0, valid_mask=valid_mask)
+    prof_by_date = prof.set_index("date")
+    assert prof_by_date.loc["2026-06-15", "n_points"] == 58
+    assert prof_by_date.loc["2026-06-15", "tier"] == "C"
+    assert prof_by_date.loc["2026-06-25", "tier"] == "C"
+
+    masks, meta = resolve_auto_quality_split(
+        grid_idx, [0.6, 0.2, 0.2], daily_quality=dq, target=target, on_thr_w=10.0, valid_mask=valid_mask
+    )
+    _check(masks)
+    clean_idx = grid_idx[valid_mask]
+    clean_masks = {k: pd.Series(v.to_numpy()[valid_mask], index=clean_idx) for k, v in masks.items()}
+    summary = summarize_split_decision(clean_idx, clean_masks, "auto", dq, target.loc[valid_mask], 10.0, auto_meta=meta)
+
+    assert meta["internal_gaps"] == 0
+    assert meta["induced_islands"] == 0
+    assert summary["by_split"]["train"]["days"] == 25
+    assert summary["by_split"]["val"]["days"] == 7
+    assert summary["by_split"]["val"]["points"] == 672
+    assert summary["by_split"]["val"]["contiguous_blocks"] == 1
+    assert summary["by_split"]["val"]["tier_c_days"] == 0
+    assert summary["by_split"]["test"]["days"] == 7
+    assert summary["by_split"]["test"]["points"] == 597
+    assert summary["by_split"]["test"]["contiguous_blocks"] == 1
+
+    va_dates = sorted(pd.Series(clean_idx[clean_masks["val"].to_numpy()].normalize()).dt.strftime("%Y-%m-%d").unique())
+    te_dates = sorted(pd.Series(clean_idx[clean_masks["test"].to_numpy()].normalize()).dt.strftime("%Y-%m-%d").unique())
+    assert va_dates == [f"2026-06-{d:02d}" for d in range(16, 23)]
+    assert te_dates == [f"2026-06-{d:02d}" for d in range(23, 30)]
+
+
+def test_causal_prefix_isolation_keeps_boundary_points_and_blocks_test_to_train_leakage(tmp_path: Path):
+    """验证分层因果前缀隔离：
+    1) 时序衔接边界（train->val、val->test）首日保留完整 96 点，不因独立滞后白丢 5 点；
+    2) 即便人工将早期的 2026-01-05 锚定为 test，篡改该 test 日母线功率对 train/val 预测与训练结果影响严格为 0。
+    """
+    import yaml
+    from tests.conftest import FIELD_MAP
+
+    ukey = "800080270733_4206673297219"
+    base_cfg = yaml.safe_load(Path("configs/default.yaml").read_text(encoding="utf-8"))
+    base_cfg["bus_field_map"] = FIELD_MAP
+    base_cfg["models"] = [{"name": "ridge", "params": {"alpha": 1.0}}]
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(yaml.safe_dump(base_cfg, allow_unicode=True), encoding="utf-8")
+
+    # 1) 验证连续切分边界首日满 96 点
+    d1 = tmp_path / "d1"
+    o1 = tmp_path / "o1"
+    _write_e2e_quality_user(d1, ukey)
+    tf1 = tmp_path / "tf1.json"
+    tf1.write_text(json.dumps({ukey: {"target_col": "p1", "split_strategy": "auto"}}, indent=2), encoding="utf-8")
+    run_batch(tf1, base_path, d1, o1, user_keys=[ukey], stages=("train",), force=True)
+    tr1 = latest_done_dir(o1 / ukey / "train")
+    pred1 = pd.read_csv(tr1 / "predictions" / "train_predictions.csv")
+    pred1["date"] = pd.to_datetime(pred1["timestamp"]).dt.strftime("%Y-%m-%d")
+    for sp in ("val", "test"):
+        first_day = sorted(pred1.loc[pred1["split"] == sp, "date"].unique())[0]
+        assert (pred1["date"] == first_day).sum() == 96
+
+    # 2) 验证前置锚定 test 日的剧烈扰动绝不反向泄漏进 train 或 val
+    d2a, d2b = tmp_path / "d2a", tmp_path / "d2b"
+    o2a, o2b = tmp_path / "o2a", tmp_path / "o2b"
+    u_dir_a = _write_e2e_quality_user(d2a, ukey)
+    u_dir_b = _write_e2e_quality_user(d2b, ukey)
+    # 在 d2b 中对被锚定为 test 的 2026-01-26 当天母线功率注入 50 倍剧烈扰动
+    bus_csv_b = next(u_dir_b.glob("e241_*.csv"))
+    bdf = pd.read_csv(bus_csv_b)
+    m_test_day = bdf["event_time"].str.startswith("2026-01-26")
+    for col in ("load_iden_data6", "load_iden_data7", "load_iden_data8"):
+        bdf.loc[m_test_day, col] = bdf.loc[m_test_day, col] * 50.0
+    bdf.to_csv(bus_csv_b, index=False)
+
+    tf2 = tmp_path / "tf2.json"
+    tf2.write_text(json.dumps({
+        ukey: {
+            "target_col": "p1",
+            "split_strategy": "auto",
+            "splits": {"test": {"include": [["2026-01-26", "2026-01-26"]]}},
+        }
+    }, indent=2), encoding="utf-8")
+    run_batch(tf2, base_path, d2a, o2a, user_keys=[ukey], stages=("train",), force=True)
+    run_batch(tf2, base_path, d2b, o2b, user_keys=[ukey], stages=("train",), force=True)
+
+    pa = pd.read_csv(latest_done_dir(o2a / ukey / "train") / "predictions" / "train_predictions.csv")
+    pb = pd.read_csv(latest_done_dir(o2b / ukey / "train") / "predictions" / "train_predictions.csv")
+    for sp in ("train", "val"):
+        sa = pa.loc[pa["split"] == sp, "pred_ridge"].to_numpy()
+        sb = pb.loc[pb["split"] == sp, "pred_ridge"].to_numpy()
+        np.testing.assert_allclose(sa, sb, rtol=0.0, atol=1e-12)
+

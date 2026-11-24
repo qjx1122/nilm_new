@@ -1143,4 +1143,18 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
   - 全仓测试套件通过：**`267 passed`**。
 - 是否进入 REPORT.md（稳定结论）：是（候选）——「`split_strategy="auto"` 实现基于逐日质量分、天然离线断口与开关日分布的连续块自动划分，并闭环阻断跨折特征渗透（L-3）与非锚定阈值测试泄漏（L-4）」。
 
+---
+
+## [2026-09-10] 复盘与实验加固：`800080270733_4206673297219` 自动划分退化四级归因修复与端到端对比验证
+
+- 问题现象：`733` 户（`p1+p2+p3+p4`，五参数全 `auto`）在初代 `split_strategy="auto"` 下每日评估指标劣于 `stratified_day`（`pbus_mode` 滞留 `raw`、`best_model` 退化为 `history_profile`、`transformer/proportional` 误差激增、`06-12/06-22` 首日点数掉为 91 点）。
+- 四级根因与闭环修复：
+  1. **大母线重度欠拟合擦边漏触发修复（`nilm/pipeline/user_task.py`）**：`_should_fallback_raw_to_scaled` 新增 `SEVERE_RAW_UNDERFIT` 分支，防止 `val` 混入异常周日压低 `ridge val_r2` 后以 `0.0004` 微差漏触发 `pbus_mode="scaled"` 候选重训（同时对 `778`、`856`、`2842` 保持零误触发）。
+  2. **去缺数真实点数画像 + 折内断口/恢复残缺日重罚 + `±1` 天弹性配额对齐（`nilm/preprocess/splits.py`、`nilm/pipeline/user_task.py`）**：传入 `valid_mask` 精确识别 `06-15`（58 点）与 `06-25`（52 点）为 C 级残缺天；重罚 `val/test` 吞入离线断口（`internal_gaps`）、切割制造单日孤岛（`induced_islands`）、混入断口后 C 级冷启动恢复日（`gap_before & tier=='C'`）及时序倒置，并在 $N \ge 14$ 时围绕连续比例目标允许 `±1` 天微调。`733` 户自动收敛至 `train=25d [04-19..06-15]`、`val=7d [06-16..06-22] (1段, 672点, C级0天)`、`test=7d [06-23..06-29] (1段)`。
+  3. **分层因果前缀特征隔离（`nilm/pipeline/user_task.py`）**：升级为 `train ← bus[train]`、`val ← bus[train|val]`、`test ← bus[train|val|test]` 向后因果计算后截取各折（`feature_isolation_mode="causal_prefix_train_val_test"`），严格保证前置锚定 `test` 对 `train/val` 零影响（`atol=1e-12`），同时时序顺接交界日保留完整 96 点与真实 `24h` 滚动统计，零丢点、零冷启动失真。
+- 实验与回归验证：
+  - `733` 数字孪生三方端到端实验（4 模型全开）：修复后 `split_strategy="auto"` 成功触发 `pbus_mode=scaled` 并选出 `best=transformer`，39 天全链日均 `MAE` 从修复前的 `218.85 kW` 降至 **`21.25 kW`（`-90.3%`）**、全链日均 `F1` 从 `0.7200` 升至 **`0.9837`**，`proportional` 日均 `MAE` 从 `2389.88 kW` 降至 `233.59 kW`，测试集 `transformer MAE=36.20 kW / R²=0.9553`，完全追平并消除相对基线的全部退化；
+  - 新增 `test_auto_split_733_outage_gap_and_post_outage_recovery_day`、`test_causal_prefix_isolation_keeps_boundary_points_and_blocks_test_to_train_leakage` 与 `res_733_run2_edge` 专项单测，全仓测试套件 **`269 passed`**。
+
+
 
