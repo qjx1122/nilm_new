@@ -1123,3 +1123,24 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
   2. `_accept_scaled_candidate` 的 `F1` 退化门禁可引入候选模式各自验证集校准后的链口径 `val_f1_selected` 联合评判，避免未校准 `@on_thr` 单切点误杀大幅改善 `R²/RMSE` 的 `scaled` 模型；
   3. `auto_run_steps2to5.py` 可增加 `--infer-model` 覆盖参数（支持 `"auto"` 清除历史强绑）或对显著劣于 `best_model` 的显式 `infer_model` 输出红色性能退化告警。
 
+---
+
+## [2026-09-10] 专题：基于每日数据质量的数据集自动划分（`split_strategy="auto"`）专题设计与代码实施
+
+- 问题背景：既有 `stratified_day` / `time` / `stratified_by_state` 均未消费 `daily_quality.csv` 的逐日质量信息，存在 ① 按星期切碎连续周导致 `window=96` 深度模型首行重复填充率升高、② 跨折 `24h` 滚动特征渗透（L-3）、③ `train/val/test` 全关天失衡缺失、④ 70~79 分边缘残缺天混入 `val/test` 污染早停与定参标尺、⑤ 远期全关天极端过剩（`>65%`）需手工跑离线删关脚本（如 `make_B1_config.py`）且非锚定 `on_thr_w="auto"` 在切分前接触 `test` 真值（L-4）五大短板。
+- 专题文档与代码改动：
+  1. **独立专题设计报告落盘**：新增 `docs/AUTO_QUALITY_SPLIT_ANALYSIS.md`，完整定义“最合理训练/验证/测试集”五维准则与四步确定性算法契约；同步更新 `docs/CONFIG_GUIDE.md`。
+  2. **核心划分器实现（`nilm/common/contracts.py`、`nilm/preprocess/splits.py`）**：
+     - `SPLIT_STRATEGIES` 新增 `"auto"`（硬编码缺省保留 `"stratified_day"` 严守向后兼容，`auto_run_steps2to5.py` 新增 `--split-strategy` 且新户默认 `"auto"`，并遵循仅 `--force + --save-config` 才写回显式 `auto` 到原 JSON 的门禁）；
+     - 新增 `build_day_quality_profiles`（逐日 `min_side_score`、`A/B/C` 质量分级、天然离线断口 `gap_before`、连续块 `block_id`、单日孤岛 `is_island`、开/关日状态）；
+     - 新增 `curate_auto_split_pool`（剥离 `<16` 点极短残片天 + 当双达标天 `>=25` 且全关占比 `>65%` 时从最远期连续全关段自动裁剪冗余全关天至 `~45%`，严护人工 `splits` 锚定日与近期全关天）；
+     - 新增 `resolve_auto_quality_split` 与 `summarize_split_decision`（前缀和全局精确搜索单段高分连续块 `auto_contiguous_quality_blocks` + 极化分布自动切换双段分层连续块 `auto_polarized_two_block` + 全关日稀缺度 `0 / 1 / 2 / >=3` 四档铁律保底 + 人工 `splits` 最高优先级锚定兼容）。
+  3. **流水线零泄漏衔接与对账（`nilm/pipeline/user_task.py`）**：
+     - 打通池级净水 → 日级 `auto` 切分 → L-4 仅按 `train+val` 复核 `on_thr_w="auto"`（`zero_test_leakage_verified=True`）→ L-3 按 `train/val/test` 三折独立执行 `build_features`（`per_split_feature_isolation=True`）→ `meta.json["split_decision"]` 审计留痕；
+     - `qualified_days_detail.csv` 采用池级裁剪前完整双达标 `target_for_qdetail` 对账，确保包含被裁剪 `未使用` 天在内的全部双达标天 `all_off` 与 `dataset` 归属 100% 守恒。
+- 单测与对账验证（`tests/test_splits.py` + 全仓回归）：
+  - 新增天然断口零人工切口验证、A 级高分天优先入 `val/test`（C 级低分天留 `train`）、`0/1/2/>=3` 全关日稀缺铁律、5 天极小样本单日容量无死锁、残片天与远期冗余全关天裁剪及锚定保护、`run_batch` 端到端与 `qualified_days_detail.csv` 逐日 100% 守恒对账、`--split-strategy auto` 写回门禁共 9 组专项用例（15 项测试）；
+  - 全仓测试套件通过：**`267 passed`**。
+- 是否进入 REPORT.md（稳定结论）：是（候选）——「`split_strategy="auto"` 实现基于逐日质量分、天然离线断口与开关日分布的连续块自动划分，并闭环阻断跨折特征渗透（L-3）与非锚定阈值测试泄漏（L-4）」。
+
+

@@ -274,7 +274,7 @@ models:
 | `post_min_on` | 1 | ≥0 整数 | 状态后处理：开机段最短持续点数，短于此的开段视为噪声置关（15min/点）。当前 `1` 恒空（长度<1不存在），防闪断 | 压 FP 收益实证 `0.75→0.87` |
 | `post_fill_short_off` | 3 | ≥0 整数 | 状态后处理：两开机段之间 ≤N 点的短关断填充为开（≤45min） | 全关日 `fp 150→152` 仅回填短关断 |
 | `split_ratios` | [0.6,0.2,0.2] | 3非负和=1 | train/val/test 切分比例 | `metrics_by_split.csv` |
-| `split_strategy` | `stratified_day` | `stratified_day / stratified / time / global_stratified / stratified_by_state` | 切分策略：`stratified_day`=按天分层打散（推荐）；`time`=时间顺序；`stratified_by_state` 按开/关分层自动均摊（800 B1b 新增） | 800 池内 `65%/12%/0%` →42%均摊 |
+| `split_strategy` | `stratified_day`（新户 `auto_run` 默认 `auto`） | `auto / stratified_day / stratified / time / global_stratified / stratified_by_state` | 切分策略：**`auto`=基于每日数据质量（`bus_score/branch_score`、天然离线断口、有效点数）与开/关日工况自动搜索高分连续块并保三折开关覆盖**（见 `docs/AUTO_QUALITY_SPLIT_ANALYSIS.md`）；`stratified_day`=按星期分层；`time`=时间顺序；`stratified_by_state`=按开/关分层均摊 | 消除碎段与关天失衡、零跨折特征渗透 |
 | `quality.day_gate` | true（全局） | bool | 覆盖 base 配置；用户级 `true` 免疫漂移（2844 显式 true） | 45天池 |
 | `quality.min_on_day_ratio` | 0.2（可选） | 0~1 | 开机日占比门禁 | 31%→71% |
 | `quality.gate_scope` | full | `full/train_range` | 覆盖 base 配置 | 缩窗时用 train_range |
