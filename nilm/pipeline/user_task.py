@@ -56,7 +56,14 @@ from nilm.preprocess.dataset import DEFAULT_WINDOW, build_windows, drop_invalid_
 from nilm.preprocess.features import build_features
 from nilm.preprocess.normalize import apply_branch_scale, apply_pt_ct
 from nilm.preprocess.scaling import TrainFitScaler
-from nilm.preprocess.splits import build_split_masks
+from nilm.preprocess.splits import (
+    anchor_splits,
+    build_split_masks,
+    curate_auto_split_pool,
+    repair_empty_splits,
+    resolve_auto_quality_split,
+    summarize_split_decision,
+)
 from nilm.preprocess.target import build_target, resolve_target_cols
 from nilm.reporting import write_markdown_report
 
@@ -756,6 +763,25 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         log.info("[%s] PT/CT 校正 pt=%.4g ct=%.4g（综合 %.4g，功率转 kW）",
                  user_key, pt_ratio, ct_ratio, pt_ratio * ct_ratio)
 
+        # 保留池级裁剪前的完整双达标真值，确保 qualified_days_detail.csv 对「未使用」天亦能忠实标注 all_off
+        target_for_qdetail = target.copy()
+        pool_curation = None
+        if user_cfg["split_strategy"] == "auto":
+            bus_al, branch_al, target, pool_curation = curate_auto_split_pool(
+                bus_al, branch_al, target,
+                daily_quality=daily_q,
+                on_thr_w=on_thr,
+                splits_spec=user_cfg.get("splits"),
+                min_days=float(qcfg.get("min_days", 14)),
+            )
+            if pool_curation["trimmed_stub_days"] or pool_curation["trimmed_excess_off_days"]:
+                log.warning("%s", yellow_text(
+                    f"[{user_key}] [AUTO-SPLIT-POOL] 池级净水完成: 天数 {pool_curation['before_days']} -> "
+                    f"{pool_curation['after_days']}（全关占比 {pool_curation['before_off_ratio']} -> "
+                    f"{pool_curation['after_off_ratio']}，剔除残片天 {len(pool_curation['trimmed_stub_days'])} 天、"
+                    f"远期过剩全关天 {len(pool_curation['trimmed_excess_off_days'])} 天）"
+                ))
+
         # —— §9 可辨识性分析（训练前强制执行）
         ident = identifiability_report(bus_al, target, on_thr_w=on_thr)
         _dump(out / "identifiability_report.json", ident)
@@ -765,30 +791,129 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
         # —— §8 特征 + §10/§11 样本与切分
         # 允许 time_filters per-user 覆盖 features（P0 lag5 等），user 优先于 base
         fc = {**base_cfg.get("features", {}), **(user_cfg.get("features") or {})}
-        feat = build_features(bus_al, lags=tuple(fc.get("lags", [1, 2, 3, 4])),
-                              rolling_windows=tuple(fc.get("rolling_windows", ["1h", "6h", "24h"])))
-        f, y = drop_invalid_rows(feat, target)
+        lags_cfg = tuple(fc.get("lags", [1, 2, 3, 4]))
+        roll_cfg = tuple(fc.get("rolling_windows", ["1h", "6h", "24h"]))
         window = int(base_cfg.get("dataset", {}).get("window", DEFAULT_WINDOW))
-        if len(f) < window * 2:
-            raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE,
-                                f"有效样本 {len(f)} < 2×L({window})")
 
-        masks = build_split_masks(f.index, user_cfg["split_ratios"],
-                                  user_cfg["split_strategy"], user_cfg.get("splits"),
-                                  target=target, on_thr_w=on_thr)
+        auto_split_meta = None
+        per_split_feature_isolation = False
+        if user_cfg["split_strategy"] == "auto":
+            raw_base_masks, auto_split_meta = resolve_auto_quality_split(
+                bus_al.index, user_cfg["split_ratios"],
+                daily_quality=daily_q, target=target, on_thr_w=on_thr,
+            )
+            raw_masks = anchor_splits(bus_al.index, raw_base_masks, user_cfg.get("splits"))
+            raw_masks = repair_empty_splits(raw_masks, bus_al.index, user_cfg["split_ratios"])
+
+            # 零泄漏闭环（L-4）：切分锁定 test 后，仅在 train+val 子集复核 on_thr_w="auto"
+            if isinstance(cfg_on_thr_raw, str) and cfg_on_thr_raw.strip().lower() == "auto":
+                non_test_raw = (raw_masks["train"] | raw_masks["val"]).to_numpy()
+                non_test_target = target.loc[non_test_raw]
+                if len(non_test_target.dropna()) >= 96:
+                    nt_pbus = bus_total(bus_al.loc[non_test_raw]).reindex(non_test_target.index)
+                    nt_thr, nt_dec = resolve_auto_on_thr_w(
+                        non_test_target, fallback_thr_w=10.0, pbus_pool=nt_pbus
+                    )
+                    nt_dec["provenance"] = on_thr_decision.get("provenance", "default(硬编码)")
+                    nt_dec["zero_test_leakage_verified"] = True
+                    if abs(nt_thr - on_thr) > 1e-6:
+                        prev_thr_nt = on_thr
+                        on_thr = nt_thr
+                        on_thr_decision = nt_dec
+                        q_bus["on_thr_w"] = on_thr
+                        q_br["on_thr_w"] = on_thr
+                        sessions = analyze_branch_sessions(branch_al, on_thr, columns=target_cols)
+                        sessions.to_csv(out / "branch_sessions.csv", index=False, encoding="utf-8")
+                        log.warning("%s", yellow_text(
+                            f"[{user_key}] [AUTO-ON-THR-ZERO-LEAK] 仅按 train+val 复核开机阈值 "
+                            f"on_thr_w: {prev_thr_nt:.4g} -> {on_thr:.4g}"
+                        ))
+                    else:
+                        on_thr_decision["zero_test_leakage_verified"] = True
+
+            # 零泄漏闭环（L-3）：按 train/val/test 三折独立构造滞后与 24h 滚动特征，阻断跨折母线渗透
+            sub_frames_f: dict[str, pd.DataFrame] = {}
+            sub_frames_y: dict[str, pd.Series] = {}
+            for sname in ("train", "val", "test"):
+                sm = raw_masks[sname].to_numpy()
+                if sm.any():
+                    s_feat = build_features(bus_al.loc[sm], lags=lags_cfg, rolling_windows=roll_cfg)
+                    sf, sy = drop_invalid_rows(s_feat, target.loc[sm])
+                    sub_frames_f[sname] = sf
+                    sub_frames_y[sname] = sy
+                else:
+                    sub_frames_f[sname] = pd.DataFrame()
+                    sub_frames_y[sname] = pd.Series(dtype=np.float64)
+
+            tot_iso_rows = sum(len(df_) for df_ in sub_frames_f.values())
+            if (len(sub_frames_f["train"]) >= window
+                    and len(sub_frames_f["test"]) > 0
+                    and tot_iso_rows >= window * 2):
+                non_empty_f = [df_ for df_ in sub_frames_f.values() if len(df_) > 0]
+                non_empty_y = [sr_ for sr_ in sub_frames_y.values() if len(sr_) > 0]
+                f = pd.concat(non_empty_f).sort_index()
+                y = pd.concat(non_empty_y).loc[f.index]
+                masks = {
+                    sname: pd.Series(f.index.isin(sub_frames_f[sname].index), index=f.index)
+                    for sname in ("train", "val", "test")
+                }
+                per_split_feature_isolation = True
+            else:
+                feat = build_features(bus_al, lags=lags_cfg, rolling_windows=roll_cfg)
+                f, y = drop_invalid_rows(feat, target)
+                if len(f) < window * 2:
+                    raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE,
+                                        f"有效样本 {len(f)} < 2×L({window})")
+                masks = build_split_masks(
+                    f.index, user_cfg["split_ratios"],
+                    user_cfg["split_strategy"], user_cfg.get("splits"),
+                    target=target, on_thr_w=on_thr, daily_quality=daily_q,
+                )
+        else:
+            feat = build_features(bus_al, lags=lags_cfg, rolling_windows=roll_cfg)
+            f, y = drop_invalid_rows(feat, target)
+            if len(f) < window * 2:
+                raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE,
+                                    f"有效样本 {len(f)} < 2×L({window})")
+            masks = build_split_masks(
+                f.index, user_cfg["split_ratios"],
+                user_cfg["split_strategy"], user_cfg.get("splits"),
+                target=target, on_thr_w=on_thr, daily_quality=daily_q,
+            )
+
         names = [str(c) for c in f.columns]
         X_all = f.to_numpy(np.float64)
         y_all = y.to_numpy(np.float64)[:, None]  # 统一 (n, 1) 多输出矩阵接口
         splits = {k: (X_all[m.to_numpy()], y_all[m.to_numpy()], f.index[m.to_numpy()])
                   for k, m in masks.items()}
         split_sizes = {k: len(v[0]) for k, v in splits.items()}
+        split_decision = summarize_split_decision(
+            f.index, masks, user_cfg["split_strategy"],
+            daily_quality=daily_q, target=target, on_thr_w=on_thr,
+            auto_meta=auto_split_meta, pool_curation=pool_curation,
+        )
+        split_decision["per_split_feature_isolation"] = per_split_feature_isolation
         log.info("[%s] 切分（%s）: %s", user_key, user_cfg["split_strategy"], split_sizes)
+        if user_cfg["split_strategy"] == "auto":
+            bs_tr = split_decision["by_split"]["train"]
+            bs_va = split_decision["by_split"]["val"]
+            bs_te = split_decision["by_split"]["test"]
+            log.warning("%s", yellow_text(
+                f"[{user_key}] [AUTO-SPLIT] mode={split_decision['resolved_mode']} | "
+                f"train={bs_tr['days']}d(开{bs_tr['on_days']}/关{bs_tr['off_days']}, "
+                f"{bs_tr['contiguous_blocks']}段, 均分{bs_tr['mean_min_side_score']}) | "
+                f"val={bs_va['days']}d(开{bs_va['on_days']}/关{bs_va['off_days']}, "
+                f"{bs_va['contiguous_blocks']}段, 均分{bs_va['mean_min_side_score']}) | "
+                f"test={bs_te['days']}d(开{bs_te['on_days']}/关{bs_te['off_days']}, "
+                f"{bs_te['contiguous_blocks']}段, 均分{bs_te['mean_min_side_score']}) | "
+                f"独立特征隔离={per_split_feature_isolation}"
+            ))
         if split_sizes["test"] == 0 or split_sizes["train"] < window:
             raise UserTaskError(Status.INSUFFICIENT_TIME_RANGE, f"切分后样本不足: {split_sizes}")
 
         # —— 双达标天清洗后统计：总/全关/训练/验证/测试天数 + 每天明细（全关/阈值/所属集）
         q_detail = qualified_days_detail(
-            daily_q, target, on_thr,
+            daily_q, target_for_qdetail, on_thr,
             split_index={k: splits[k][2] for k in ("train", "val", "test")
                          if split_sizes.get(k, 0) > 0})
         q_detail.to_csv(out / "qualified_days_detail.csv", index=False, encoding="utf-8")
@@ -832,7 +957,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             (isinstance(cfg_post_min_on_raw, str) and cfg_post_min_on_raw.strip().lower() == "auto")
             or (isinstance(cfg_post_fill_off_raw, str) and cfg_post_fill_off_raw.strip().lower() == "auto")
         )
-        non_test_mask = ~masks["test"].to_numpy()
+        non_test_mask = (masks["train"] | masks["val"]).to_numpy()
         postproc_bounds = (
             resolve_postprocess_physical_bounds(
                 y.to_numpy(np.float64)[non_test_mask],
@@ -1291,6 +1416,7 @@ def run_user_train(user_key: str, scan, user_cfg: dict, base_cfg: dict,
             "feature_names": names, "scale_cols": scale_cols,
             "scaler": scaler.state(), "window": window, "window_mode": wmode,
             "split_sizes": split_sizes, "split_strategy": user_cfg["split_strategy"],
+            "split_decision": split_decision,
             "best_model": best, "models": [s["name"] for s in base_cfg.get("models", [])],
             "collapsed_models": [c["model"] for c in collapsed_models],
             "on_thr_w": on_thr,

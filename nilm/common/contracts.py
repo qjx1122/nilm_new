@@ -130,7 +130,15 @@ class Status:
 
 
 # ---------------------------------------------------------------- 用户 JSON 配置契约（§12.3）
-SPLIT_STRATEGIES = ("stratified_day", "stratified", "time", "global_stratified",
+# split_strategy（数据集按日划分策略）：
+#   auto                : 基于每日数据质量（bus/branch 得分、有效点数、天然离线断口）与日开/关工况
+#                         自动搜索连续高质量块并保障 train/val/test 开关双覆盖，支持池级过剩全关天治理；
+#   stratified_day      : 按星期几分层，每层内部按时间切比例（硬编码缺省，保持既有实验 100% 向后兼容）；
+#   stratified          : 按月份分层，每层内部按时间切比例；
+#   time                : 纯时间顺序连续切分（train→val→test）；
+#   global_stratified   : 按日轮转交错分配；
+#   stratified_by_state : 按日开/关状态分层，每层内部按时间切比例。
+SPLIT_STRATEGIES = ("auto", "stratified_day", "stratified", "time", "global_stratified",
                     "stratified_by_state")
 # pbus_mode（按户选/自动判定双路径）：
 #   auto（全局默认）：三步零泄漏验证闭环——① 取消静态千瓦阈值盲跳，默认统一先跑抗漂移基态 raw

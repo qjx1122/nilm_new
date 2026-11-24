@@ -100,12 +100,13 @@ def _parse_postproc_arg(val: str):
 
 
 def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=None,
-                       decision_thr=None, pbus_mode=None, min_on=None, fill_off=None) -> Path:
+                       decision_thr=None, pbus_mode=None, min_on=None, fill_off=None,
+                       split_strategy=None) -> Path:
     """已有用户：脚本参数优先但不写回（overlay）；新用户：补原文件（带备份）。
 
     返回本次运行实际使用的配置路径：已有用户无覆盖返回原文件，有覆盖返回
     overlay；新用户写回原文件后返回原文件。target_col/on_thr/decision_thr/pbus_mode/
-    min_on/fill_off 为 None 表示未传，沿用配置值；新用户未传则默认 p1 / auto / auto / auto / auto / auto。
+    min_on/fill_off/split_strategy 为 None 表示未传，沿用配置值；新用户未传则默认 p1 / 全 auto。
     """
     cfg = json.loads(tf_path.read_text(encoding="utf-8"))
     if user_key in cfg:
@@ -129,12 +130,16 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
             updates["post_min_on"] = min_on
         if fill_off is not None and eff_cur.get("post_fill_short_off", cur.get("post_fill_short_off", 3)) != fill_off:
             updates["post_fill_short_off"] = fill_off
+        eff_cur_split = eff_cur.get("split_strategy") or cur.get("split_strategy") or "stratified_day"
+        if split_strategy is not None and eff_cur_split != split_strategy:
+            updates["split_strategy"] = split_strategy
         if not updates:
             log(f"time_filters.json 已含 {user_key} → 沿用（target={eff_cur.get('target_col', cur.get('target_col'))} "
                 f"on={eff_cur.get('on_thr_w', cur.get('on_thr_w'))} "
                 f"dec={eff_cur.get('decision_thr_w', cur.get('decision_thr_w'))} pbus_mode={eff_cur_pbus} "
                 f"min_on={eff_cur.get('post_min_on', cur.get('post_min_on', 1))} "
-                f"fill_off={eff_cur.get('post_fill_short_off', cur.get('post_fill_short_off', 3))})")
+                f"fill_off={eff_cur.get('post_fill_short_off', cur.get('post_fill_short_off', 3))} "
+                f"split={eff_cur_split})")
             return tf_path
         old = {k: cur.get(k, eff_cur.get(k)) for k in updates}
         cur.update(updates)
@@ -148,6 +153,7 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
         "pbus_mode": pbus_mode if pbus_mode is not None else "auto",
         "post_min_on": min_on if min_on is not None else "auto",
         "post_fill_short_off": fill_off if fill_off is not None else "auto",
+        "split_strategy": split_strategy if split_strategy is not None else "auto",
         "quality": {"day_gate": True, "min_on_day_ratio": 0.2},
         "train": {"include": [["2025-07-10","2026-06-30"]]},
         "infer": {"include": [["2026-07-01","2026-07-31"]]}
@@ -155,7 +161,8 @@ def ensure_user_config(user_key: str, tf_path: Path, target_col=None, on_thr=Non
     bak = _write_cfg_with_backup(tf_path, cfg)
     log(f"新用户 {user_key} → 已补原 time_filters.json（target={cfg[user_key]['target_col']} on={cfg[user_key]['on_thr_w']} "
         f"dec={cfg[user_key]['decision_thr_w']} pbus_mode={cfg[user_key]['pbus_mode']} "
-        f"min_on={cfg[user_key]['post_min_on']} fill_off={cfg[user_key]['post_fill_short_off']}），原文件备份 {bak.name}", "WARN")
+        f"min_on={cfg[user_key]['post_min_on']} fill_off={cfg[user_key]['post_fill_short_off']} "
+        f"split={cfg[user_key]['split_strategy']}），原文件备份 {bak.name}", "WARN")
     log("  → 请按 TUNING_GUIDE §1 核实 target_col 是否为真实 pN（错则似 OQ-13/800 PAUSED 全返工）", "WARN")
     return tf_path
 
@@ -235,6 +242,7 @@ def step_sync_decision_thr(
     explicit_fill_off_arg=None,
     target_col_arg=None,
     pbus_mode_arg=None,
+    split_strategy_arg=None,
     save_config: bool = False,
     force: bool = False,
     ran_train: bool = False,
@@ -245,7 +253,7 @@ def step_sync_decision_thr(
     """零重训收口同步 train 与 infer 的 decision_thr_w 与游程参数（支持 auto 双链联合寻优与显式数值同步）。
 
     原配置文件（time_filters.json）写回契约：
-    - 显式传 'auto' 的自动定参项（--on-thr/--decision-thr/--min-on/--fill-off/--pbus-mode）：
+    - 显式传 'auto' 的自动定参项（--on-thr/--decision-thr/--min-on/--fill-off/--pbus-mode/--split-strategy）：
       仅当同时显式传 --force 与 --save-config 时，不论原 JSON 中是否已有固定值，均同步更新新自动值至原 JSON；
       否则（未传 --force 或未传 --save-config），绝不将新自动值更新至原 JSON。
     """
@@ -268,7 +276,8 @@ def step_sync_decision_thr(
     is_auto_mo = isinstance(explicit_min_on_arg, str) and explicit_min_on_arg.strip().lower() == "auto"
     is_auto_fo = isinstance(explicit_fill_off_arg, str) and explicit_fill_off_arg.strip().lower() == "auto"
     is_auto_pbus = isinstance(pbus_mode_arg, str) and pbus_mode_arg.strip().lower() == "auto"
-    any_explicit_auto = is_auto_on or is_auto_dec or is_auto_mo or is_auto_fo or is_auto_pbus
+    is_auto_split = isinstance(split_strategy_arg, str) and split_strategy_arg.strip().lower() == "auto"
+    any_explicit_auto = is_auto_on or is_auto_dec or is_auto_mo or is_auto_fo or is_auto_pbus or is_auto_split
 
     has_explicit_num_on = isinstance(explicit_on_arg, (int, float)) and not isinstance(explicit_on_arg, bool)
     has_explicit_num_dec = isinstance(explicit_dec_arg, (int, float)) and not isinstance(explicit_dec_arg, bool)
@@ -276,6 +285,9 @@ def step_sync_decision_thr(
     has_explicit_num_mo = isinstance(explicit_min_on_arg, int) and not isinstance(explicit_min_on_arg, bool)
     has_explicit_num_fo = isinstance(explicit_fill_off_arg, int) and not isinstance(explicit_fill_off_arg, bool)
     has_explicit_fixed_pbus = pbus_mode_arg in ("raw", "scaled")
+    has_explicit_fixed_split = split_strategy_arg in (
+        "stratified_day", "stratified", "time", "global_stratified", "stratified_by_state"
+    )
 
     if stage == "sync-thr":
         use_infer_meta = inf_dir is not None
@@ -459,6 +471,16 @@ def step_sync_decision_thr(
             if resolved_pbus in ("raw", "scaled"):
                 entry["pbus_mode"] = str(resolved_pbus)
 
+        # 6) split_strategy
+        if is_auto_split:
+            if allow_explicit_auto_save:
+                if auto_ready_train or auto_ready_chain:
+                    entry["split_strategy"] = "auto"
+            else:
+                skipped_auto_fields.append("split_strategy")
+        elif has_explicit_fixed_split:
+            entry["split_strategy"] = split_strategy_arg
+
         if skipped_auto_fields:
             ulog.warning("%s", yellow_text(
                 f"[{user_key}] [AUTO-SAVE-SKIPPED] 显式 auto 参数 {skipped_auto_fields} 未更新至 {orig_tf.name} "
@@ -563,6 +585,10 @@ def main(argv=None):
                     help="post_fill_short_off（支持 0..96 整数或 'auto'）；已传且与配置不同则 overlay 覆盖，未传沿用（新用户默认 auto）")
     ap.add_argument("--pbus-mode", choices=["auto", "raw", "scaled"], default=None,
                     help="pbus_mode（auto=默认先试raw+欠拟合经val双向验收后红色熔断切scaled，默认；raw=锁死未缩放+分摊；scaled=锁死z-score+改学）")
+    ap.add_argument("--split-strategy",
+                    choices=["auto", "stratified_day", "stratified", "time", "global_stratified", "stratified_by_state"],
+                    default=None,
+                    help="split_strategy（auto=基于每日数据质量与开/关工况连续块自动划分，新户默认；其余沿用既有五种策略）")
     ap.add_argument("--stage", choices=["all","train","infer","threshold","sync-thr"], default="all",
                     help="all=2+3+5+双链收口+4 完整；threshold=仅 Step4；sync-thr=零重训同步刷新 train+infer 的 decision_thr_w 与游程参数")
     ap.add_argument("--save-config", action="store_true",
@@ -584,7 +610,8 @@ def main(argv=None):
     if args.stage in ("all","train","infer"):
         effective_tf = ensure_user_config(user_key, tf, args.target_col, args.on_thr,
                                           args.decision_thr, args.pbus_mode,
-                                          args.min_on, args.fill_off)
+                                          args.min_on, args.fill_off,
+                                          args.split_strategy)
 
     ran_train = args.stage in ("all", "train") and not args.skip_train
     ran_infer = args.stage in ("all", "infer") and not args.skip_infer
@@ -620,6 +647,7 @@ def main(argv=None):
             explicit_fill_off_arg=args.fill_off,
             target_col_arg=args.target_col,
             pbus_mode_arg=args.pbus_mode,
+            split_strategy_arg=args.split_strategy,
             save_config=args.save_config,
             force=args.force,
             ran_train=ran_train,
@@ -640,6 +668,7 @@ def main(argv=None):
             explicit_fill_off_arg=args.fill_off,
             target_col_arg=args.target_col,
             pbus_mode_arg=args.pbus_mode,
+            split_strategy_arg=args.split_strategy,
             save_config=True,
             force=args.force,
             ran_train=ran_train,
