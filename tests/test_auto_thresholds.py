@@ -1717,8 +1717,156 @@ def test_901_buried_bus_4branch_corridor_and_13_bad_days_day_gate_refresh(
     assert audit_main(["--run-root", str(out_root / user_901)]) == 0
 
 
+# ---------------------------------------------------------------- 21. 显式 auto 定参写回门禁契约（须同时传 --force + --save-config）
+def test_auto_run_explicit_auto_requires_force_and_save_config_to_update_orig_json(
+    tmp_path: Path, base_cfg: dict, caplog
+):
+    """验证 auto_run_steps2to5 显式传 auto 选项时：
+    1) 仅传 --force（未传 --save-config）-> 原 time_filters.json 固定值保持不变；
+    2) 仅传 --save-config（未传 --force）-> 原 time_filters.json 固定值保持不变，输出 [AUTO-SAVE-SKIPPED] 告警；
+    3) 同时显式传 --force + --save-config（--stage train，且磁盘存在陈旧 infer 产物干扰）->
+       不被陈旧 infer 污染，5 项参数（含 pbus_mode 决议值）同步更新至原 time_filters.json，清理临时 overlay；
+       随后单独执行 run_batch --stage infer 读原 time_filters.json，训推 5 项参数 100% 对齐无 OVERRIDE 告警；
+    4) 同时显式传 --force + --save-config（--stage all）-> 原 JSON 固定值同步更新为双链新自动值。
+    """
+    import yaml
 
+    full_base = dict(base_cfg)
+    full_base["metrics"] = [
+        "mae", "rmse", "r2", "sae",
+        "f1", "accuracy", "precision", "recall", "tp", "fp", "fn", "tn",
+    ]
+    base_file = tmp_path / "base_force_save.yaml"
+    base_file.write_text(yaml.safe_dump(full_base, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "outputs"
+    _write_bimodal_user_dir(
+        data_root, USER_KEY, "trains", days=16, start="2026-04-01",
+        standby_w=20.0, working_w=700.0, bg_bus_kw=200.0, seed=101,
+    )
+    _write_bimodal_user_dir(
+        data_root, USER_KEY, "infers", days=8, start="2026-07-01",
+        standby_w=20.0, working_w=700.0, bg_bus_kw=200.0, seed=102,
+    )
 
+    fixed_orig = {
+        "target_col": "p1",
+        "on_thr_w": 85.0,
+        "decision_thr_w": 55.0,
+        "post_min_on": 6,
+        "post_fill_short_off": 5,
+        "pbus_mode": "scaled",
+        "split_ratios": [0.6, 0.2, 0.2],
+        "split_strategy": "stratified_day",
+    }
+    tf_file = tmp_path / "time_filters.json"
+    tf_file.write_text(json.dumps({USER_KEY: dict(fixed_orig)}, indent=2), encoding="utf-8")
 
+    # 先按旧固定值跑一次 train + infer，在磁盘制造陈旧 _DONE 产物（模拟老户 2842 已有旧 infer 目录）
+    run_batch(
+        tf_file,
+        base_config_path=base_file,
+        data_root=data_root,
+        output_root=out_root,
+        stages=("train", "infer"),
+        force=True,
+    )
+    stale_inf_dir = latest_done_dir(out_root / USER_KEY / "infer")
+    assert stale_inf_dir is not None
 
+    auto_args_base = [
+        "--user-key", USER_KEY,
+        "--time-filter-config", str(tf_file),
+        "--base-config", str(base_file),
+        "--data-root", str(data_root),
+        "--output-root", str(out_root),
+        "--target-col", "p1",
+        "--on-thr", "auto",
+        "--decision-thr", "auto",
+        "--min-on", "auto",
+        "--fill-off", "auto",
+        "--pbus-mode", "auto",
+    ]
+
+    # 1) 显式 auto + 仅 --force（无 --save-config）-> 原 JSON 不变
+    rc1 = auto_run_main(auto_args_base + ["--stage", "train", "--force"])
+    assert rc1 == 0
+    assert json.loads(tf_file.read_text(encoding="utf-8"))[USER_KEY] == fixed_orig
+
+    # 2) 显式 auto + 仅 --save-config（无 --force）-> 原 JSON 不变，且输出 [AUTO-SAVE-SKIPPED]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        rc2 = auto_run_main(auto_args_base + ["--stage", "train", "--save-config"])
+    assert rc2 == 0
+    assert json.loads(tf_file.read_text(encoding="utf-8"))[USER_KEY] == fixed_orig
+    assert any("[AUTO-SAVE-SKIPPED]" in r.message for r in caplog.records)
+
+    # 3) 显式 auto + --stage train + --force + --save-config -> 5 项新自动值同步更新至原 JSON（不被陈旧 infer 污染）
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        rc3 = auto_run_main(auto_args_base + ["--stage", "train", "--force", "--save-config"])
+    assert rc3 == 0
+    assert any("[AUTO-SAVE-CONFIG]" in r.message for r in caplog.records)
+    overlay_path = tmp_path / f"time_filters.overlay.{USER_KEY}.json"
+    assert not overlay_path.exists()
+
+    tr_dir_new = latest_done_dir(out_root / USER_KEY / "train")
+    tr_meta_new = json.loads((tr_dir_new / "meta.json").read_text(encoding="utf-8"))
+    saved_after_train = json.loads(tf_file.read_text(encoding="utf-8"))[USER_KEY]
+    assert saved_after_train["on_thr_w"] == pytest.approx(float(tr_meta_new["on_thr_w"]))
+    assert saved_after_train["on_thr_w"] != pytest.approx(85.0)
+    assert saved_after_train["decision_thr_w"] == pytest.approx(float(tr_meta_new["decision_thr_w"]))
+    assert saved_after_train["post_min_on"] == int(tr_meta_new["post_min_on"])
+    assert saved_after_train["post_min_on"] != 6
+    assert saved_after_train["post_fill_short_off"] == int(tr_meta_new["post_fill_short_off"])
+    assert saved_after_train["pbus_mode"] in ("raw", "scaled")
+    assert saved_after_train["pbus_mode"] == tr_meta_new["pbus_mode"]
+
+    # 紧接着单独执行 run_batch --stage infer --force 读原 time_filters.json：训推参数 100% 对齐，零 OVERRIDE 告警
+    # 若 best_model 与校准模型不同，锁定校准模型以验证阈值/游程对齐
+    cal_model = (tr_meta_new.get("decision_thr_w_decision") or {}).get("calibrated_model")
+    if cal_model:
+        cfg_tmp = json.loads(tf_file.read_text(encoding="utf-8"))
+        cfg_tmp[USER_KEY]["infer_model"] = cal_model
+        tf_file.write_text(json.dumps(cfg_tmp, indent=2), encoding="utf-8")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nilm"):
+        inf_res = run_batch(
+            tf_file,
+            base_config_path=base_file,
+            data_root=data_root,
+            output_root=out_root,
+            stages=("infer",),
+            force=True,
+        )
+    assert (pd.read_csv(inf_res["status_csv"])["status"] == Status.OK).all()
+    warn_msgs = [r.message for r in caplog.records]
+    assert not any("[DEC-THR-OVERRIDE]" in m for m in warn_msgs)
+    assert not any("[POSTPROC-OVERRIDE]" in m for m in warn_msgs)
+    assert not any("[ON-THR-MISMATCH]" in m for m in warn_msgs)
+    inf_dir_new = latest_done_dir(out_root / USER_KEY / "infer")
+    inf_meta_new = json.loads((inf_dir_new / "meta.json").read_text(encoding="utf-8"))
+    assert inf_meta_new["on_thr_w"] == pytest.approx(float(tr_meta_new["on_thr_w"]))
+    assert inf_meta_new["decision_thr_w"] == pytest.approx(float(tr_meta_new["decision_thr_w"]))
+    assert inf_meta_new["post_min_on"] == int(tr_meta_new["post_min_on"])
+    assert inf_meta_new["post_fill_short_off"] == int(tr_meta_new["post_fill_short_off"])
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+    # 4) 将原 JSON 再次重置为旧固定值，验证 --stage all --force --save-config 同样完整更新 5 项新自动值
+    tf_file.write_text(json.dumps({USER_KEY: dict(fixed_orig)}, indent=2), encoding="utf-8")
+    rc4 = auto_run_main(auto_args_base + ["--stage", "all", "--force", "--save-config"])
+    assert rc4 == 0
+    saved_after_all = json.loads(tf_file.read_text(encoding="utf-8"))[USER_KEY]
+    tr_dir_all = latest_done_dir(out_root / USER_KEY / "train")
+    inf_dir_all = latest_done_dir(out_root / USER_KEY / "infer")
+    tr_meta_all = json.loads((tr_dir_all / "meta.json").read_text(encoding="utf-8"))
+    inf_meta_all = json.loads((inf_dir_all / "meta.json").read_text(encoding="utf-8"))
+    assert saved_after_all["on_thr_w"] == pytest.approx(float(tr_meta_all["on_thr_w"]))
+    assert saved_after_all["decision_thr_w"] == pytest.approx(float(inf_meta_all["decision_thr_w"]))
+    assert saved_after_all["post_min_on"] == int(inf_meta_all["post_min_on"])
+    assert saved_after_all["post_fill_short_off"] == int(inf_meta_all["post_fill_short_off"])
+    assert saved_after_all["pbus_mode"] in ("raw", "scaled")
+    assert saved_after_all["pbus_mode"] == tr_meta_all["pbus_mode"]
+    assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0

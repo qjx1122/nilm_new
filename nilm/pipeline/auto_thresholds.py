@@ -1753,6 +1753,10 @@ def check_offline_decision_drift(
 def resolve_joint_val_infer_decision_thr_w(
     train_dir: Path,
     infer_dir: Path,
+    *,
+    force_auto_dec: bool = False,
+    force_auto_min_on: bool = False,
+    force_auto_fill_off: bool = False,
 ) -> tuple[float | None, dict]:
     """双链（train/val + infer 离线评估）联合校准最优 decision_thr_w。
 
@@ -1833,8 +1837,12 @@ def resolve_joint_val_infer_decision_thr_w(
     min_cand_w = max(0.001, 0.60 * on_thr)
 
     dec_cfg_tr = tr_meta.get("decision_thr_w_configured", "auto")
-    inf_dec_src = str((inf_meta.get("thresholds") or {}).get("decision_thr_w_source", ""))
-    c_joint_auto = (dec_cfg_tr == "auto") and not inf_dec_src.startswith("explicit")
+    inf_thr_blk = inf_meta.get("thresholds") or {}
+    inf_dec_src = str(inf_thr_blk.get("decision_thr_w_source", ""))
+    inf_dec_cfg = inf_thr_blk.get("decision_thr_w_configured", inf_meta.get("decision_thr_w_configured"))
+    c_joint_auto = bool(force_auto_dec) or (
+        (dec_cfg_tr == "auto" or inf_dec_cfg == "auto") and not inf_dec_src.startswith("explicit")
+    )
 
     if c_joint_auto or ("decision_thr_w_configured" not in tr_meta):
         raw_cands: set[float] = {round(on_thr, 4), round(cur_dec, 4)}
@@ -1856,12 +1864,14 @@ def resolve_joint_val_infer_decision_thr_w(
     )
 
     inf_pp = inf_meta.get("postprocess") or {}
-    m_joint_auto = (
-        tr_meta.get("post_min_on_configured") == "auto"
+    inf_m_cfg = inf_pp.get("post_min_on_configured", inf_meta.get("post_min_on_configured"))
+    inf_k_cfg = inf_pp.get("post_fill_short_off_configured", inf_meta.get("post_fill_short_off_configured"))
+    m_joint_auto = bool(force_auto_min_on) or (
+        (tr_meta.get("post_min_on_configured") == "auto" or inf_m_cfg == "auto")
         and not str(inf_pp.get("post_min_on_source", "")).startswith("explicit(")
     )
-    k_joint_auto = (
-        tr_meta.get("post_fill_short_off_configured") == "auto"
+    k_joint_auto = bool(force_auto_fill_off) or (
+        (tr_meta.get("post_fill_short_off_configured") == "auto" or inf_k_cfg == "auto")
         and not str(inf_pp.get("post_fill_short_off_source", "")).startswith("explicit(")
     )
 
@@ -2582,9 +2592,19 @@ def calibrate_and_sync_joint_decision_thr(
     user_key: str,
     train_dir: Path,
     infer_dir: Path,
+    *,
+    force_auto_dec: bool = False,
+    force_auto_min_on: bool = False,
+    force_auto_fill_off: bool = False,
 ) -> dict:
     """在 Step2+Step5 完成后执行双链联合收口校准并原子回刷 train+infer 产物，输出黄/红高亮日志。"""
-    new_thr, info = resolve_joint_val_infer_decision_thr_w(train_dir, infer_dir)
+    new_thr, info = resolve_joint_val_infer_decision_thr_w(
+        train_dir,
+        infer_dir,
+        force_auto_dec=force_auto_dec,
+        force_auto_min_on=force_auto_min_on,
+        force_auto_fill_off=force_auto_fill_off,
+    )
     if new_thr is None:
         return info
 
