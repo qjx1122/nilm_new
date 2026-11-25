@@ -606,3 +606,83 @@ def test_causal_prefix_isolation_keeps_boundary_points_and_blocks_test_to_train_
         sb = pb.loc[pb["split"] == sp, "pred_ridge"].to_numpy()
         np.testing.assert_allclose(sa, sb, rtol=0.0, atol=1e-12)
 
+
+def test_auto_split_2844_cross_epoch_no_inversion_and_recent_on_coverage():
+    """回归 2844 户真实 45 天跨年双时期日历（2025-07 全开 18 天 + 294 天跨年大断口 + 2026-05~06 含 4 处断口的 27 天）：
+    1) 严禁将 test 倒置在 val/train 之前（杜绝旧版 test=[05-21..05-29] 三明治倒置抽空近期黄金训练段）；
+    2) train 严格早于 val、val 严格早于 test（max(train) < min(val) < min(test)）；
+    3) train 完整保留 2026 年 5 月全部 6 个连续开机日（05-21, 05-23..05-27），96 点有效滑窗 >= 2100 且 M_max=8；
+    4) test 贴合 06-12 / 06-17 天然断口落在末尾 [06-17..06-28]，三折均具备 >=2 开 + >=2 关双覆盖。
+    """
+    from nilm.pipeline.auto_thresholds import resolve_postprocess_physical_bounds
+    from nilm.preprocess.dataset import build_windows
+
+    raw_2844 = [
+        ("2025-07-11", True, 91), ("2025-07-12", True, 96), ("2025-07-13", True, 96),
+        ("2025-07-14", True, 96), ("2025-07-15", True, 96),
+        ("2025-07-17", True, 96), ("2025-07-18", True, 96), ("2025-07-19", True, 96),
+        ("2025-07-20", True, 96), ("2025-07-21", True, 96), ("2025-07-22", True, 96),
+        ("2025-07-23", True, 96), ("2025-07-24", True, 96), ("2025-07-25", True, 96),
+        ("2025-07-26", True, 96), ("2025-07-27", True, 96), ("2025-07-28", True, 96),
+        ("2025-07-30", True, 96),
+        ("2026-05-21", True, 96), ("2026-05-22", False, 96), ("2026-05-23", True, 96),
+        ("2026-05-24", True, 96), ("2026-05-25", True, 96), ("2026-05-26", True, 96),
+        ("2026-05-27", True, 96), ("2026-05-28", False, 96), ("2026-05-29", False, 96),
+        ("2026-05-30", False, 96), ("2026-05-31", False, 96), ("2026-06-01", True, 96),
+        ("2026-06-02", False, 96), ("2026-06-03", False, 96), ("2026-06-04", False, 96),
+        ("2026-06-08", False, 95),
+        ("2026-06-12", True, 96),
+        ("2026-06-17", False, 96), ("2026-06-18", False, 96), ("2026-06-19", True, 96),
+        ("2026-06-20", True, 96), ("2026-06-21", False, 96), ("2026-06-22", True, 96),
+        ("2026-06-23", True, 96),
+        ("2026-06-26", False, 96), ("2026-06-27", True, 96), ("2026-06-28", True, 96),
+    ]
+    parts = [
+        pd.date_range(pd.Timestamp(d) + pd.Timedelta(minutes=15 * (96 - pts)), periods=pts, freq="15min")
+        for d, _, pts in raw_2844
+    ]
+    idx = parts[0].append(parts[1:])
+    assert len(idx) == 4314
+
+    tgt = pd.Series(2.0, index=idx)
+    for d, on, _ in raw_2844:
+        if on:
+            d_mask = idx.normalize() == pd.Timestamp(d)
+            # 模拟真实日内长班次开机（每日 32:80 共 48 个点 = 12 小时稳态运行，支持 M_max=8）
+            pos = np.flatnonzero(d_mask)
+            tgt.iloc[pos[24:min(len(pos), 80)]] = 620.0
+
+    masks, meta = resolve_auto_quality_split(idx, [0.6, 0.2, 0.2], target=tgt, on_thr_w=20.0)
+    _check(masks)
+    summary = summarize_split_decision(idx, masks, "auto", target=tgt, on_thr_w=20.0, auto_meta=meta)
+
+    assert meta["resolved_mode"] == "auto_contiguous_quality_blocks"
+    assert meta["chronological_order"] is True
+    assert meta["recent_cover_ok"] is True
+    assert meta["recent_epoch_start_idx"] == 18
+    assert meta["induced_islands"] == 0
+
+    tr_idx = idx[masks["train"].to_numpy()]
+    va_idx = idx[masks["val"].to_numpy()]
+    te_idx = idx[masks["test"].to_numpy()]
+    assert tr_idx.max() < va_idx.min()
+    assert va_idx.max() < te_idx.min()
+
+    tr_dates = set(pd.Series(tr_idx.normalize()).dt.strftime("%Y-%m-%d").unique())
+    for must_train_day in ("2026-05-21", "2026-05-23", "2026-05-24", "2026-05-25", "2026-05-26", "2026-05-27"):
+        assert must_train_day in tr_dates
+    te_dates = sorted(pd.Series(te_idx.normalize()).dt.strftime("%Y-%m-%d").unique())
+    assert te_dates[0] == "2026-06-17" and te_dates[-1] == "2026-06-28"
+
+    for sp in ("train", "val", "test"):
+        assert summary["by_split"][sp]["on_days"] >= 2
+        assert summary["by_split"][sp]["off_days"] >= 2
+
+    Xw, _, _ = build_windows(np.zeros((len(tr_idx), 2), np.float32),
+                             np.zeros((len(tr_idx), 1), np.float32),
+                             tr_idx, window=96, mode="seq2point")
+    assert len(Xw) >= 2100
+    bounds = resolve_postprocess_physical_bounds(tgt.loc[tr_idx].to_numpy(), tr_idx, on_thr_w=20.0)
+    assert bounds["m_max"] == 8
+
+

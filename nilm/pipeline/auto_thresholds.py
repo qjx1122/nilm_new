@@ -720,8 +720,27 @@ def resolve_auto_decision_thr_w(
     if not feasible:
         confidence = "low"
         reasons.append(f"RECALL_BELOW_{MIN_VAL_RECALL:.2f}_GUARD")
-        best_any = max(rows, key=lambda r: (r["f1"], r["recall"], -abs(r["thr"] - base_thr)))
-        selected = best_any if best_any["f1"] > baseline_row["f1"] + 1e-6 else baseline_row
+        # 欠召回止损护栏：当验证集原始召回已低于 0.95 时，首要矛盾是漏检，严禁无约束按 max(F1)
+        # 将 decision_thr_w 大幅拔高（如 2844 从 20 拔高到 250）继续吞噬残存召回率。
+        max_avail_rec = max((r["recall"] for r in rows), default=baseline_row["recall"])
+        rec_stop_floor = max(baseline_row["recall"] - 0.01, max_avail_rec - 0.02) - 1e-9
+        guarded_rows = [r for r in rows if r["recall"] >= rec_stop_floor]
+        guarded_rows, low_rec_collapse = _apply_anti_collapse_guard(
+            guarded_rows, lambda r: r, tot_neg_eval
+        )
+        if low_rec_collapse and "ANTI_COLLAPSE_SPEC_GUARD" not in reasons:
+            reasons.append("ANTI_COLLAPSE_SPEC_GUARD")
+        cand_pool = guarded_rows if guarded_rows else [baseline_row]
+        best_guarded = max(
+            cand_pool,
+            key=lambda r: (r["f1"], -r["off_day_fp"], r["recall"], -abs(r["thr"] - base_thr)),
+        )
+        if best_guarded["f1"] > baseline_row["f1"] + MIN_DECISION_F1_GAIN:
+            selected = best_guarded
+            reasons.append("LOW_RECALL_STOP_LOSS_GUARDED")
+        else:
+            selected = baseline_row
+            reasons.append("LOW_RECALL_KEEP_ON_THR_STOP_LOSS")
     else:
         best_f1 = max(r["f1"] for r in feasible)
         hi_rec_better = [
@@ -1401,13 +1420,47 @@ def resolve_auto_postprocess_and_decision_thr(
     if not feasible_keys:
         confidence = "low"
         reasons.append(f"RECALL_BELOW_{MIN_VAL_RECALL:.2f}_GUARD")
-        all_keys = [(c, m_anchor, k_anchor) for c in c_cands]
-        best_any_k = max(all_keys, key=lambda key: (table[key]["f1"], table[key]["recall"], -abs(key[0] - base_thr)))
-        sel_c, sel_m, sel_k = (
-            best_any_k
-            if table[best_any_k]["f1"] > on_anchor_row["f1"] + 1e-6
-            else (c_ref_on, m_anchor, k_anchor)
+        # 欠召回 3D 止损护栏：当无任何 (c, m, k) 达到 recall >= 0.95 时，严禁回退无约束 max(F1)
+        # 将幅值阈值拔高至上界（如 2844 从 20 飙升至 250），同时保留不进一步折损召回的安全 3D 游程滤波 (m, k)。
+        max_anchor_rec = max(
+            (table[(c, m_anchor, k_anchor)]["recall"] for c in c_cands),
+            default=on_anchor_row["recall"],
         )
+        rec_stop_floor = max(on_anchor_row["recall"] - 0.01, max_anchor_rec - 0.02) - 1e-9
+        guarded_keys: list[tuple[float, int, int]] = []
+        for c in c_cands:
+            for m in m_cands:
+                for k in k_cands:
+                    row = table[(c, m, k)]
+                    if row["recall"] < rec_stop_floor:
+                        continue
+                    if m > m_anchor and row["recall"] < table[(c, m_anchor, k)]["recall"] - 0.02 - 1e-9:
+                        continue
+                    if k_is_auto and has_off_days and k > 0:
+                        if row["off_day_fp"] > table[(c, m, 0)]["off_day_fp"]:
+                            continue
+                    guarded_keys.append((c, m, k))
+        guarded_keys, low_rec_collapse_3d = _apply_anti_collapse_guard(
+            guarded_keys, lambda key: table[key], tot_neg_3d
+        )
+        if low_rec_collapse_3d and "ANTI_COLLAPSE_SPEC_GUARD" not in reasons:
+            reasons.append("ANTI_COLLAPSE_SPEC_GUARD")
+
+        if guarded_keys and max_anchor_rec > 1e-9:
+            cand_guard_key = max(guarded_keys, key=_occam_score)
+            cand_guard_row = table[cand_guard_key]
+            off_fp_saved_g = on_anchor_row["off_day_fp"] - cand_guard_row["off_day_fp"]
+            off_fp_cleared_g = on_anchor_row["off_day_fp"] > 0 and cand_guard_row["off_day_fp"] == 0
+            f1_gain_g = cand_guard_row["f1"] - on_anchor_row["f1"]
+            if f1_gain_g >= MIN_DECISION_F1_GAIN or off_fp_saved_g >= 2 or off_fp_cleared_g:
+                sel_c, sel_m, sel_k = cand_guard_key
+                reasons.append(f"LOW_RECALL_STOP_LOSS_3D_GUARDED(m={sel_m},k={sel_k})")
+            else:
+                sel_c, sel_m, sel_k = (c_ref_on, m_anchor, k_anchor)
+                reasons.append("LOW_RECALL_KEEP_ON_THR_STOP_LOSS")
+        else:
+            sel_c, sel_m, sel_k = (c_ref_on, m_anchor, k_anchor)
+            reasons.append("LOW_RECALL_KEEP_ON_THR_STOP_LOSS")
     else:
         cand_best_key = max(feasible_keys, key=_occam_score)
         cand_row = table[cand_best_key]
@@ -2003,9 +2056,13 @@ def resolve_joint_val_infer_decision_thr_w(
         if not joint_feas_3d:
             confidence = "low"
             reasons_3d.append("RECALL_BELOW_095_GUARD")
+            max_inf_rec_3d = max((inf_tab[key]["recall"] for key in all_cand_3d), default=inf_tab[cur_3d]["recall"])
+            rec_floor_3d = max(inf_tab[cur_3d]["recall"] - 0.01, max_inf_rec_3d - 0.02) - 1e-9
+            guarded_inf_3d = [key for key in all_cand_3d if inf_tab[key]["recall"] >= rec_floor_3d]
+            pool_3d = guarded_inf_3d if guarded_inf_3d else [cur_3d]
             best_key = max(
-                all_cand_3d,
-                key=lambda key: (inf_tab[key]["f1"], inf_tab[key]["recall"], -abs(key[0] - cur_dec)),
+                pool_3d,
+                key=lambda key: (inf_tab[key]["f1"], -inf_tab[key]["off_day_fp"], inf_tab[key]["recall"], -abs(key[0] - cur_dec)),
             )
         else:
             cand_joint_key = max(joint_feas_3d, key=lambda key: _inf_reg_score(key, include_val=True))
@@ -2169,7 +2226,14 @@ def resolve_joint_val_infer_decision_thr_w(
     if not joint_feas:
         confidence = "low"
         reasons.append("RECALL_BELOW_095_GUARD")
-        best_c = max(cands, key=lambda c: (inf_map[c]["f1"], inf_map[c]["recall"], -abs(c - cur_dec)))
+        max_inf_rec_1d = max((inf_map[c]["recall"] for c in cands), default=inf_map[cur_key]["recall"])
+        rec_floor_1d = max(inf_map[cur_key]["recall"] - 0.01, max_inf_rec_1d - 0.02) - 1e-9
+        guarded_inf_1d = [c for c in cands if inf_map[c]["recall"] >= rec_floor_1d]
+        pool_1d = guarded_inf_1d if guarded_inf_1d else [cur_key]
+        best_c = max(
+            pool_1d,
+            key=lambda c: (inf_map[c]["f1"], -inf_map[c]["off_day_fp"], inf_map[c]["recall"], -abs(c - cur_dec)),
+        )
     else:
         best_inf_f1 = max(inf_map[c]["f1"] for c in joint_feas)
         cur_inf = inf_map[cur_key]

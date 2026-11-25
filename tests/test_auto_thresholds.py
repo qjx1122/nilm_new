@@ -1870,3 +1870,74 @@ def test_auto_run_explicit_auto_requires_force_and_save_config_to_update_orig_js
     assert saved_after_all["pbus_mode"] in ("raw", "scaled")
     assert saved_after_all["pbus_mode"] == tr_meta_all["pbus_mode"]
     assert audit_main(["--run-root", str(out_root / USER_KEY)]) == 0
+
+
+def test_2844_low_recall_stop_loss_blocks_250w_runaway_in_1d_and_3d():
+    """回归 2844 户 RECALL_BELOW_0.95_GUARD 极端场景：
+    当验证集原始召回率已低于 0.95（如 ~0.80）且全关日存在高幅短毛刺虚报时：
+    1) 1D 与 3D 自动定参严禁退化为无召回止损的纯 max(F1) 搜索将 decision_thr_w 推高至 ~250.0 继续吞噬召回；
+    2) 选定方案的验证集召回率相对于 on_thr_w 锚点折损严格 <= 0.015；
+    3) 3D 协同定参保留安全游程滤波（提升 post_min_on、抑制全关日桥接），在不拔高幅值阈值的前提下清除全关日虚报。
+    """
+    from nilm.pipeline.auto_thresholds import (
+        resolve_auto_postprocess_and_decision_thr,
+        resolve_postprocess_physical_bounds,
+    )
+
+    # 构造与 2844 同构的训练集真值（P10(y_on) ≈ 578，M_max=4, K_max=6）
+    idx_tr = pd.date_range("2026-05-01 00:00:00", periods=12 * 96, freq="15min")
+    y_tr = np.zeros(len(idx_tr), dtype=np.float64)
+    for d in range(12):
+        b = d * 96
+        if d % 3 == 0:
+            y_tr[b + 20: b + 26] = 578.36  # 6 窗短班次将 M_max 限制在 4
+        else:
+            y_tr[b + 20: b + 68] = 620.0
+    bounds = resolve_postprocess_physical_bounds(y_tr, idx_tr, on_thr_w=20.0)
+    assert bounds["m_max"] == 4
+
+    # 构造 10 天验证集（6 开 + 4 全关）：
+    # - 6 个开机日共 240 个真开机点：其中 48 点漏检 (<20，使原始 recall=0.80 < 0.95)，
+    #   另有 72 点处于欠估带 (65.0，若阈值飙升至 250 会额外再砍掉 30% 召回至 0.50！)，其余 120 点为 580.0；
+    # - 4 个全关日存在大量 2 窗高幅短毛刺 (180.0，间隔 2 窗，使得旧版 m=1,k=3 桥接产生大面积 FP，诱骗无约束 max(F1) 飙到 250)。
+    idx_val = pd.date_range("2026-06-17 00:00:00", periods=10 * 96, freq="15min")
+    y_val = np.zeros(len(idx_val), dtype=np.float64)
+    p_val = np.full(len(idx_val), 3.0, dtype=np.float64)
+    for d in range(10):
+        b = d * 96
+        if d in (2, 3, 5, 6, 8, 9):  # 6 个开机日，每日 40 点开机
+            y_val[b + 24: b + 64] = 600.0
+            p_val[b + 24: b + 32] = 8.0      # 8 点漏检 -> 基准 recall = 32/40 = 0.80 < 0.95
+            p_val[b + 32: b + 44] = 65.0     # 12 点轻载欠估段（必须被止损护栏保住！）
+            p_val[b + 44: b + 64] = 580.0    # 20 点满载段
+        else:  # 4 个全关日：多组相距 2 窗的 2 窗高幅毛刺 (180.0)
+            for s in range(8, 84, 8):
+                p_val[b + s: b + s + 2] = 180.0
+                p_val[b + s + 4: b + s + 6] = 180.0
+
+    # 1) 检验 1D 自动定参：触发 RECALL_BELOW_0.95_GUARD 且绝不飙升到 >65 砍掉欠估开机段
+    dec_1d, info_1d = resolve_auto_decision_thr_w(
+        y_train=y_tr, y_val=y_val, pred_val=p_val, val_index=idx_val,
+        on_thr_w=20.0, post_min_on=1, post_fill_off=3, calibrated_model="transformer",
+        pbus_mode="scaled",
+    )
+    assert info_1d["confidence"] == "low"
+    assert "RECALL_BELOW_0.95_GUARD" in info_1d["reasons"]
+    assert dec_1d < 65.0
+    base_1d_rec = min(info_1d["candidates"], key=lambda r: abs(r["thr"] - 20.0))["recall"]
+    assert info_1d["val_recall_selected"] >= base_1d_rec - 0.015
+
+    # 2) 检验 3D 协同定参：保持低阈值 (<65) 保住 0.80 召回率，同时自动启用 m>=3, k=0 滤净全关日高幅短毛刺！
+    dec_3d, mo_3d, fo_3d, dec_info_3d, pp_info_3d = resolve_auto_postprocess_and_decision_thr(
+        y_train=y_tr, y_val=y_val, pred_val=p_val, val_index=idx_val,
+        on_thr_w=20.0, cfg_decision_thr_w="auto", cfg_post_min_on="auto", cfg_post_fill_off="auto",
+        bounds=bounds, calibrated_model="transformer", pbus_mode="scaled",
+    )
+    assert pp_info_3d["confidence"] == "low"
+    assert "RECALL_BELOW_0.95_GUARD" in pp_info_3d["reasons"]
+    assert any("LOW_RECALL_STOP_LOSS_3D_GUARDED" in r for r in pp_info_3d["reasons"])
+    assert dec_3d < 65.0
+    assert mo_3d >= 3
+    assert pp_info_3d["val_off_fp_after"] == 0
+    assert pp_info_3d["val_recall_after"] >= 0.79
+

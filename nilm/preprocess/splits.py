@@ -426,15 +426,51 @@ def _pick_best_two_slices(
     if has_state:
         on_arr = prof["is_on"].to_numpy(bool).astype(np.int64)
         off_arr = 1 - on_arr
+        contig_on_arr = (
+            (on_arr == 1)
+            & (prof["block_len"].to_numpy(np.int64) >= 2)
+            & (prof["n_points"].to_numpy(np.int64) >= 88)
+        ).astype(np.int64)
         ps_on = np.concatenate([[0], np.cumsum(on_arr)])
         ps_off = np.concatenate([[0], np.cumsum(off_arr)])
+        ps_contig_on = np.concatenate([[0], np.cumsum(contig_on_arr)])
         tot_on = int(ps_on[-1])
         tot_off = int(ps_off[-1])
         pool_off_rate = tot_off / n if n > 0 else 0.0
     else:
-        ps_on = ps_off = None
+        ps_on = ps_off = ps_contig_on = None
         tot_on = tot_off = 0
         pool_off_rate = 0.0
+
+    # 检测跨多周/跨季节大断口（缺数 >= 21 天，且前后时期均具实质规模）：
+    # 防止像 2844（2025-07 全开 18d + 10 个月断口 + 2026-05~06 混合 27d）那样把近期连续开机段抽空，
+    # 或用远古 100% 全开期稀释后的池均关机率误杀近期顺时序切分。
+    recent_start = 0
+    if "day_ts" in prof.columns and n >= 18:
+        days_ts = prof["day_ts"].tolist()
+        for i in range(1, n):
+            if (days_ts[i] - days_ts[i - 1]).days - 1 >= 21 and i >= 5 and (n - i) >= 12:
+                recent_start = i
+
+    if recent_start > 0 and has_state and ps_on is not None and ps_off is not None and ps_contig_on is not None:
+        n_rec = n - recent_start
+        rec_off_tot = int(ps_off[n] - ps_off[recent_start])
+        rec_contig_on_tot = int(ps_contig_on[n] - ps_contig_on[recent_start])
+        hist_off_rate = float(ps_off[recent_start]) / float(recent_start)
+        rec_off_rate = float(rec_off_tot) / float(n_rec)
+        epoch_off_shift = abs(hist_off_rate - rec_off_rate) >= 0.25
+        if n_rec >= (n_va + n_te + 4) and rec_contig_on_tot >= 4:
+            rec_tr_avail = n_rec - n_va - n_te
+            min_rec_tr_contig_on = min(rec_contig_on_tot // 2, max(2, min(4, rec_tr_avail // 2)))
+        else:
+            min_rec_tr_contig_on = 0
+    else:
+        n_rec = 0
+        rec_off_tot = 0
+        rec_contig_on_tot = 0
+        rec_off_rate = pool_off_rate
+        epoch_off_shift = False
+        min_rec_tr_contig_on = 0
 
     va_starts = _candidate_starts(n, n_va, gap_before)
     te_starts = _candidate_starts(n, n_te, gap_before)
@@ -462,15 +498,45 @@ def _pick_best_two_slices(
                     on_tr >= req_on[0] and on_va >= req_on[1] and on_te >= req_on[2]
                     and off_tr >= req_off[0] and off_va >= req_off[1] and off_te >= req_off[2]
                 )
+                recent_cover_ok = True
+                if min_rec_tr_contig_on > 0 and ps_contig_on is not None:
+                    va_r0, va_r1 = max(v0, recent_start), max(v1, recent_start)
+                    te_r0, te_r1 = max(t0, recent_start), max(t1, recent_start)
+                    rec_contig_on_tr = (
+                        rec_contig_on_tot
+                        - (int(ps_contig_on[va_r1] - ps_contig_on[va_r0]) if n_va > 0 else 0)
+                        - (int(ps_contig_on[te_r1] - ps_contig_on[te_r0]) if n_te > 0 else 0)
+                    )
+                    recent_cover_ok = rec_contig_on_tr >= min_rec_tr_contig_on
+
                 skews = []
                 for cnt_off, cnt_tot in ((off_tr, n_tr), (off_va, n_va), (off_te, n_te)):
                     if cnt_tot >= 2:
                         skews.append(abs(cnt_off / cnt_tot - pool_off_rate))
                 max_skew = max(skews) if skews else 0.0
                 mean_skew = float(np.mean(skews)) if skews else 0.0
-                skew_ok = True if enforce_skew_cap is None else (max_skew <= enforce_skew_cap)
+                if enforce_skew_cap is None:
+                    skew_ok = True
+                elif epoch_off_shift and v0 >= recent_start and t0 >= recent_start:
+                    rec_skews: list[float] = []
+                    if n_va >= 2:
+                        rec_skews.append(abs(off_va / n_va - rec_off_rate))
+                    if n_te >= 2:
+                        rec_skews.append(abs(off_te / n_te - rec_off_rate))
+                    rec_tr_days = n_rec - n_va - n_te
+                    if rec_tr_days >= 2:
+                        rec_off_tr = rec_off_tot - off_va - off_te
+                        rec_skews.append(abs(rec_off_tr / rec_tr_days - rec_off_rate))
+                    max_rec_skew = max(rec_skews) if rec_skews else 0.0
+                    mean_rec_skew = float(np.mean(rec_skews)) if rec_skews else 0.0
+                    skew_ok = (max_skew <= enforce_skew_cap) or (max_rec_skew <= max(enforce_skew_cap, 0.30))
+                    mean_skew = 0.5 * mean_skew + 0.5 * mean_rec_skew
+                    max_skew = min(max_skew, max_rec_skew)
+                else:
+                    skew_ok = max_skew <= enforce_skew_cap
             else:
                 cover_ok = True
+                recent_cover_ok = True
                 skew_ok = True
                 max_skew = 0.0
                 mean_skew = 0.0
@@ -558,7 +624,17 @@ def _pick_best_two_slices(
                 tail_tc = float(ps_tc[n] - ps_tc[cursor])
                 if tail_len > 0 and (tail_tc / tail_len) < 0.5:
                     future_tail_pen = 10.0 + 1.5 * (tail_len - tail_tc)
-            split_apart_pen = 6.0 if (n_va > 0 and n_te > 0 and v0 < t0 and v1 < t0) else 0.0
+            # 对称分离/三明治夹层保护 + 顺时序因果保护（禁止 test 倒置在 val 之前，或无故把好天夹在 val/test 之间塞回 train）
+            split_apart_pen = 0.0
+            if len(intervals) == 2 and intervals[0][1] < intervals[1][0]:
+                mid_s0, mid_s1 = intervals[0][1], intervals[1][0]
+                mid_len = mid_s1 - mid_s0
+                mid_tc = float(ps_tc[mid_s1] - ps_tc[mid_s0])
+                if mid_len > 0 and (mid_tc / mid_len) < 0.5:
+                    split_apart_pen = 16.0 + 2.5 * (mid_len - mid_tc)
+                else:
+                    split_apart_pen = 4.0
+            chrono_inv_pen = 18.0 if (n_va > 0 and n_te > 0 and t0 < v0) else 0.0
             eff_art_cuts = max(0, art_cuts - recovery_cuts)
             cont_util = (
                 2.5 * nat_cuts
@@ -569,6 +645,7 @@ def _pick_best_two_slices(
                 - 6.0 * induced_islands
                 - future_tail_pen
                 - split_apart_pen
+                - chrono_inv_pen
             )
 
             # 开关均衡度与时序近端偏好
@@ -580,7 +657,8 @@ def _pick_best_two_slices(
 
             total_util = q_util + cont_util + bal_util + rec_util
             cand_key = (
-                1 if (cover_ok and skew_ok) else 0,
+                1 if (cover_ok and recent_cover_ok and skew_ok) else 0,
+                1 if (cover_ok and recent_cover_ok) else 0,
                 1 if cover_ok else 0,
                 round(total_util, 6),
                 v0,
@@ -591,7 +669,10 @@ def _pick_best_two_slices(
                 best_pair = (v0, t0)
                 best_diag = {
                     "cover_ok": bool(cover_ok),
+                    "recent_cover_ok": bool(recent_cover_ok),
                     "skew_ok": bool(skew_ok),
+                    "chronological_order": bool(n_va == 0 or n_te == 0 or v0 < t0),
+                    "recent_epoch_start_idx": int(recent_start),
                     "max_off_skew": round(float(max_skew), 4),
                     "mean_off_skew": round(float(mean_skew), 4),
                     "natural_gap_cuts": int(nat_cuts),
@@ -693,7 +774,8 @@ def resolve_auto_quality_split(
     # 或吞入断口后半天残缺恢复日（如 733 户 39 天下 8+8=16 越过 06-13~14 断口）时，允许微调 ±1 天贴合连续满点块
     cand_quotas: list[tuple[int, int]] = [(n_va_base, n_te_base)]
     if n_days >= 14 and n_va_base >= 3 and n_te_base >= 3:
-        max_diff = max(1, abs(n_va_base - n_te_base) + 1)
+        base_tol = 2 if (n_va_base >= 8 and n_te_base >= 8) else 1
+        max_diff = max(base_tol, abs(n_va_base - n_te_base) + 1)
         for dv in (-1, 0, 1):
             for dt in (-1, 0, 1):
                 if dv == 0 and dt == 0:
@@ -737,7 +819,12 @@ def resolve_auto_quality_split(
         extra_quota_err = max(0.0, cand_quota_err - base_quota_err)
         adj_util = float(c_diag.get("utility_score", 0.0)) - 2.2 * extra_quota_err
         c_key = (
-            1 if (c_diag.get("cover_ok", False) and c_diag.get("skew_ok", True)) else 0,
+            1 if (
+                c_diag.get("cover_ok", False)
+                and c_diag.get("recent_cover_ok", True)
+                and c_diag.get("skew_ok", True)
+            ) else 0,
+            1 if (c_diag.get("cover_ok", False) and c_diag.get("recent_cover_ok", True)) else 0,
             1 if c_diag.get("cover_ok", False) else 0,
             round(adj_util, 6),
             -dev_days,
