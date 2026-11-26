@@ -4,7 +4,7 @@
 > **版本**：v1.2 详细版（2026-09-10，对齐 `REPORT.md v1.1 + NILM_DATA_DICT v0.2.10 + REPORT_TEST 专题集 + base_optimal lag5[5,1,2,3,4]`）+ 五大核心参数（`pbus_mode / on_thr_w / decision_thr_w / post_min_on / post_fill_short_off`）自动定参专题详解与 `901` 边界复盘｜协议：`BOOTSTRAP.md v2.2`｜分支：`arena/01a0896c-nilm-new`  
 > **一句话定位**：用总线侧 5 分钟电表（电压电流有功功率因数）去猜分路侧 15 分钟电表（某一路 `p1/p2/p3...` 的有功）此刻是“开 1”还是“关 0”、功率是多少瓦。模型只看过去 24 小时（96 点）的功率走势，不看高频谐波。
 
-**怎么用本手册**：按顺序读，`Step 0-7` 是必做流水线（`Step1` 拆 `1a探数定阈(5min)+1b写配置`，仍计8步）；`§4-6` 是解释为什么；`§7-9` 是上线门禁与排障；`附录` 是可直接复制的模板。遇到报错先查 `§9 战史`，再查 `§10 FAQ`。
+**怎么用本手册**：按顺序读，`Step 0-7` 是必做流水线（`Step1` 拆 `1a探数定阈(5min)+1b写配置`，仍计8步）；`§4-6` 是解释为什么；`§7-10` 是上线门禁与排障；`附录` 是可直接复制的模板。遇到报错先查 `§10 战史`，再查 `§11 FAQ`。
 
 ---
 
@@ -18,10 +18,10 @@
 6. [推理后看哪两个表（能力 vs 交付）](#6-推理后看哪两个表能力-vs-交付)
 7. [生产 7 项放行（缺一不可，含不合格长什么样）](#7-生产-7-项放行缺一不可含不合格长什么样)
 8. [部署架构与日常运维（批量、断点、月历）](#8-部署架构与日常运维批量断点月历)
-9. [战史：我们犯过的 8 个错（别再踩）](#9-战史我们犯过的-8-个错别再踩)
-10. [常见问题 18 问](#10-常见问题-18-问)
-11. [附录：模板与速查卡](#11-附录模板与速查卡)
-12. [通用模型：跨用户验证与调优流程](#通用模型专章跨用户泛化验证最终训练与调优流程pooled)
+9. [通用模型：跨用户泛化验证与调优流程（pooled）](#9-通用模型跨用户泛化验证与调优流程pooled)
+10. [战史：我们犯过的 8 个错（别再踩）](#10-战史我们犯过的-8-个错别再踩)
+11. [常见问题 18 问](#11-常见问题-18-问)
+12. [附录：模板与速查卡](#12-附录模板与速查卡)
 
 ---
 
@@ -207,97 +207,6 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 python -c "import pandas,glob;f=sorted(glob.glob('outputs/900080270900_4200000000001/train/*/train_window_index.csv'))[-1];w=pandas.read_csv(f);s=pandas.to_datetime(w.win_end)-pandas.to_datetime(w.win_start);print('windows',len(w),'cross_gap',(s>pandas.Timedelta('23h45m')).sum(),'max',s.max())"
 # 期望 cross_gap 0，max 23.75h（L96）。2842 修复前 1045 跨洞最长 231 天，修复后 0。
 ```
-
-### 通用模型专章：跨用户泛化验证、最终训练与调优流程（pooled）
-
-本专章针对“用部分用户训练共享模型，再推理未参与训练的新用户，或已有用户未来的新数据”。它使用独立链路 `scripts/run_pooled.py` + `configs/base_universal.yaml`，**不是**单用户命令 `auto_run_steps2to5.py` 的 `--split-strategy auto`，两者不可混为一谈。
-
-> **适用前提**：池中用户的 `target_col` 必须代表同一种物理负荷/设备语义（例如都确认 `p1` 是同类设备）；各用户总线字段映射、PT/CT 变比、分路单位和标签阈值也必须可信。只因 CSV 列名同为 `p1`，不能证明设备语义相同。
-
-#### A. 建立训练用户池与独立最终留出用户
-
-建议先做用户级清单，至少记录 `user_key / target_col及设备语义 / PT·CT / branch_scale / 有效双达标天 / on_thr来源 / 是否有全关日 / 目标功率范围`。按设备类型与工况选有代表性的开发用户；另留至少一个**不参与模型/超参/阈值选择**的最终审计用户。若用户数少，必须在报告中说明结论的外推范围很有限。
-
-`--users` 指定此次池化训练使用的用户；未指定时脚本会扫描 `data/trains` 下所有合法用户。不同 `target_col` 不应混池；当前脚本按列名过滤，配置不一致会跳过用户并写告警。
-
-```powershell
-# 使用三个开发用户做 LOUO；每次轮流把一个完整用户留作 test
-python scripts/run_pooled.py `
-  --time-filter-config configs/time_filters.json `
-  --base-config configs/base_universal.yaml `
-  --data-root data --output-root outputs --target-col p1 `
-  --stage train --users <开发用户A> <开发用户B> <开发用户C> --loo
-```
-
-配置的 `pooled.val_ratio` 默认 `0.2`，`pooled.split_strategy` 默认 `stratified_by_state`。LOUO 每折的用户关系是：训练用户内部逐用户按日切 train/val；留出用户的全部可用日期只进 test，不参与模型拟合。记录输出目录和各折留出用户身份，检查：
-
-- `louo_summary.csv/json`：按留出用户聚合的 LOUO 总结；
-- `loo_hold_<user_key>/metrics_by_user.csv`：每个模型在各用户上的逐用户指标；
-- 每折 `meta.json`、`metrics_by_split.csv`、`metrics_daily.csv`、`models/`：切分、scaler 与模型产物。
-
-LOUO 目录是**验证产物，不是部署模型目录**。代码中的 `latest_universal_dir()` 查找带顶层 `_DONE` 的普通 pooled 训练目录；LOUO 模型保存在折子目录，不应直接当作最终通用模型使用。
-
-#### B. 评估泛化，不要只看池化平均分
-
-按以下顺序验收：
-
-1. **先查每折数据和用户身份**：每个用户在 train/val/test 的日期、有效点数、质量剔除日期、`cap`、`on_thr_w`；确认 held-out user 没被放进该折 train。
-2. **看逐用户、逐模型**：重点检查最差用户及不同量级用户，不只看 macro 平均。一个大用户表现很好不能抵消另一用户完全失效；当前训练损失按拼接后的逐点样本计算，没有按用户均衡损失权重，因此有效点多的用户会贡献更多梯度。
-3. **区分回归泛化与状态阈值泛化**：`MAE/RMSE` 衡量瓦数预测；`F1/precision/recall` 还依赖每用户 `on_thr_w`。当前 `_load_user_preprocessed()` 对 `on_thr_w="auto"` 会用该用户标签估值；因此 LOUO 的自动阈值指标不是严格的“完全无新用户标签”状态泛化测试。严格零样本评估须为 held-out 用户提供事先冻结、独立于 test 标签确定的物理阈值，并在报告中记录来源。
-4. **看日级与负样本**：检查全关日、夜间关态、休息日及不同开机时长；池里若没有全关日，LOUO 也无法证明模型能识别整天停机。`metrics_daily.csv` 的 pooled 日级 F1 使用池内 `on_thr` 中位数作诊断阈值（代码注释标为近似口径）；异质用户的精确分类汇总优先看 `metrics_by_user.csv`。
-5. **保留最终未触碰用户**：用开发用户 LOUO 选模型/调参数之后，再对未参与这些决策的审计用户做一次最终留出评估。用同一份 LOUO 结果反复选模型、调参数再汇报该分数，会产生测试集选择偏差。
-
-**推荐放行门槛不是固定一条 F1 数字**：先由业务定义用户可接受的 MAE 上限、最低 recall、误报/漏报代价和最差用户底线；再检查最差留出用户是否满足。没有达到底线时，不要把模型标记为通用，应缩小适用用户范围、补充代表性训练用户或改进特征/模型后重新做独立 LOUO。
-
-#### C. 比较模型与调参（先比较，再定部署模型）
-
-`configs/base_universal.yaml` 当前示例模型是 `ridge` 与 `transformer`。建议逐轮只改一类因素，并重复 LOUO：
-
-1. **基线**：固定开发用户、字段/阈值、`seed`、质量策略与特征，先跑默认 ridge + transformer，保存完整产物。
-2. **模型选择**：比较每用户及留出用户最差结果，而非仅比较点级池化分数。`history_profile`/`proportional` 不在通用配置的默认候选模型中；它们不等价于可迁移的共享参数模型。
-3. **特征与模型参数**：每次只调整 `features.lags`、`rolling_windows` 或具体模型参数，记下 LOUO 每用户结果和变动；避免因同一批 LOUO 用户反复调参后仍把其作为无偏最终测试。
-4. **用户采样与均衡**：检查各用户有效训练点占比；若一个用户支配样本池，先从数据构成或训练权重层面处理，并重新做 LOUO。当前实现没有用户等权 loss，宏平均评估不能补救训练时的样本权重失衡。
-5. **模型落盘选择必须显式**：`run_pooled_infer()` 当前默认使用 `user_cfg.infer_model`、`base_cfg.infer_model`，否则取 `meta["models"][0]`。示例配置里 `ridge` 排在第一，因此不会自动根据 LOUO 选出 transformer。选定模型后，在顶层 `time_filters.json` 配 `"infer_model": "ridge"`（共享默认）或目标用户配置中指定；再确认推理日志中的实际模型名与 LOUO 决策一致。
-
-**不要把单用户的 `--on-thr/--decision-thr/--min-on/--fill-off` 自动定参能力假定为已迁移到 pooled。** 当前 pooled 训练保存 `caps`、`on_thr_map`、全局 scaler 和模型，但没有生成完整的通用 `decision_thr_map/postprocess_map` 校准表；推理时 `decision_thr_w="auto"` 若找不到对应模型阈值会回退到 `on_thr_w`。无标签新用户的 `on_thr_w="auto"` 也会回退到 `10.0`，不是从新用户分路标签自动校准出的阈值。正式交付状态判决前，应使用设备台账给定并显式配置的 `on_thr_w` 与合适的 `decision_thr_w`；如果没有物理阈值或少量标注校准数据，应只把 `pred` 当回归输出，不能宣称 `pred_state` 已跨用户校准。
-
-#### D. 训练最终通用模型，再推理新用户
-
-通过开发 LOUO 后，使用纳入的开发用户训练**非 LOO**最终模型（此时 train/val 来自各个开发用户，模型保存于 `outputs/universal/<target_col>/train/<时间戳>/`）：
-
-```powershell
-python scripts/run_pooled.py `
-  --time-filter-config configs/time_filters.json `
-  --base-config configs/base_universal.yaml `
-  --data-root data --output-root outputs --target-col p1 `
-  --stage train --users <最终纳入用户A> <最终纳入用户B> <最终纳入用户C>
-```
-
-新用户总线放在 `data/infers/<user_key>/`，配置中明确 `target_col`、`pt_ratio`、`ct_ratio`、`branch_scale` 与人工核实的状态阈值。按选定训练目录显式推理：
-
-```powershell
-python scripts/run_pooled.py `
-  --time-filter-config configs/time_filters.json `
-  --base-config configs/base_universal.yaml `
-  --data-root data --output-root outputs --target-col p1 `
-  --stage infer --user-key <新用户key> `
-  --universal-dir outputs/universal/p1/train/<最终训练时间戳>
-```
-
-检查 `outputs/universal/p1/infer/<时间戳>/predictions/inference_result.csv`、推理 `meta.json` 中的模型名/cap/阈值，以及若有标签时的 `offline_metrics.json`。新用户若没有分路标签，无法计算真实 MAE/F1；应另行收集人工/仪表核验期，不能把输出文件成功生成当成泛化验证通过。
-
-#### E. 老用户未来新数据：当前能力边界与验证要求
-
-老用户未来工况是**时间外泛化**，与 LOUO 的“整户未见”问题不同。当前 pooled 切分器为池内用户分 train/val（无独立时间外 test），且 `pooled_task._load_user_preprocessed()` 目前在训练与推理路径都读取 `user_cfg["train"]` 时间过滤。因此，不能不核对配置就假设 `infer` 时间窗会自动按 `infer.include` 正确筛选；若训练时间窗把未来日期排除，可能造成推理样本被过滤为空或不符合预期。
-
-在代码完成推理期 `infer` 时间窗过滤与“已知用户历史训练 / 未来日期独立 test”切分支持前：
-
-- 将“LOUO 未见用户”与“老用户未来日期”分开报告，不用前者代替后者；
-- 推理前核对训练产物的 `meta.json`、用户 `train.include/exclude`、待推理日期范围和实际输出行数；
-- 用独立的未来标注期做时间外测试，且不能用该期挑模型、调特征或校准阈值后再报告同一测试分数；
-- 如果发现日期过滤、阈值来源或目标量纲不清楚，先停止上线验收，不要用零行/少量行产物或训练集分数宣称已验证泛化。
-
-**最终交付检查卡**：① 目标设备语义一致；② 单位与 PT/CT 对齐；③ 开发用户 LOUO 逐用户通过；④ 留有未触碰审计用户；⑤ 最终模型为非 LOO 产物；⑥ `infer_model` 显式匹配验证结论；⑦ 状态阈值有物理/标注来源；⑧ 新用户与老用户未来数据分别做了真实标签验证；⑨ 当前推理时间过滤边界已逐项核实。
 
 ### Step 4 选阈值（不动模型，零成本离线扫，核心）
 
@@ -648,7 +557,7 @@ python scripts/auto_run_steps2to5.py --user-key <device>_<user> --stage sync-thr
 | 6 | 阈值校准 | `threshold_sweep` 已扫且 `decision` 不破 `R0.95`，`test链不净降` | 7月 `400` 在 6月 `R 0.43` 净降 -0.17 → 静态阈不可跨月，需月扫 | `state_strategy` / `sweep` 曲线 |
 | 7 | 模型择优 | `comparison` best 稳定，`offline` 与 `metrics_by_split test` 逐位一致 | `best` 随阈抖动 → 误把交付口径当选型依据 | `comparison.csv` |
 
-> 7项全绿即可与 4 户同口径并入 `outputs/batch` 调度。任一项红→按 `§9 战史` 定向排障，不盲调参。
+> 7项全绿即可与 4 户同口径并入 `outputs/batch` 调度。任一项红→按 `§10 战史` 定向排障，不盲调参。
 
 ---
 
@@ -674,7 +583,98 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 ---
 
-## 9. 战史：我们犯过的 8 个错（别再踩）
+## 9. 通用模型：跨用户泛化验证与调优流程（pooled）
+
+本专章针对“用部分用户训练共享模型，再推理未参与训练的新用户，或已有用户未来的新数据”。它使用独立链路 `scripts/run_pooled.py` + `configs/base_universal.yaml`，**不是**单用户命令 `auto_run_steps2to5.py` 的 `--split-strategy auto`，两者不可混为一谈。
+
+> **适用前提**：池中用户的 `target_col` 必须代表同一种物理负荷/设备语义（例如都确认 `p1` 是同类设备）；各用户总线字段映射、PT/CT 变比、分路单位和标签阈值也必须可信。只因 CSV 列名同为 `p1`，不能证明设备语义相同。
+
+#### A. 建立训练用户池与独立最终留出用户
+
+建议先做用户级清单，至少记录 `user_key / target_col及设备语义 / PT·CT / branch_scale / 有效双达标天 / on_thr来源 / 是否有全关日 / 目标功率范围`。按设备类型与工况选有代表性的开发用户；另留至少一个**不参与模型/超参/阈值选择**的最终审计用户。若用户数少，必须在报告中说明结论的外推范围很有限。
+
+`--users` 指定此次池化训练使用的用户；未指定时脚本会扫描 `data/trains` 下所有合法用户。不同 `target_col` 不应混池；当前脚本按列名过滤，配置不一致会跳过用户并写告警。
+
+```powershell
+# 使用三个开发用户做 LOUO；每次轮流把一个完整用户留作 test
+python scripts/run_pooled.py `
+  --time-filter-config configs/time_filters.json `
+  --base-config configs/base_universal.yaml `
+  --data-root data --output-root outputs --target-col p1 `
+  --stage train --users <开发用户A> <开发用户B> <开发用户C> --loo
+```
+
+配置的 `pooled.val_ratio` 默认 `0.2`，`pooled.split_strategy` 默认 `stratified_by_state`。LOUO 每折的用户关系是：训练用户内部逐用户按日切 train/val；留出用户的全部可用日期只进 test，不参与模型拟合。记录输出目录和各折留出用户身份，检查：
+
+- `louo_summary.csv/json`：按留出用户聚合的 LOUO 总结；
+- `loo_hold_<user_key>/metrics_by_user.csv`：每个模型在各用户上的逐用户指标；
+- 每折 `meta.json`、`metrics_by_split.csv`、`metrics_daily.csv`、`models/`：切分、scaler 与模型产物。
+
+LOUO 目录是**验证产物，不是部署模型目录**。代码中的 `latest_universal_dir()` 查找带顶层 `_DONE` 的普通 pooled 训练目录；LOUO 模型保存在折子目录，不应直接当作最终通用模型使用。
+
+#### B. 评估泛化，不要只看池化平均分
+
+按以下顺序验收：
+
+1. **先查每折数据和用户身份**：每个用户在 train/val/test 的日期、有效点数、质量剔除日期、`cap`、`on_thr_w`；确认 held-out user 没被放进该折 train。
+2. **看逐用户、逐模型**：重点检查最差用户及不同量级用户，不只看 macro 平均。一个大用户表现很好不能抵消另一用户完全失效；当前训练损失按拼接后的逐点样本计算，没有按用户均衡损失权重，因此有效点多的用户会贡献更多梯度。
+3. **区分回归泛化与状态阈值泛化**：`MAE/RMSE` 衡量瓦数预测；`F1/precision/recall` 还依赖每用户 `on_thr_w`。当前 `_load_user_preprocessed()` 对 `on_thr_w="auto"` 会用该用户标签估值；因此 LOUO 的自动阈值指标不是严格的“完全无新用户标签”状态泛化测试。严格零样本评估须为 held-out 用户提供事先冻结、独立于 test 标签确定的物理阈值，并在报告中记录来源。
+4. **看日级与负样本**：检查全关日、夜间关态、休息日及不同开机时长；池里若没有全关日，LOUO 也无法证明模型能识别整天停机。`metrics_daily.csv` 的 pooled 日级 F1 使用池内 `on_thr` 中位数作诊断阈值（代码注释标为近似口径）；异质用户的精确分类汇总优先看 `metrics_by_user.csv`。
+5. **保留最终未触碰用户**：用开发用户 LOUO 选模型/调参数之后，再对未参与这些决策的审计用户做一次最终留出评估。用同一份 LOUO 结果反复选模型、调参数再汇报该分数，会产生测试集选择偏差。
+
+**推荐放行门槛不是固定一条 F1 数字**：先由业务定义用户可接受的 MAE 上限、最低 recall、误报/漏报代价和最差用户底线；再检查最差留出用户是否满足。没有达到底线时，不要把模型标记为通用，应缩小适用用户范围、补充代表性训练用户或改进特征/模型后重新做独立 LOUO。
+
+#### C. 比较模型与调参（先比较，再定部署模型）
+
+`configs/base_universal.yaml` 当前示例模型是 `ridge` 与 `transformer`。建议逐轮只改一类因素，并重复 LOUO：
+
+1. **基线**：固定开发用户、字段/阈值、`seed`、质量策略与特征，先跑默认 ridge + transformer，保存完整产物。
+2. **模型选择**：比较每用户及留出用户最差结果，而非仅比较点级池化分数。`history_profile`/`proportional` 不在通用配置的默认候选模型中；它们不等价于可迁移的共享参数模型。
+3. **特征与模型参数**：每次只调整 `features.lags`、`rolling_windows` 或具体模型参数，记下 LOUO 每用户结果和变动；避免因同一批 LOUO 用户反复调参后仍把其作为无偏最终测试。
+4. **用户采样与均衡**：检查各用户有效训练点占比；若一个用户支配样本池，先从数据构成或训练权重层面处理，并重新做 LOUO。当前实现没有用户等权 loss，宏平均评估不能补救训练时的样本权重失衡。
+5. **模型落盘选择必须显式**：`run_pooled_infer()` 当前默认使用 `user_cfg.infer_model`、`base_cfg.infer_model`，否则取 `meta["models"][0]`。示例配置里 `ridge` 排在第一，因此不会自动根据 LOUO 选出 transformer。选定模型后，在顶层 `time_filters.json` 配 `"infer_model": "ridge"`（共享默认）或目标用户配置中指定；再确认推理日志中的实际模型名与 LOUO 决策一致。
+
+**不要把单用户的 `--on-thr/--decision-thr/--min-on/--fill-off` 自动定参能力假定为已迁移到 pooled。** 当前 pooled 训练保存 `caps`、`on_thr_map`、全局 scaler 和模型，但没有生成完整的通用 `decision_thr_map/postprocess_map` 校准表；推理时 `decision_thr_w="auto"` 若找不到对应模型阈值会回退到 `on_thr_w`。无标签新用户的 `on_thr_w="auto"` 也会回退到 `10.0`，不是从新用户分路标签自动校准出的阈值。正式交付状态判决前，应使用设备台账给定并显式配置的 `on_thr_w` 与合适的 `decision_thr_w`；如果没有物理阈值或少量标注校准数据，应只把 `pred` 当回归输出，不能宣称 `pred_state` 已跨用户校准。
+
+#### D. 训练最终通用模型，再推理新用户
+
+通过开发 LOUO 后，使用纳入的开发用户训练**非 LOO**最终模型（此时 train/val 来自各个开发用户，模型保存于 `outputs/universal/<target_col>/train/<时间戳>/`）：
+
+```powershell
+python scripts/run_pooled.py `
+  --time-filter-config configs/time_filters.json `
+  --base-config configs/base_universal.yaml `
+  --data-root data --output-root outputs --target-col p1 `
+  --stage train --users <最终纳入用户A> <最终纳入用户B> <最终纳入用户C>
+```
+
+新用户总线放在 `data/infers/<user_key>/`，配置中明确 `target_col`、`pt_ratio`、`ct_ratio`、`branch_scale` 与人工核实的状态阈值。按选定训练目录显式推理：
+
+```powershell
+python scripts/run_pooled.py `
+  --time-filter-config configs/time_filters.json `
+  --base-config configs/base_universal.yaml `
+  --data-root data --output-root outputs --target-col p1 `
+  --stage infer --user-key <新用户key> `
+  --universal-dir outputs/universal/p1/train/<最终训练时间戳>
+```
+
+检查 `outputs/universal/p1/infer/<时间戳>/predictions/inference_result.csv`、推理 `meta.json` 中的模型名/cap/阈值，以及若有标签时的 `offline_metrics.json`。新用户若没有分路标签，无法计算真实 MAE/F1；应另行收集人工/仪表核验期，不能把输出文件成功生成当成泛化验证通过。
+
+#### E. 老用户未来新数据：当前能力边界与验证要求
+
+老用户未来工况是**时间外泛化**，与 LOUO 的“整户未见”问题不同。当前 pooled 切分器为池内用户分 train/val（无独立时间外 test），且 `pooled_task._load_user_preprocessed()` 目前在训练与推理路径都读取 `user_cfg["train"]` 时间过滤。因此，不能不核对配置就假设 `infer` 时间窗会自动按 `infer.include` 正确筛选；若训练时间窗把未来日期排除，可能造成推理样本被过滤为空或不符合预期。
+
+在代码完成推理期 `infer` 时间窗过滤与“已知用户历史训练 / 未来日期独立 test”切分支持前：
+
+- 将“LOUO 未见用户”与“老用户未来日期”分开报告，不用前者代替后者；
+- 推理前核对训练产物的 `meta.json`、用户 `train.include/exclude`、待推理日期范围和实际输出行数；
+- 用独立的未来标注期做时间外测试，且不能用该期挑模型、调特征或校准阈值后再报告同一测试分数；
+- 如果发现日期过滤、阈值来源或目标量纲不清楚，先停止上线验收，不要用零行/少量行产物或训练集分数宣称已验证泛化。
+
+**最终交付检查卡**：① 目标设备语义一致；② 单位与 PT/CT 对齐；③ 开发用户 LOUO 逐用户通过；④ 留有未触碰审计用户；⑤ 最终模型为非 LOO 产物；⑥ `infer_model` 显式匹配验证结论；⑦ 状态阈值有物理/标注来源；⑧ 新用户与老用户未来数据分别做了真实标签验证；⑨ 当前推理时间过滤边界已逐项核实。
+
+## 10. 战史：我们犯过的 8 个错（别再踩）
 
 1. **W-1 跨天拼窗（高危）**：按数组位置滑窗，把切分锚定造成的时间洞拼进 24h 窗，800有 50.5% 窗被污染最长 4.99 天，`transformer` 位置编码全错。现按 `间隔≠15min` 即分段，段头用段内首行填充，`common.schema.segment_bounds` 全局原语，守卫 13 项。
 2. **目标错（OQ-13）**：2842 `p1+p2`、2844 `p3+p4` 训完才发现真目标 `p1/p2`，旧结论 `SAE 0.372→0.0039` 全降级。**先定 target_col 再跑。**
@@ -687,7 +687,7 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 ---
 
-## 10. 常见问题 18 问
+## 11. 常见问题 18 问
 
 **Q1: 我只有 7 天数据能上线吗？** 能跑但不建议当生产。`history/proportional` 可先当影子，`transformer` 等 30 天再切。  
 **Q2: `on_thr` 和 `decision` 能否统一成 400？** 别。会把 10-400W 真开点重定义为关，报表好看但漏报被洗掉（`target [10,400)` 约 21 点）。  
@@ -710,7 +710,7 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 ---
 
-## 11. 附录：模板与速查卡
+## 12. 附录：模板与速查卡
 
 ### A. 新用户 `time_filters.json` 模板（推荐首跑全 `"auto"`，跑通验收后 `--save-config` 固化）
 
