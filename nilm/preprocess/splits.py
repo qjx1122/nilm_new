@@ -515,6 +515,17 @@ def _pick_best_two_slices(
                         skews.append(abs(cnt_off / cnt_tot - pool_off_rate))
                 max_skew = max(skews) if skews else 0.0
                 mean_skew = float(np.mean(skews)) if skews else 0.0
+                split_off_rates = [
+                    cnt_off / cnt_tot
+                    for cnt_off, cnt_tot in ((off_tr, n_tr), (off_va, n_va), (off_te, n_te))
+                    if cnt_tot > 0
+                ]
+                rate_spread = (max(split_off_rates) - min(split_off_rates)) if split_off_rates else 0.0
+                # A per-fold distance from the pool mean is insufficient: two folds can sit
+                # on opposite sides of that mean and still differ dramatically. Also keep
+                # a meaningful share of off-days in train so the model sees off-state days.
+                train_off_floor = int(np.ceil(0.5 * tot_off)) if tot_off >= 10 else 0
+                train_off_ok = off_tr >= train_off_floor
                 if enforce_skew_cap is None:
                     skew_ok = True
                 elif epoch_off_shift and v0 >= recent_start and t0 >= recent_start:
@@ -529,17 +540,23 @@ def _pick_best_two_slices(
                         rec_skews.append(abs(rec_off_tr / rec_tr_days - rec_off_rate))
                     max_rec_skew = max(rec_skews) if rec_skews else 0.0
                     mean_rec_skew = float(np.mean(rec_skews)) if rec_skews else 0.0
-                    skew_ok = (max_skew <= enforce_skew_cap) or (max_rec_skew <= max(enforce_skew_cap, 0.30))
+                    legacy_skew_ok = (max_skew <= enforce_skew_cap) or (max_rec_skew <= max(enforce_skew_cap, 0.30))
                     mean_skew = 0.5 * mean_skew + 0.5 * mean_rec_skew
                     max_skew = min(max_skew, max_rec_skew)
+                    # Cross-epoch pools have distinct regimes; preserve their established
+                    # recent-epoch guard rather than comparing unlike historical periods.
+                    skew_ok = legacy_skew_ok
                 else:
-                    skew_ok = max_skew <= enforce_skew_cap
+                    skew_ok = max_skew <= enforce_skew_cap and rate_spread <= 0.20 and train_off_ok
             else:
                 cover_ok = True
                 recent_cover_ok = True
                 skew_ok = True
                 max_skew = 0.0
                 mean_skew = 0.0
+                rate_spread = 0.0
+                train_off_floor = 0
+                off_tr = 0
 
             # 质量评分（优先让 val/test 成为高分完整连续段，C 级残缺天与孤岛天优先留 train）
             q_terms = []
@@ -675,6 +692,9 @@ def _pick_best_two_slices(
                     "recent_epoch_start_idx": int(recent_start),
                     "max_off_skew": round(float(max_skew), 4),
                     "mean_off_skew": round(float(mean_skew), 4),
+                    "off_rate_spread": round(float(rate_spread), 4),
+                    "train_off_floor": int(train_off_floor),
+                    "train_off_days": int(off_tr),
                     "natural_gap_cuts": int(nat_cuts),
                     "artificial_cuts": int(art_cuts),
                     "internal_gaps": int(internal_gaps),
@@ -768,6 +788,8 @@ def resolve_auto_quality_split(
     else:
         tot_on = tot_off = 0
 
+    # Tighten imbalance guard: in addition to pool-relative skew, require pairwise
+    # fold-rate spread <= 20 percentage points (checked in _pick_best_two_slices).
     skew_cap = 0.25 if (has_state and n_days >= 12 and tot_on > 0 and tot_off > 0) else None
 
     # 弹性 ±1 天配额对齐（N >= 14 时启用）：当死守 round(N*0.2) 会迫使 val/test 跨越离线断口
