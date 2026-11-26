@@ -593,27 +593,37 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 建议先做用户级清单，至少记录 `user_key / target_col及设备语义 / PT·CT / branch_scale / 有效双达标天 / on_thr来源 / 是否有全关日 / 目标功率范围`。按设备类型与工况选有代表性的开发用户；另留至少一个**不参与模型/超参/阈值选择**的最终审计用户。若用户数少，必须在报告中说明结论的外推范围很有限。
 
-`--users` 指定此次池化训练使用的用户；未指定时脚本会扫描 `data/trains` 下所有合法用户。默认兼容旧行为：没有共同语义配置时，脚本仍按任务级 `--target-col`/`pooled.target_col` 筛选同列用户。若各用户列名不同但标签经台账确认代表同一物理目标，可在 `time_filters.json` 的 `_default`（或逐用户）配置相同的 `target_semantic`，同时保留每个用户原有 `target_col`：
+`--users` 指定此次池化训练使用的用户；未指定时脚本会扫描 `data/trains` 下所有合法用户。先区分两个参数的职责：
+
+- `time_filters.json` 每个用户的 `target_col`：**该用户实际从哪些标签列构造训练真值**，例如 `p1`、`p2`、`p1+p2`。保留现有解析规则：列名忽略大小写和空格；`+` 表示逐行求和；复合目标任一分量缺失时该点目标为缺失。
+- `--target-col`：不是多个用户目标列的列表，不能写成 `p1,p2`；它是任务级兼容参数，用作用户未配置 `target_col` 时的回退值。无共同语义配置时，旧逻辑还会用它筛选同列用户。启用下面的 `target_semantic` 后，各用户显式配置的 `target_col` 优先，`--target-col p1` 不会把用户 B 的 `p2` 覆盖成 `p1`；它只应视为缺省用户的兜底。所有用户都明确配置时，建议命令中仍保留仓库默认的 `--target-col p1`，但不要把它误认为三个用户共同使用的标签列。
+- `target_semantic`：池化任务的**规范目标语义/模型目录标识**，不是分路列名。只有经台账确认各用户标签代表同一物理目标，才能给这些用户配置相同语义。
+
+**示例：三个开发用户分别使用不同目标列**。将占位的用户 key 替换为 `data/trains/<user_key>` 和 JSON 中实际一致的完整 `user_key`：
 
 ```json
 {
   "_default": {"target_semantic": "device_x_active_power"},
-  "<用户A>": {"target_col": "p1"},
-  "<用户B>": {"target_col": "p2"},
-  "<用户C>": {"target_col": "p1+p2"}
+  "<开发用户A的完整user_key>": {"target_col": "p1"},
+  "<开发用户B的完整user_key>": {"target_col": "p2"},
+  "<开发用户C的完整user_key>": {"target_col": "p1+p2"}
 }
 ```
 
-开启语义模式后，训练按每个用户配置的 `target_col` 各自解析标签（仍遵循原有大小写/空格、`+` 求和、缺值传播规则），同一池中用户的 `target_semantic` 必须一致；语义不一致或部分缺失会失败，不会静默合并。训练产物目录使用该规范语义标识，例如 `outputs/universal/device_x_active_power/train/<时间戳>/`，`meta.json` 留存逐用户原始 `target_col` 与解析出的列。推理用户也必须解析到同一 `target_semantic`，并按相同语义定位模型。只有设备范围、计量单位、分路求和口径及阈值均经核实后才可这样配置；设备类别相似本身不足以证明标签等价。无 `target_semantic` 的配置仍走原有按列名筛选/告警路径。
+这里 `_default.target_semantic` 让三户继承同一语义，三个用户级 `target_col` 则分别保留自己的列选择规则。也可以在每个用户对象内重复写完全相同的 `target_semantic`。若一个用户没有显式 `target_col`，其目标列会回退到任务级 `--target-col`，再回退 `base_universal.yaml` 的 `pooled.target_col`（示例默认为 `p1`）；为避免误取错标签，混列池建议每户都显式配置 `target_col`。
 
 ```powershell
-# 使用三个开发用户做 LOUO；每次轮流把一个完整用户留作 test
+# LOUO：A/B/C 三个开发用户轮流整户留出；此例三户目标列可以不同
 python scripts/run_pooled.py `
   --time-filter-config configs/time_filters.json `
   --base-config configs/base_universal.yaml `
   --data-root data --output-root outputs --target-col p1 `
-  --stage train --users <开发用户A> <开发用户B> <开发用户C> --loo
+  --stage train --users <开发用户A的完整user_key> <开发用户B的完整user_key> <开发用户C的完整user_key> --loo
 ```
+
+运行前逐项核对：① 三个 key 与数据目录、配置键完全一致；② 三户都解析到同一个 `target_semantic`；③ A/B/C 的 `target_col` 分别是现场确认的列/复合列；④ `branch_scale`、单位、设备范围、PT/CT 与阈值口径可比。语义缺失/不一致会报错，不会静默混合；但程序无法验证你声明的设备语义是否真实，不能把“设备类别相同”自动当成“标签定义相同”。
+
+开启语义模式后，训练按每个用户自己的 `target_col` 构造标签，产物目录使用共同语义标识，例如 `outputs/universal/device_x_active_power/train/<时间戳>/`；各折 `meta.json` 留存逐用户原始 `target_col` 与解析出的实际列。推理用户也必须配置同一 `target_semantic`，再按该语义定位模型。没有 `target_semantic` 时继续使用旧逻辑：按任务级 `--target-col`/`pooled.target_col` 过滤不同列，配置不匹配的用户会被跳过并告警。
 
 配置的 `pooled.val_ratio` 默认 `0.2`，`pooled.split_strategy` 默认 `stratified_by_state`。LOUO 每折的用户关系是：训练用户内部逐用户按日切 train/val；留出用户的全部可用日期只进 test，不参与模型拟合。记录输出目录和各折留出用户身份，检查：
 
