@@ -96,6 +96,7 @@ def build_day_quality_profiles(
         "date", "day_ts", "n_points", "bus_score", "branch_score",
         "min_side_score", "effective_score", "mean_score", "tier", "is_on",
         "gap_before", "gap_after", "block_id", "block_len", "is_island",
+        "intraday_gaps", "head_run", "tail_run", "mid_windows", "stream_link_prev",
     ]
     if not days:
         return pd.DataFrame(columns=cols)
@@ -106,8 +107,46 @@ def build_day_quality_profiles(
         if len(vm) != len(index):
             raise ValueError(f"valid_mask 长度 {len(vm)} 与 index 长度 {len(index)} 不一致")
         pt_counts = pd.Series(vm.astype(np.int64), index=norm_idx).groupby(level=0).sum().to_dict()
+        eff_idx = index[vm]
     else:
         pt_counts = pd.Series(1, index=norm_idx).groupby(level=0).sum().to_dict()
+        eff_idx = index
+
+    # 统计每日内部 >15min 缺数断口（intraday_gaps）及跨午夜 15min 连续衔接性（stream_link_prev），
+    # 避免切分器只看跨日断口而把含日内缺口的碎片日全部挤压进 train 造成滑窗坍塌（如 724 户 06-05/07/09）。
+    # 注：使用 Timedelta 比较而非裸 asi8，兼容 pandas 2.x (ns) 与 pandas 3.x (s/us/ms) 任意时间精度。
+    step_td = pd.Timedelta(minutes=15)
+    w_minus_1 = POINTS_PER_DAY_15MIN - 1
+    day_stream_stats: dict[pd.Timestamp, tuple[int, int, int, int, pd.Timestamp | None, pd.Timestamp | None]] = {}
+    if len(eff_idx) > 0:
+        eff_sorted = eff_idx.sort_values()
+        eff_norm_sorted = eff_sorted.normalize()
+        change_pos = np.flatnonzero(eff_norm_sorted[1:] != eff_norm_sorted[:-1]) + 1
+        starts = np.concatenate([[0], change_pos])
+        ends = np.concatenate([change_pos, [len(eff_sorted)]])
+        for s_i, e_i in zip(starts, ends):
+            d_key = eff_norm_sorted[s_i]
+            ts_sub = eff_sorted[s_i:e_i]
+            if len(ts_sub) == 1:
+                day_stream_stats[d_key] = (0, 1, 1, 0, ts_sub[0], ts_sub[0])
+            else:
+                brk = np.flatnonzero((ts_sub[1:] - ts_sub[:-1]) != step_td) + 1
+                if len(brk) == 0:
+                    k_len = int(len(ts_sub))
+                    day_stream_stats[d_key] = (0, k_len, k_len, 0, ts_sub[0], ts_sub[-1])
+                else:
+                    seg_starts = np.concatenate([[0], brk])
+                    seg_ends = np.concatenate([brk, [len(ts_sub)]])
+                    seg_lens = seg_ends - seg_starts
+                    mid_w = int(sum(max(0, int(L) - w_minus_1) for L in seg_lens[1:-1]))
+                    day_stream_stats[d_key] = (
+                        int(len(brk)),
+                        int(seg_lens[0]),
+                        int(seg_lens[-1]),
+                        mid_w,
+                        ts_sub[0],
+                        ts_sub[-1],
+                    )
 
     dq_map: dict[str, tuple[float, float]] = {}
     if daily_quality is not None and len(daily_quality) > 0 and "date" in daily_quality.columns:
@@ -140,6 +179,7 @@ def build_day_quality_profiles(
         block_sizes[bid] = block_sizes.get(bid, 0) + 1
 
     rows: list[dict] = []
+    prev_last_ts: pd.Timestamp | None = None
     for i, d in enumerate(days):
         d_str = d.strftime("%Y-%m-%d")
         n_pts = int(pt_counts.get(d, 0))
@@ -158,6 +198,17 @@ def build_day_quality_profiles(
         else:
             tier = "C"
         blen = block_sizes[block_ids[i]]
+        intra_g, h_run, t_run, mid_w, first_ts, last_ts = day_stream_stats.get(
+            d, (0, 0, 0, 0, None, None)
+        )
+        link_prev = bool(
+            i > 0
+            and (not gap_before[i])
+            and first_ts is not None
+            and prev_last_ts is not None
+            and (first_ts - prev_last_ts) == step_td
+        )
+        prev_last_ts = last_ts
         rows.append({
             "date": d_str,
             "day_ts": d,
@@ -174,6 +225,11 @@ def build_day_quality_profiles(
             "block_id": int(block_ids[i]),
             "block_len": int(blen),
             "is_island": bool(blen == 1),
+            "intraday_gaps": int(intra_g),
+            "head_run": int(h_run),
+            "tail_run": int(t_run),
+            "mid_windows": int(mid_w),
+            "stream_link_prev": link_prev,
         })
     return pd.DataFrame(rows, columns=cols)
 
@@ -395,6 +451,80 @@ def _candidate_starts(n: int, length: int, gap_before: np.ndarray) -> list[int]:
     return sorted(starts)
 
 
+def _precompute_interval_window_stats(
+    prof: pd.DataFrame,
+    window_len: int = POINTS_PER_DAY_15MIN,
+):
+    """预计算任意连续日区间 [a, b) 的精确 15min 滑窗数与 15min 连续段数回调。"""
+    n = len(prof)
+    n_pts = prof["n_points"].to_numpy(np.int64)
+    gap_before = prof["gap_before"].to_numpy(bool)
+    if "intraday_gaps" in prof.columns and "head_run" in prof.columns:
+        intra_gaps = prof["intraday_gaps"].to_numpy(np.int64)
+        head_run = prof["head_run"].to_numpy(np.int64)
+        tail_run = prof["tail_run"].to_numpy(np.int64)
+        mid_win = prof["mid_windows"].to_numpy(np.int64)
+        link_prev = prof["stream_link_prev"].to_numpy(bool)
+    else:
+        intra_gaps = np.zeros(n, dtype=np.int64)
+        head_run = n_pts.copy()
+        tail_run = n_pts.copy()
+        mid_win = np.zeros(n, dtype=np.int64)
+        link_prev = np.zeros(n, dtype=bool)
+        if n > 1:
+            link_prev[1:] = (~gap_before[1:]) & (n_pts[1:] == window_len) & (n_pts[:-1] == window_len)
+
+    w_minus_1 = max(1, int(window_len) - 1)
+    if n <= 360:
+        win_mat = np.zeros((n + 1, n + 1), dtype=np.int64)
+        seg_mat = np.zeros((n + 1, n + 1), dtype=np.int64)
+        for a in range(n):
+            cur_run = 0
+            done_win = 0
+            n_segs = 0
+            for d in range(a, n):
+                pts_d = int(n_pts[d])
+                if pts_d <= 0:
+                    if cur_run > 0:
+                        done_win += max(0, cur_run - w_minus_1)
+                        cur_run = 0
+                else:
+                    if d == a or (not link_prev[d]) or cur_run == 0:
+                        if cur_run > 0:
+                            done_win += max(0, cur_run - w_minus_1)
+                        cur_run = int(head_run[d])
+                        n_segs += 1
+                    else:
+                        cur_run += int(head_run[d])
+                    ig_d = int(intra_gaps[d])
+                    if ig_d > 0:
+                        done_win += max(0, cur_run - w_minus_1) + int(mid_win[d])
+                        cur_run = int(tail_run[d])
+                        n_segs += ig_d
+                win_mat[a, d + 1] = done_win + max(0, cur_run - w_minus_1)
+                seg_mat[a, d + 1] = n_segs
+
+        def _interval_stats(a: int, b: int) -> tuple[int, int]:
+            if b <= a:
+                return 0, 0
+            return int(win_mat[a, b]), int(seg_mat[a, b])
+
+        return _interval_stats
+
+    ps_pts = np.concatenate([[0], np.cumsum(n_pts)])
+    stream_brk = (~link_prev).astype(np.int64)
+    ps_brk = np.concatenate([[0], np.cumsum(stream_brk + intra_gaps)])
+
+    def _interval_stats_large(a: int, b: int) -> tuple[int, int]:
+        if b <= a:
+            return 0, 0
+        pts_ab = int(ps_pts[b] - ps_pts[a])
+        segs_ab = 1 + int(intra_gaps[a]) + int(ps_brk[b] - ps_brk[a + 1])
+        return max(0, pts_ab - w_minus_1 * segs_ab), segs_ab
+
+    return _interval_stats_large
+
+
 def _pick_best_two_slices(
     prof: pd.DataFrame,
     n_va: int,
@@ -407,21 +537,33 @@ def _pick_best_two_slices(
     """在有序日画像表 prof 上用前缀和精确搜索最优非重叠连续区间 (val_start, test_start)。"""
     n = len(prof)
     n_tr = n - n_va - n_te
+    n_pts_arr = prof["n_points"].to_numpy(np.int64)
     min_scores = prof["min_side_score"].to_numpy(np.float64)
     tier_a = (prof["tier"] == "A").to_numpy(np.float64)
     tier_c = (prof["tier"] == "C").to_numpy(np.float64)
-    stub48 = (prof["n_points"] < 48).to_numpy(np.float64)
+    stub48 = (n_pts_arr < 48).astype(np.float64)
+    stub64 = (n_pts_arr < 64).astype(np.float64)
     island = prof["is_island"].to_numpy(np.float64)
     gap_before = prof["gap_before"].to_numpy(bool)
     outage_c = (gap_before & (prof["tier"] == "C").to_numpy(bool)).astype(np.float64)
+    intra_gaps_arr = (
+        prof["intraday_gaps"].to_numpy(np.int64)
+        if "intraday_gaps" in prof.columns
+        else np.zeros(n, dtype=np.int64)
+    )
 
     ps_score = np.concatenate([[0.0], np.cumsum(min_scores)])
     ps_ta = np.concatenate([[0.0], np.cumsum(tier_a)])
     ps_tc = np.concatenate([[0.0], np.cumsum(tier_c)])
     ps_s48 = np.concatenate([[0.0], np.cumsum(stub48)])
+    ps_s64 = np.concatenate([[0.0], np.cumsum(stub64)])
     ps_isl = np.concatenate([[0.0], np.cumsum(island)])
     ps_gap = np.concatenate([[0], np.cumsum(gap_before.astype(np.int64))])
     ps_outc = np.concatenate([[0.0], np.cumsum(outage_c)])
+    ps_intra = np.concatenate([[0], np.cumsum(intra_gaps_arr)])
+
+    interval_stats_fn = _precompute_interval_window_stats(prof, POINTS_PER_DAY_15MIN)
+    pool_win, _ = interval_stats_fn(0, n)
 
     if has_state:
         on_arr = prof["is_on"].to_numpy(bool).astype(np.int64)
@@ -429,16 +571,22 @@ def _pick_best_two_slices(
         contig_on_arr = (
             (on_arr == 1)
             & (prof["block_len"].to_numpy(np.int64) >= 2)
-            & (prof["n_points"].to_numpy(np.int64) >= 88)
+            & (n_pts_arr >= 88)
         ).astype(np.int64)
+        imperf_on_arr = (
+            (on_arr == 1)
+            & ((tier_c > 0.5) | (intra_gaps_arr > 0) | (n_pts_arr < POINTS_PER_DAY_15MIN))
+        ).astype(np.float64)
         ps_on = np.concatenate([[0], np.cumsum(on_arr)])
         ps_off = np.concatenate([[0], np.cumsum(off_arr)])
         ps_contig_on = np.concatenate([[0], np.cumsum(contig_on_arr)])
+        ps_imperf_on = np.concatenate([[0.0], np.cumsum(imperf_on_arr)])
         tot_on = int(ps_on[-1])
         tot_off = int(ps_off[-1])
         pool_off_rate = tot_off / n if n > 0 else 0.0
     else:
-        ps_on = ps_off = ps_contig_on = None
+        off_arr = None
+        ps_on = ps_off = ps_contig_on = ps_imperf_on = None
         tot_on = tot_off = 0
         pool_off_rate = 0.0
 
@@ -608,44 +756,119 @@ def _pick_best_two_slices(
                     if (c + 1 == n or gap_before[c + 1]) and island[c] < 0.5 and tier_c[c] < 0.5:
                         induced_islands += 1
 
-            # train 被切成的区间段数（越少越好，1 段最优）及时序因果保护（禁止无故把好天留在 test 之后反哺 train）
+            # train 被切成的区间段数、有效 15min 滑窗数及时序因果硬护栏：
+            # 1) 禁止像 724 旧版那样把前 12 天完整好天全划给 val+test、仅拿后半月碎片日当 train（整段逆时序前置倒置）；
+            # 2) 当 val 与 test 之间仅夹着因 req_off 刚性锁留 train 的稀缺全关日或残缺日时，豁免反三明治惩罚；
+            # 3) 显式计入日内 >15min 缺数断口（intraday_gaps）并校验 train 96 点有效滑窗保底。
             intervals = sorted([(s0, s1) for s0, s1, sl in ((v0, v1, n_va), (t0, t1, n_te)) if sl > 0])
-            tr_segs = 0
+            tr_intervals: list[tuple[int, int]] = []
             cursor = 0
             for s0, s1 in intervals:
                 if s0 > cursor:
-                    tr_segs += 1
+                    tr_intervals.append((cursor, s0))
                 cursor = s1
             if cursor < n:
-                tr_segs += 1
+                tr_intervals.append((cursor, n))
+
+            tr_segs = len(tr_intervals)
+            non_c_tr_segs = sum(
+                1 for a, b in tr_intervals
+                if (b - a) - float(ps_tc[b] - ps_tc[a]) >= 1.0
+            )
+            tr_win = 0
+            tr_15m_segs = 0
+            for a, b in tr_intervals:
+                w_ab, sg_ab = interval_stats_fn(a, b)
+                tr_win += w_ab
+                tr_15m_segs += sg_ab
+
+            eval_intra_gaps = sum(
+                int(ps_intra[s1] - ps_intra[s0])
+                for s0, s1, sl in ((v0, v1, n_va), (t0, t1, n_te)) if sl > 0
+            )
+
+            # 时序因果硬护栏（chrono_causal_ok）
+            chrono_causal_ok = True
             future_tail_pen = 0.0
-            if cursor < n:
-                tail_len = n - cursor
-                tail_tc = float(ps_tc[n] - ps_tc[cursor])
+            if len(intervals) > 0:
+                eval_first = intervals[0][0]
+                eval_last = intervals[-1][1]
+                tail_len = n - eval_last
+                tail_tc = float(ps_tc[n] - ps_tc[eval_last])
+                tail_s64 = float(ps_s64[n] - ps_s64[eval_last])
+                non_c_tail = max(0, int(round(tail_len - max(tail_tc, tail_s64))))
                 if tail_len > 0 and (tail_tc / tail_len) < 0.5:
                     future_tail_pen = 10.0 + 1.5 * (tail_len - tail_tc)
-            # 对称分离/三明治夹层保护 + 顺时序因果保护（禁止 test 倒置在 val 之前，或无故把好天夹在 val/test 之间塞回 train）
+
+                if n >= 10 and n_tr >= 4:
+                    min_front_tr = max(1, int(np.ceil(0.35 * n_tr)))
+                    front_ok = eval_first >= min_front_tr
+                    tail_off = int(ps_off[n] - ps_off[eval_last]) if (has_state and ps_off is not None) else 0
+                    tail_forced_by_off = bool(
+                        has_state and ps_off is not None and req_off[0] > 0
+                        and tail_off > 0 and (off_tr - tail_off) < req_off[0]
+                    )
+                    if tail_forced_by_off and off_arr is not None:
+                        tail_off_rel = np.flatnonzero(off_arr[eval_last:] > 0)
+                        first_tail_off = (eval_last + int(tail_off_rel[0])) if len(tail_off_rel) > 0 else eval_last
+                        tail_ok = (eval_last == first_tail_off) or (non_c_tail <= 3)
+                    else:
+                        tail_ok = (non_c_tail == 0)
+
+                    order_forced_by_off = bool(
+                        has_state and req_off[1] > 0 and req_off[2] == 0 and tot_off <= 2
+                    )
+                    order_ok = True if (n_va == 0 or n_te == 0 or order_forced_by_off or n < 12) else (v0 < t0)
+                    chrono_causal_ok = bool(front_ok and tail_ok and order_ok)
+
+            # 训练有效 96 点滑窗数保底护栏（train_win_ok）
+            if n >= 12 and pool_win >= 200 and n_tr > 0:
+                min_tr_win = int(np.floor(pool_win * max(0.48, 0.85 * (n_tr / float(n)))))
+                train_win_ok = bool(tr_win >= min_tr_win)
+            else:
+                train_win_ok = True
+
+            # 对称分离/反三明治保护（豁免因 req_off 刚性锁留 train 的稀缺全关日及邻接残缺日）
             split_apart_pen = 0.0
             if len(intervals) == 2 and intervals[0][1] < intervals[1][0]:
                 mid_s0, mid_s1 = intervals[0][1], intervals[1][0]
                 mid_len = mid_s1 - mid_s0
                 mid_tc = float(ps_tc[mid_s1] - ps_tc[mid_s0])
-                if mid_len > 0 and (mid_tc / mid_len) < 0.5:
+                off_mid = int(ps_off[mid_s1] - ps_off[mid_s0]) if (has_state and ps_off is not None) else 0
+                scarce_off_locked_in_mid = bool(
+                    has_state and tot_off > 0 and (req_off[1] == 0 or req_off[2] == 0)
+                    and off_mid > 0 and (off_tr - off_mid) < req_off[0]
+                )
+                if scarce_off_locked_in_mid:
+                    mid_imperf_on = (
+                        float(ps_imperf_on[mid_s1] - ps_imperf_on[mid_s0])
+                        if ps_imperf_on is not None else mid_tc
+                    )
+                    extra_clean_on = max(0.0, float(mid_len - off_mid) - mid_imperf_on)
+                    split_apart_pen = 1.5 * extra_clean_on
+                elif mid_len > 0 and (mid_tc / mid_len) < 0.5:
                     split_apart_pen = 16.0 + 2.5 * (mid_len - mid_tc)
                 else:
                     split_apart_pen = 4.0
+
             chrono_inv_pen = 18.0 if (n_va > 0 and n_te > 0 and t0 < v0) else 0.0
             eff_art_cuts = max(0, art_cuts - recovery_cuts)
+            win_util = (
+                14.0 * ((tr_win / float(pool_win)) - (n_tr / float(n)))
+                if (pool_win >= POINTS_PER_DAY_15MIN and n > 0) else 0.0
+            )
             cont_util = (
                 2.5 * nat_cuts
                 + 2.0 * recovery_cuts
                 - 6.0 * eff_art_cuts
                 - 4.0 * max(0, tr_segs - 1)
                 - 9.0 * internal_gaps
+                - 2.0 * eval_intra_gaps
                 - 6.0 * induced_islands
                 - future_tail_pen
                 - split_apart_pen
                 - chrono_inv_pen
+                + win_util
             )
 
             # 开关均衡度与时序近端偏好
@@ -657,7 +880,9 @@ def _pick_best_two_slices(
 
             total_util = q_util + cont_util + bal_util + rec_util
             cand_key = (
-                1 if (cover_ok and recent_cover_ok and skew_ok) else 0,
+                1 if (cover_ok and recent_cover_ok and skew_ok and chrono_causal_ok and train_win_ok) else 0,
+                1 if (cover_ok and recent_cover_ok and chrono_causal_ok and train_win_ok) else 0,
+                1 if (cover_ok and recent_cover_ok and chrono_causal_ok) else 0,
                 1 if (cover_ok and recent_cover_ok) else 0,
                 1 if cover_ok else 0,
                 round(total_util, 6),
@@ -671,6 +896,8 @@ def _pick_best_two_slices(
                     "cover_ok": bool(cover_ok),
                     "recent_cover_ok": bool(recent_cover_ok),
                     "skew_ok": bool(skew_ok),
+                    "chrono_causal_ok": bool(chrono_causal_ok),
+                    "train_win_ok": bool(train_win_ok),
                     "chronological_order": bool(n_va == 0 or n_te == 0 or v0 < t0),
                     "recent_epoch_start_idx": int(recent_start),
                     "max_off_skew": round(float(max_skew), 4),
@@ -678,7 +905,13 @@ def _pick_best_two_slices(
                     "natural_gap_cuts": int(nat_cuts),
                     "artificial_cuts": int(art_cuts),
                     "internal_gaps": int(internal_gaps),
+                    "eval_intraday_gaps": int(eval_intra_gaps),
                     "induced_islands": int(induced_islands),
+                    "train_day_segments": int(tr_segs),
+                    "non_c_train_segments": int(non_c_tr_segs),
+                    "train_15m_segments": int(tr_15m_segs),
+                    "train_windows_96": int(tr_win),
+                    "pool_windows_96": int(pool_win),
                     "utility_score": round(float(total_util), 4),
                 }
 
@@ -798,47 +1031,104 @@ def resolve_auto_quality_split(
     target_te = n_days * float(ratios[2])
     base_quota_err = abs(n_va_base - target_va) + abs(n_te_base - target_te)
 
-    for c_va, c_te in cand_quotas:
-        c_tr = n_days - c_va - c_te
-        if has_state:
-            c_req_on, c_req_off, c_scarcity = _compute_state_floors(tot_on, tot_off, c_tr, c_va, c_te)
-        else:
-            c_req_on, c_req_off, c_scarcity = (0, 0, 0), (0, 0, 0), "no_target_state"
+    def _eval_quota_candidates(
+        quota_list: list[tuple[int, int]],
+        require_clean_block_gain: bool = False,
+        stage1_clean: bool = False,
+    ) -> None:
+        nonlocal best_overall_key, best_pair, diag, n_tr, n_va, n_te, req_on, req_off, off_scarcity
+        for c_va, c_te in quota_list:
+            c_tr = n_days - c_va - c_te
+            if has_state:
+                c_req_on, c_req_off, c_scarcity = _compute_state_floors(tot_on, tot_off, c_tr, c_va, c_te)
+            else:
+                c_req_on, c_req_off, c_scarcity = (0, 0, 0), (0, 0, 0), "no_target_state"
 
-        c_pair, c_diag = _pick_best_two_slices(
-            prof, c_va, c_te,
-            has_state=has_state,
-            req_on=c_req_on,
-            req_off=c_req_off,
-            enforce_skew_cap=skew_cap,
-        )
-        if c_pair is None:
-            continue
-        dev_days = abs(c_va - n_va_base) + abs(c_te - n_te_base)
-        cand_quota_err = abs(c_va - target_va) + abs(c_te - target_te)
-        extra_quota_err = max(0.0, cand_quota_err - base_quota_err)
-        adj_util = float(c_diag.get("utility_score", 0.0)) - 2.2 * extra_quota_err
-        c_key = (
-            1 if (
-                c_diag.get("cover_ok", False)
-                and c_diag.get("recent_cover_ok", True)
-                and c_diag.get("skew_ok", True)
-            ) else 0,
-            1 if (c_diag.get("cover_ok", False) and c_diag.get("recent_cover_ok", True)) else 0,
-            1 if c_diag.get("cover_ok", False) else 0,
-            round(adj_util, 6),
-            -dev_days,
-            c_tr,
-        )
-        if best_overall_key is None or c_key > best_overall_key:
-            best_overall_key = c_key
-            best_pair = c_pair
-            c_diag = dict(c_diag)
-            c_diag["utility_score"] = round(adj_util, 4)
-            c_diag["quota_adjusted_days"] = int(dev_days)
-            diag = c_diag
-            n_tr, n_va, n_te = c_tr, c_va, c_te
-            req_on, req_off, off_scarcity = c_req_on, c_req_off, c_scarcity
+            c_pair, c_diag = _pick_best_two_slices(
+                prof, c_va, c_te,
+                has_state=has_state,
+                req_on=c_req_on,
+                req_off=c_req_off,
+                enforce_skew_cap=skew_cap,
+            )
+            if c_pair is None:
+                continue
+            cand_is_clean = (
+                c_diag.get("internal_gaps", 0) == 0
+                and c_diag.get("non_c_train_segments", 1) <= 1
+                and c_diag.get("chrono_causal_ok", True)
+                and c_diag.get("train_win_ok", True)
+            )
+            if require_clean_block_gain and (stage1_clean or not cand_is_clean):
+                continue
+
+            dev_days = abs(c_va - n_va_base) + abs(c_te - n_te_base)
+            cand_quota_err = abs(c_va - target_va) + abs(c_te - target_te)
+            extra_quota_err = max(0.0, cand_quota_err - base_quota_err)
+            adj_util = float(c_diag.get("utility_score", 0.0)) - 2.2 * extra_quota_err
+            cov_ok = c_diag.get("cover_ok", False)
+            rec_ok = c_diag.get("recent_cover_ok", True)
+            skw_ok = c_diag.get("skew_ok", True)
+            chr_ok = c_diag.get("chrono_causal_ok", True)
+            win_ok = c_diag.get("train_win_ok", True)
+            c_key = (
+                1 if (cov_ok and rec_ok and skw_ok and chr_ok and win_ok) else 0,
+                1 if (cov_ok and rec_ok and chr_ok and win_ok) else 0,
+                1 if (cov_ok and rec_ok and chr_ok) else 0,
+                1 if (cov_ok and rec_ok) else 0,
+                1 if cov_ok else 0,
+                round(adj_util, 6),
+                -dev_days,
+                c_tr,
+            )
+            if best_overall_key is None or c_key > best_overall_key:
+                best_overall_key = c_key
+                best_pair = c_pair
+                c_diag = dict(c_diag)
+                c_diag["utility_score"] = round(adj_util, 4)
+                c_diag["quota_adjusted_days"] = int(dev_days)
+                diag = c_diag
+                n_tr, n_va, n_te = c_tr, c_va, c_te
+                req_on, req_off, off_scarcity = c_req_on, c_req_off, c_scarcity
+
+    _eval_quota_candidates(cand_quotas, require_clean_block_gain=False)
+
+    # 二阶段评估块自动缩减：当 ±1 天配额仍被迫跨断口或把非 C 级 train 切碎（如 724 户唯一全关日 06-08 锁留 train
+    # 且后方仅 4d + 断口 + 5d = 9 天 < 5+5 天）时，允许向 -2 天缩减贴合天然无断口连续块。
+    stage1_clean = bool(
+        diag.get("cover_ok", False)
+        and diag.get("chrono_causal_ok", True)
+        and diag.get("train_win_ok", True)
+        and diag.get("internal_gaps", 0) == 0
+        and diag.get("non_c_train_segments", 1) <= 1
+    )
+    if (not stage1_clean) and n_days >= 18 and n_va_base >= 4 and n_te_base >= 4:
+        seen_q = set(cand_quotas)
+        shrink_quotas: list[tuple[int, int]] = []
+        min_eval_days = max(3, int(np.floor(n_days * 0.12)))
+        max_tr_days = int(np.ceil(n_days * 0.72))
+        max_diff_s2 = max(2, abs(n_va_base - n_te_base) + 1)
+        for dv in (-2, -1, 0, 1):
+            for dt in (-2, -1, 0, 1):
+                c_va = n_va_base + dv
+                c_te = n_te_base + dt
+                if (c_va, c_te) in seen_q:
+                    continue
+                c_tr = n_days - c_va - c_te
+                if (
+                    c_va >= min_eval_days
+                    and c_te >= min_eval_days
+                    and max(4, n_tr_base - 2) <= c_tr <= max_tr_days
+                    and abs(c_va - c_te) <= max_diff_s2
+                ):
+                    shrink_quotas.append((c_va, c_te))
+                    seen_q.add((c_va, c_te))
+        if shrink_quotas:
+            _eval_quota_candidates(
+                shrink_quotas,
+                require_clean_block_gain=True,
+                stage1_clean=stage1_clean,
+            )
 
     use_polarized = (
         has_state
@@ -848,8 +1138,29 @@ def resolve_auto_quality_split(
         and (not diag.get("cover_ok", False) or not diag.get("skew_ok", True))
     )
 
+    # 极端破碎兜底：若连续块搜索同时违反因果时序护栏与训练有效产窗护栏，平滑回退至 stratified_day
+    use_stratified_fallback = (
+        (not use_polarized)
+        and n_days >= 12
+        and (
+            best_pair is None
+            or (not diag.get("chrono_causal_ok", True) and not diag.get("train_win_ok", True))
+        )
+    )
+
     assign: dict[pd.Timestamp, str] = {}
-    if not use_polarized and best_pair is not None:
+    if use_stratified_fallback:
+        by_dow: dict[int, list[pd.Timestamp]] = {}
+        for d in days:
+            by_dow.setdefault(d.day_of_week, []).append(d)
+        for _, ds in sorted(by_dow.items()):
+            assign.update(_ratio_assign(ds, ratios))
+        vals_fb = list(assign.values())
+        n_tr = vals_fb.count("train")
+        n_va = vals_fb.count("val")
+        n_te = vals_fb.count("test")
+        mode_name = "auto_fallback_stratified_day"
+    elif not use_polarized and best_pair is not None:
         v0, t0 = best_pair
         va_set = set(days[v0:v0 + n_va]) if n_va > 0 else set()
         te_set = set(days[t0:t0 + n_te]) if n_te > 0 else set()
@@ -881,10 +1192,15 @@ def resolve_auto_quality_split(
                 continue
             sub_days = sub_p["day_ts"].tolist()
             sub_p = sub_p.copy()
-            sub_p["gap_before"] = [
+            sub_gb = [
                 (i == 0) or ((sub_days[i] - sub_days[i - 1]).days > 1)
                 for i in range(len(sub_days))
             ]
+            sub_p["gap_before"] = sub_gb
+            if "stream_link_prev" in sub_p.columns:
+                sub_p["stream_link_prev"] = (
+                    sub_p["stream_link_prev"].to_numpy(bool) & (~np.asarray(sub_gb, dtype=bool))
+                )
             sub_pair, _ = _pick_best_two_slices(sub_p, sub_va, sub_te, has_state=False)
             sv0, st0 = sub_pair if sub_pair is not None else (max(0, len(sub_days) - sub_va - sub_te), max(0, len(sub_days) - sub_te))
             sva = set(sub_days[sv0:sv0 + sub_va]) if sub_va > 0 else set()
@@ -941,6 +1257,7 @@ def summarize_split_decision(
         eff_scores = [float(prof_by_day[d]["effective_score"]) for d in s_days if d in prof_by_day]
         tier_a_cnt = sum(1 for d in s_days if d in prof_by_day and prof_by_day[d]["tier"] == "A")
         tier_c_cnt = sum(1 for d in s_days if d in prof_by_day and prof_by_day[d]["tier"] == "C")
+        intra_g_cnt = sum(int(prof_by_day[d]["intraday_gaps"]) for d in s_days if d in prof_by_day)
         if target is not None and on_thr_w is not None:
             on_cnt = sum(1 for d in s_days if d in prof_by_day and bool(prof_by_day[d]["is_on"]))
             off_cnt = len(s_days) - on_cnt
@@ -953,6 +1270,7 @@ def summarize_split_decision(
             "days": int(len(s_days)),
             "points": int(m.sum()),
             "contiguous_blocks": int(n_blocks),
+            "intraday_gaps": int(intra_g_cnt),
             "on_days": on_cnt,
             "off_days": off_cnt,
             "off_day_ratio": off_ratio,
@@ -971,7 +1289,9 @@ def summarize_split_decision(
     if auto_meta:
         for k in (
             "off_day_scarcity", "natural_gap_cuts", "artificial_cuts",
-            "internal_gaps", "induced_islands", "quota_adjusted_days",
+            "internal_gaps", "eval_intraday_gaps", "induced_islands",
+            "quota_adjusted_days", "chrono_causal_ok", "train_win_ok",
+            "train_windows_96", "pool_windows_96",
             "max_off_skew", "utility_score",
         ):
             if k in auto_meta:

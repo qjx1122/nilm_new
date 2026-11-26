@@ -686,3 +686,204 @@ def test_auto_split_2844_cross_epoch_no_inversion_and_recent_on_coverage():
     assert bounds["m_max"] == 8
 
 
+def test_auto_split_724_no_front_inversion_and_intraday_gap_window_preservation():
+    """回归 724 户真实 28 天 2637 点拓扑（2026-05-21..06-20，含 06-13..15 三天离线断口、
+    唯一全关日 06-08 锁留 train、以及 06-05[75pt]/06-07[89pt]/06-09[92pt] 日内 >15min 缺数断口）：
+    1) 严禁将 val+test 整段倒置前置到 05-21..06-01 抽空前 12 天连续满点黄金训练流（chrono_causal_ok=True）；
+    2) Stage-2 自然块配额贴合 06-13..15 断口产出严格顺时序 train=05-21..06-08(19d)、
+       val=06-09..12(4d)、test=06-16..20(5d)，internal_gaps=0、induced_islands=0；
+    3) train 有效 96 点滑窗达 1506 个（较旧版倒置 1010 窗提升 +49.1%，且高于 stratified_day 的 1378 窗），
+       唯一全关日 06-08 与 C 级残缺日 06-05 均留在 train，test 日内断口为 0。
+    """
+    from nilm.preprocess.dataset import build_windows
+    from nilm.preprocess.splits import _precompute_interval_window_stats
+
+    days_724 = [
+        ("2026-05-21", 91, True), ("2026-05-22", 96, True), ("2026-05-23", 96, True),
+        ("2026-05-24", 96, True), ("2026-05-25", 96, True), ("2026-05-26", 96, True),
+        ("2026-05-27", 96, True), ("2026-05-28", 96, True), ("2026-05-29", 96, True),
+        ("2026-05-30", 96, True), ("2026-05-31", 96, True), ("2026-06-01", 96, True),
+        ("2026-06-02", 96, True), ("2026-06-03", 96, True), ("2026-06-04", 96, True),
+        ("2026-06-05", 75, True), ("2026-06-06", 96, True), ("2026-06-07", 89, True),
+        ("2026-06-08", 96, False),  # 全池唯一全关日
+        ("2026-06-09", 92, True), ("2026-06-10", 96, True),
+        ("2026-06-11", 96, True), ("2026-06-12", 96, True),
+        # 2026-06-13..15 三天设备离线天然断口
+        ("2026-06-16", 96, True), ("2026-06-17", 96, True), ("2026-06-18", 96, True),
+        ("2026-06-19", 96, True), ("2026-06-20", 82, True),
+    ]
+    # 严格复刻 user_task.py 的 96 点日网格 + valid_mask 调用口径
+    grid_parts = [pd.date_range(d, periods=96, freq="15min") for d, _, _ in days_724]
+    grid_idx = grid_parts[0].append(grid_parts[1:])
+    valid_mask = np.ones(len(grid_idx), dtype=bool)
+    off = 0
+    for d, _, _ in days_724:
+        if d == "2026-05-21":
+            valid_mask[off:off + 5] = False       # 首日 01:15 起步 (91 点)
+        elif d == "2026-06-05":
+            valid_mask[off + 38:off + 59] = False  # 日内缺 21 点断口 (75 点, C 级)
+        elif d == "2026-06-07":
+            valid_mask[off + 45:off + 52] = False  # 日内缺 7 点断口 (89 点)
+        elif d == "2026-06-09":
+            valid_mask[off + 46:off + 50] = False  # 日内缺 4 点断口 (92 点)
+        elif d == "2026-06-20":
+            valid_mask[off + 82:off + 96] = False  # 末日 20:15 收尾 (82 点)
+        off += 96
+    assert int(valid_mask.sum()) == 2637
+
+    tgt = pd.Series(3.0, index=grid_idx)
+    for d, _, is_on in days_724:
+        if is_on:
+            pos = np.flatnonzero(grid_idx.normalize() == pd.Timestamp(d))
+            tgt.iloc[pos[36:64]] = 560.0
+            # 在 06-10..12 注入变频短真停机凹槽（停 2 点 = 30min 后复开），贴合 724 间歇温控特征
+            if d in ("2026-06-10", "2026-06-11", "2026-06-12"):
+                tgt.iloc[pos[48:50]] = 4.0
+
+    dq = pd.DataFrame({
+        "date": [d for d, _, _ in days_724],
+        "bus_score": [100.0 if pts >= 91 else round(100.0 * pts / 96.0, 2) for _, pts, _ in days_724],
+        "branch_score": [100.0 if pts >= 91 else round(100.0 * pts / 96.0, 2) for _, pts, _ in days_724],
+        "qualified": [1] * len(days_724),
+    })
+
+    masks, meta = resolve_auto_quality_split(
+        grid_idx, [0.6, 0.2, 0.2],
+        daily_quality=dq, target=tgt, on_thr_w=15.0, valid_mask=valid_mask,
+    )
+    _check(masks)
+
+    clean_idx = grid_idx[valid_mask]
+    clean_masks = {k: pd.Series(v.to_numpy()[valid_mask], index=clean_idx) for k, v in masks.items()}
+    summary = summarize_split_decision(
+        clean_idx, clean_masks, "auto", dq, tgt.loc[valid_mask], 15.0, auto_meta=meta
+    )
+
+    assert meta["resolved_mode"] == "auto_contiguous_quality_blocks"
+    assert meta["off_day_scarcity"] == "single_off_day_reserved_for_train"
+    assert meta["chrono_causal_ok"] is True
+    assert meta["train_win_ok"] is True
+    assert meta["chronological_order"] is True
+    assert meta["internal_gaps"] == 0
+    assert meta["induced_islands"] == 0
+    assert meta["natural_gap_cuts"] == 1
+
+    tr_idx = clean_idx[clean_masks["train"].to_numpy()]
+    va_idx = clean_idx[clean_masks["val"].to_numpy()]
+    te_idx = clean_idx[clean_masks["test"].to_numpy()]
+    assert tr_idx.max() < va_idx.min() < va_idx.max() < te_idx.min()
+
+    tr_dates = sorted(pd.Series(tr_idx.normalize()).dt.strftime("%Y-%m-%d").unique())
+    va_dates = sorted(pd.Series(va_idx.normalize()).dt.strftime("%Y-%m-%d").unique())
+    te_dates = sorted(pd.Series(te_idx.normalize()).dt.strftime("%Y-%m-%d").unique())
+    assert tr_dates[0] == "2026-05-21" and tr_dates[-1] == "2026-06-08" and len(tr_dates) == 19
+    assert va_dates == ["2026-06-09", "2026-06-10", "2026-06-11", "2026-06-12"]
+    assert te_dates == ["2026-06-16", "2026-06-17", "2026-06-18", "2026-06-19", "2026-06-20"]
+    assert "2026-06-08" in tr_dates and "2026-06-05" in tr_dates
+    assert summary["by_split"]["test"]["intraday_gaps"] == 0
+
+    # 校验 _precompute_interval_window_stats 与真实 build_windows(window=96) 100% 零误差一致
+    Xw_tr, _, _ = build_windows(
+        np.zeros((len(tr_idx), 1), np.float32),
+        np.zeros((len(tr_idx), 1), np.float32),
+        tr_idx, window=96, mode="seq2point",
+    )
+    assert len(Xw_tr) == 1506
+    assert meta["train_windows_96"] == len(Xw_tr)
+
+    masks_dow = initial_split(clean_idx, [0.6, 0.2, 0.2], "stratified_day")
+    dow_tr_idx = clean_idx[masks_dow["train"].to_numpy()]
+    Xw_dow, _, _ = build_windows(
+        np.zeros((len(dow_tr_idx), 1), np.float32),
+        np.zeros((len(dow_tr_idx), 1), np.float32),
+        dow_tr_idx, window=96, mode="seq2point",
+    )
+    assert len(Xw_tr) > len(Xw_dow)  # 1506 > 1378
+
+    prof = build_day_quality_profiles(clean_idx, dq, tgt.loc[valid_mask], 15.0)
+    q_fn = _precompute_interval_window_stats(prof)
+    p_days = prof["day_ts"].tolist()
+    norm_clean = clean_idx.normalize()
+    for a in (0, 6, 12, 19, 23):
+        for b in range(a + 2, len(p_days) + 1, 4):
+            sub_idx = clean_idx[(norm_clean >= p_days[a]) & (norm_clean <= p_days[b - 1])]
+            act_w = 0 if len(sub_idx) < 96 else len(build_windows(
+                np.zeros((len(sub_idx), 1), np.float32),
+                np.zeros((len(sub_idx), 1), np.float32),
+                sub_idx, window=96, mode="seq2point",
+            )[0])
+            assert q_fn(a, b)[0] == act_w
+
+
+def test_auto_split_scarce_off_day_sandwich_exemption_and_intraday_gap_guard():
+    """验证两大机制协同：
+    1) 当唯一全关日偏晚（如 06-11，后方仅剩 06-12 + 断口 + 06-16..20 不足容纳 val+test）时，
+       允许 val 与 test 顺时序跨过必留 train 的稀缺全关日夹层（豁免反三明治重罚），绝不前置倒置抽空首段长训练流；
+    2) 日内 >15min 缺数断口（intraday_gaps）被准确识别（兼容 pandas 2.x/3.x 时间精度），
+       同等分数下优先将无日内断口的纯净块分配给评估集，同时保证 train_win_ok=True。
+    """
+    # 子场景 A：偏晚锁留全关日 06-11 触发跨夹层豁免而非前置倒置
+    days_late_off = [
+        ("2026-05-21", 91, True), ("2026-05-22", 96, True), ("2026-05-23", 96, True),
+        ("2026-05-24", 96, True), ("2026-05-25", 96, True), ("2026-05-26", 96, True),
+        ("2026-05-27", 96, True), ("2026-05-28", 96, True), ("2026-05-29", 96, True),
+        ("2026-05-30", 96, True), ("2026-05-31", 96, True), ("2026-06-01", 96, True),
+        ("2026-06-02", 96, True), ("2026-06-03", 96, True), ("2026-06-04", 96, True),
+        ("2026-06-05", 96, True), ("2026-06-06", 96, True), ("2026-06-07", 96, True),
+        ("2026-06-08", 96, True), ("2026-06-09", 96, True), ("2026-06-10", 96, True),
+        ("2026-06-11", 96, False), ("2026-06-12", 92, True),
+        ("2026-06-16", 96, True), ("2026-06-17", 96, True), ("2026-06-18", 96, True),
+        ("2026-06-19", 96, True), ("2026-06-20", 82, True),
+    ]
+    parts_a = [
+        pd.date_range(pd.Timestamp(d) + pd.Timedelta(minutes=15 * (96 - pts)), periods=pts, freq="15min")
+        for d, pts, _ in days_late_off
+    ]
+    idx_a = parts_a[0].append(parts_a[1:])
+    tgt_a = pd.Series(500.0, index=idx_a)
+    tgt_a.loc[idx_a.normalize() == pd.Timestamp("2026-06-11")] = 2.0
+
+    masks_a, meta_a = resolve_auto_quality_split(idx_a, [0.6, 0.2, 0.2], target=tgt_a, on_thr_w=15.0)
+    _check(masks_a)
+    assert meta_a["chrono_causal_ok"] is True
+    assert meta_a["train_win_ok"] is True
+    assert meta_a["chronological_order"] is True
+    assert meta_a["train_windows_96"] >= 1300
+    tr_dates_a = set(pd.Series(idx_a[masks_a["train"].to_numpy()].normalize()).dt.strftime("%Y-%m-%d").unique())
+    te_dates_a = sorted(pd.Series(idx_a[masks_a["test"].to_numpy()].normalize()).dt.strftime("%Y-%m-%d").unique())
+    assert "2026-05-21" in tr_dates_a and "2026-06-01" in tr_dates_a and "2026-06-11" in tr_dates_a
+    assert te_dates_a == ["2026-06-16", "2026-06-17", "2026-06-18", "2026-06-19", "2026-06-20"]
+
+    # 子场景 B：日内 >15min 断口精确感知（兼容 pandas 2.x/3.x 时间精度）：
+    # 构造 3 段天然连续块：[0..11](8d 无断口) + 断口 + [13..16](4d 均 94 点 A 级但含午间日内断口)
+    # + 断口 + [18..25](8d 无断口)，验证 val/test 主动避开含日内断口的 [13..16] 块（eval_intraday_gaps=0），
+    # 且 train_win_ok=True 护栏生效。
+    full_b = pd.date_range("2026-04-01", periods=22, freq="D")
+    kept_b = [d for i, d in enumerate(full_b) if i not in (8, 13)]  # 20 天：8d + 4d + 8d
+    parts_b = []
+    for k_i, d in enumerate(kept_b):
+        full_d = pd.date_range(d, periods=96, freq="15min")
+        if k_i in (9, 10):  # 中间 4 天块内含 2 天午间 >15min 缺口（仍 94 点 >= 88 点 A 级线）
+            full_d = full_d.delete([48, 49])
+        parts_b.append(full_d)
+    idx_b = parts_b[0].append(parts_b[1:])
+    dq_b = pd.DataFrame({
+        "date": [d.strftime("%Y-%m-%d") for d in kept_b],
+        "bus_score": [99.0] * len(kept_b),
+        "branch_score": [99.0] * len(kept_b),
+        "qualified": [1] * len(kept_b),
+    })
+    tgt_b = pd.Series(420.0, index=idx_b)
+    prof_b = build_day_quality_profiles(idx_b, dq_b, tgt_b, 20.0)
+    assert int(prof_b["intraday_gaps"].sum()) == 2
+    assert prof_b.loc[9, "intraday_gaps"] == 1 and prof_b.loc[10, "intraday_gaps"] == 1
+    masks_b, meta_b = resolve_auto_quality_split(
+        idx_b, [0.6, 0.2, 0.2], daily_quality=dq_b, target=tgt_b, on_thr_w=20.0
+    )
+    _check(masks_b)
+    assert meta_b["chrono_causal_ok"] is True
+    assert meta_b["train_win_ok"] is True
+    assert meta_b["eval_intraday_gaps"] == 0
+
+
+

@@ -141,4 +141,19 @@
 2. **跨多周大断口（`gap >= 21` 天）近期域连续开机训练保底与近端开关参考率对齐（`splits.py`）**：当池内存在跨时期大断口且前后时期关机率偏移 $\ge 0.25$ 时，要求 `train` 在近期域内保留最低数量的非孤岛连续开机日（`recent_cover_ok`），并以近期域真实关机率校准开关均衡度，避免远古 `100%` 全开期稀释全池关机率后误杀顺时序切分。修复后 `2844` 自动切分为严格顺时序 `train=[2025-07-11..2026-05-28] (26d, 开24/关2, 保留 5 月全部 6 个连续开机日, M_max=8)` $\rightarrow$ `val=[2026-05-29..2026-06-12] (9d, 开2/关7)` $\rightarrow$ `test=[2026-06-17..2026-06-28] (10d, 开6/关4, 贴合 06-12/06-17 天然断口)`。
 3. **`RECALL_BELOW_0.95_GUARD` 1D/3D 欠召回止损护栏（`auto_thresholds.py`）**：当验证集原始召回已低于 `0.95`（`feasible` / `feasible_keys` 为空）时，废除旧版无约束 `max(F1)` 搜索与强制回退 `(m=1, k=3)`，新增召回止损下界 `rec_stop_floor = max(base_recall - 0.01, max_recall - 0.02)` 并保留安全 3D 游程滤波 `(m, k)`——彻底阻断把 `decision_thr_w` 从 `20` 反向拔高至 `250` 继续吞噬召回率的行为。
 
+---
+
+## 8. 稀缺全关日锁留冲突防前置倒置与日内断口产窗保护（`800080270724_4206699153775` 四级连锁修复）
+
+在 `724` 户（28 个双达标天、`2637` 点：`06-08` 为全池唯一全关日必须留给 `train`、`06-13..15` 为三天离线断口、`06-05[75pt]/06-07[89pt]/06-09[92pt]` 含日内 `>15min` 缺数断口）实跑复盘中，旧版因 `06-08` 后方仅剩 `4d + 断口 + 5d = 9d` 不足容纳 `±1` 天配额 `val(5)+test(5)=10d`、且跨过 `06-08` 被反三明治项重扣，导致将 `val+test` 整段倒置前置到 `05-21..06-01`（抽空前 12 天黄金连续训练流，令 `train` 碎成 5 段仅剩 `1010` 个 96 点滑窗，`transformer` 严重欠拟合退化至 `ridge`），已完成两项零数据泄漏加固：
+
+1. **禁止整段逆时序前置倒置 + 稀缺全关日夹层反三明治豁免 + 二阶段自然块配额缩减（`splits.py`）**：
+   - 新增时序因果硬护栏 `chrono_causal_ok`（严禁将 `val+test` 整段切在首段训练流之前令最早训练日退至 `min(v0, t0) >= 4` 之后）；
+   - 当稀缺全关日（`req_off` 锁留 `train`）或日内断口残缺日位于 `val` 与 `test` 之间时，对其自动豁免 `mid_good_days` 反三明治重罚；
+   - 当一阶段 `±1` 天配额仍被迫跨离线断口或切碎 `train` 时，按需解锁二阶段 `-2` 天评估块缩减（仅在达成 `internal_gaps == 0 & non_c_train_segments <= 1 & chrono_causal_ok & train_win_ok` 时采纳），使 `724` 精确切出纯顺时序 `train=[05-21..06-08](19d, 1506窗)` $\rightarrow$ `val=[06-09..12](4d)` $\rightarrow$ `test=[06-16..20](5d, 贴合 06-13..15 天然断口)`。
+2. **日画像日内 `>15min` 缺数断口（`intraday_gaps`）显式感知与训练 96 点滑窗保底护栏 `train_win_ok`（`splits.py`）**：
+   - 在 `build_day_quality_profiles` 中扫描每日真实时间戳间隔（兼容 pandas 2.x/3.x 时间精度），显式统计 `intraday_gaps`、`head_run`、`tail_run`、`mid_windows` 与跨午夜连续标记 `stream_link_prev`；
+   - 新增 `_precompute_interval_window_stats` 精确预计算任意连续日区间的真实 `window=96` 滑窗数（与 `build_windows` 100% 零误差一致），加入训练有效产窗硬下限 `train_win_ok` 与产窗效用奖励，并在 `meta.json.split_decision` 完整留痕 `intraday_gaps`、`eval_intraday_gaps`、`train_windows_96` 与 `pool_windows_96`。
+
+
 
