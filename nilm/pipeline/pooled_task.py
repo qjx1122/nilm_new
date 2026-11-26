@@ -268,9 +268,12 @@ def _load_user_preprocessed(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     return {
         "user_key": user_key, "feat": f, "y_phys": y_phys, "y_norm": y_norm,
         "index": f.index, "cap": cap, "on_thr_w": eff_on_thr,
+        "target_col_spec": user_cfg.get("target_col") or target_col_override,
+        "target_cols": target_cols,
+        "target_semantic": user_cfg.get("target_semantic"),
         "pt_ratio": pt_ratio, "ct_ratio": ct_ratio, "branch_scale": branch_scale,
         "feature_names": [str(c) for c in f.columns],
-        "bus_al": bus_al, "branch_al": branch_al, "target_cols": target_cols,
+        "bus_al": bus_al, "branch_al": branch_al,
         "ident": ident,
     }
 
@@ -423,6 +426,13 @@ def _train_one_fold(pre: dict[str, dict], train_users: list[str], test_users: li
         "feature_names": names, "scale_cols": scale_cols, "scaler": scaler.state(),
         "models": [s["name"] for s in base_cfg.get("models", [])],
         "target_col": (base_cfg.get("pooled") or {}).get("target_col"),
+        "target_semantic": next((d.get("target_semantic") for d in pre.values()
+                                  if d.get("target_semantic")), None),
+        "model_target_key": next((d.get("target_semantic") for d in pre.values()
+                                   if d.get("target_semantic")), None)
+                            or (base_cfg.get("pooled") or {}).get("target_col") or "p1",
+        "target_col_by_user": {uk: d.get("target_col_spec") for uk, d in pre.items()},
+        "target_cols_by_user": {uk: d.get("target_cols", []) for uk, d in pre.items()},
         "cap_quantile": float((base_cfg.get("pooled") or {}).get("cap_quantile", 0.95)),
         "caps": {uk: pre[uk]["cap"] for uk in pre},
         "on_thr_map": on_thr_map,
@@ -442,18 +452,44 @@ def run_pooled_train(user_keys: list[str], scans: dict, user_cfgs: dict,
     """池化训练：多用户拼接 -> 全局 Scaler -> 通用模型。loo=True 时做 LOUO。"""
     out_root = Path(output_root)
     tc = target_col or (base_cfg.get("pooled") or {}).get("target_col") or "p1"
-    out = _new_outdir(out_root, tc, "train")
-    try:
-        # 按 target_col 分组校验：只保留与 tc 一致的用户（其余跳过并告警）
+    pooled_cfg = base_cfg.get("pooled") or {}
+    expected_semantic = pooled_cfg.get("target_semantic")
+    per_user_specs = {uk: (user_cfgs.get(uk, {}).get("target_col") or tc) for uk in user_keys}
+    per_user_semantics = {
+        uk: (user_cfgs.get(uk, {}).get("target_semantic") or expected_semantic)
+        for uk in user_keys
+    }
+    configured_semantics = {str(v).strip() for v in per_user_semantics.values() if v is not None}
+    semantic_mode = bool(configured_semantics)
+    if semantic_mode:
+        missing_semantics = [uk for uk, value in per_user_semantics.items() if value is None]
+        if missing_semantics:
+            return PooledResult(Status.FAILED,
+                                "target_semantic 已启用，但以下用户未配置规范语义：" + ", ".join(missing_semantics))
+        if len(configured_semantics) != 1:
+            return PooledResult(Status.FAILED,
+                                f"池内 target_semantic 不一致：{sorted(configured_semantics)}")
+        semantic = next(iter(configured_semantics))
+        if (Path(semantic).name != semantic or "/" in semantic or "\\" in semantic
+                or semantic in {".", ".."}):
+            return PooledResult(Status.FAILED, "target_semantic 必须是安全的单级目录标识（不可含路径分隔符）")
+        keep, skip = list(user_keys), []
+        output_key = semantic
+    else:
+        # 向后兼容旧行为：无规范语义时只训练与任务级 target_col 一致的用户。
         keep, skip = [], []
         for uk in user_keys:
-            u_tc = user_cfgs[uk].get("target_col")
+            u_tc = user_cfgs.get(uk, {}).get("target_col")
             if u_tc is None or str(u_tc).replace(" ", "").lower() == str(tc).replace(" ", "").lower():
                 keep.append(uk)
             else:
                 skip.append(uk)
+        semantic = None
+        output_key = tc
+    out = _new_outdir(out_root, output_key, "train")
+    try:
         if skip:
-            log.warning("target_col=%s 分组：跳过 %s（其 target_col 与池不一致）", tc, skip)
+            log.warning("target_col=%s 分组：跳过 %s（未启用共同 target_semantic 或 target_col 不匹配）", tc, skip)
         if len(keep) < 2 and not loo:
             # 非 LOO 允许单用户池（退化为单用户训练的池化封装），但告警
             log.warning("池内仅 %d 个用户，通用模型泛化存疑", len(keep))
@@ -463,7 +499,8 @@ def run_pooled_train(user_keys: list[str], scans: dict, user_cfgs: dict,
         pre: dict[str, dict] = {}
         for uk in keep:
             pre[uk] = _load_user_preprocessed(uk, scans[uk], user_cfgs[uk], base_cfg,
-                                              target_col_override=tc, need_branch=True)
+                                              target_col_override=per_user_specs[uk], need_branch=True)
+            pre[uk]["target_semantic"] = semantic
             log.info("[%s] cap=%.1f on_thr=%.1f n=%d", uk, pre[uk]["cap"],
                      pre[uk]["on_thr_w"], len(pre[uk]["feat"]))
 
@@ -511,17 +548,31 @@ def run_pooled_infer(user_key: str, scan, user_cfg: dict, base_cfg: dict,
     """新用户零样本推理：通用模型 + 本用户 cap/on_thr 校准。"""
     out_root = Path(output_root)
     tc = target_col or (base_cfg.get("pooled") or {}).get("target_col") or "p1"
-    out = _new_outdir(out_root, tc, "infer")
+    pooled_cfg = base_cfg.get("pooled") or {}
+    target_semantic = user_cfg.get("target_semantic") or pooled_cfg.get("target_semantic")
+    target_key = str(target_semantic).strip() if target_semantic else tc
+    if (Path(target_key).name != target_key or "/" in target_key or "\\" in target_key
+            or target_key in {".", ".."}):
+        return PooledResult(Status.FAILED, "target semantic/output key must be a safe single-level name")
+    out = _new_outdir(out_root, target_key, "infer")
     try:
-        train_dir = Path(universal_dir) if universal_dir else latest_universal_dir(out_root, tc, "train")
+        train_dir = Path(universal_dir) if universal_dir else latest_universal_dir(out_root, target_key, "train")
         if train_dir is None or not (train_dir / "meta.json").exists():
             raise PooledTaskError(Status.MODEL_NOT_FOUND,
                                   f"找不到通用模型产物（target_col={tc}）")
         meta = json.loads((train_dir / "meta.json").read_text(encoding="utf-8"))
+        trained_semantic = meta.get("target_semantic")
+        if trained_semantic and not target_semantic:
+            raise PooledTaskError(Status.MODEL_NOT_FOUND,
+                                  "该模型使用 target_semantic 训练；推理用户/基础配置也必须声明同一语义")
+        if trained_semantic and str(trained_semantic).strip() != str(target_semantic).strip():
+            raise PooledTaskError(Status.MODEL_NOT_FOUND,
+                                  f"目标语义不匹配：模型={trained_semantic!r}, 用户配置={target_semantic!r}")
         names = meta["feature_names"]
 
+        infer_target_spec = user_cfg.get("target_col") or tc
         pre = _load_user_preprocessed(user_key, scan, user_cfg, base_cfg,
-                                      target_col_override=tc, need_branch=False)
+                                      target_col_override=infer_target_spec, need_branch=False)
         feat = pre["feat"]
         missing = [c for c in names if c not in feat.columns]
         if missing:

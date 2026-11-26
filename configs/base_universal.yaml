@@ -54,7 +54,8 @@ pooled:
   cap_quantile: 0.95          # cap = pbus 分位数（仅由总线估计，新用户可算）
   val_ratio: 0.2              # train 池内 val 占比
   split_strategy: stratified_by_state
-  target_col: p1              # 默认目标通道；CLI --target-col 覆盖；按 target_col 分组训练
+  target_col: p1              # 旧配置/用户缺省时的目标列；用户显式 target_col 优先用于其标签
+  # target_semantic: device_x_active_power  # 可选共同目标语义；也可在 time_filters.json 的 _default 配置
   # PT/CT 变比（与 on_thr_w 同级，time_filters.json 用户级，默认 1.0）：
   # pt 缩电压（V）、ct 缩电流（A）、有功缩 pt*ct/1000 转 kW，使总线与分路同量级后再算 cap。
   # 质量打分在校正前（二次侧）执行，校正后（一次侧 kW）供 ident/特征/cap。

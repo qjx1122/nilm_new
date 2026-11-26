@@ -593,7 +593,18 @@ outputs/<key>/{train,infer}/<ts>/ + outputs/batch/<ts>/batch_status.csv → 下�
 
 建议先做用户级清单，至少记录 `user_key / target_col及设备语义 / PT·CT / branch_scale / 有效双达标天 / on_thr来源 / 是否有全关日 / 目标功率范围`。按设备类型与工况选有代表性的开发用户；另留至少一个**不参与模型/超参/阈值选择**的最终审计用户。若用户数少，必须在报告中说明结论的外推范围很有限。
 
-`--users` 指定此次池化训练使用的用户；未指定时脚本会扫描 `data/trains` 下所有合法用户。不同 `target_col` 不应混池；当前脚本按列名过滤，配置不一致会跳过用户并写告警。
+`--users` 指定此次池化训练使用的用户；未指定时脚本会扫描 `data/trains` 下所有合法用户。默认兼容旧行为：没有共同语义配置时，脚本仍按任务级 `--target-col`/`pooled.target_col` 筛选同列用户。若各用户列名不同但标签经台账确认代表同一物理目标，可在 `time_filters.json` 的 `_default`（或逐用户）配置相同的 `target_semantic`，同时保留每个用户原有 `target_col`：
+
+```json
+{
+  "_default": {"target_semantic": "device_x_active_power"},
+  "<用户A>": {"target_col": "p1"},
+  "<用户B>": {"target_col": "p2"},
+  "<用户C>": {"target_col": "p1+p2"}
+}
+```
+
+开启语义模式后，训练按每个用户配置的 `target_col` 各自解析标签（仍遵循原有大小写/空格、`+` 求和、缺值传播规则），同一池中用户的 `target_semantic` 必须一致；语义不一致或部分缺失会失败，不会静默合并。训练产物目录使用该规范语义标识，例如 `outputs/universal/device_x_active_power/train/<时间戳>/`，`meta.json` 留存逐用户原始 `target_col` 与解析出的列。推理用户也必须解析到同一 `target_semantic`，并按相同语义定位模型。只有设备范围、计量单位、分路求和口径及阈值均经核实后才可这样配置；设备类别相似本身不足以证明标签等价。无 `target_semantic` 的配置仍走原有按列名筛选/告警路径。
 
 ```powershell
 # 使用三个开发用户做 LOUO；每次轮流把一个完整用户留作 test
