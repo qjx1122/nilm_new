@@ -121,8 +121,10 @@ def test_pooled_task_smoke(tmp_path):
         bus.to_csv(d / f"e241_{device}_{user}-Ch1-260101-260110.csv", index=False)
         idx15 = pd.date_range("2026-01-01", periods=96 * 10, freq="15min")
         on15 = (idx15.hour >= 8) & (idx15.hour < 18)
+        target = np.where(on15, 400.0 * scale, 0.0) + rng.normal(0, 3, len(idx15))
+        # Two physical channels are configured as the same device semantic across users.
         br = pd.DataFrame({"time": idx15.strftime("%Y-%m-%d %H:%M:%S"),
-                           "p1": np.where(on15, 400.0 * scale, 0.0) + rng.normal(0, 3, len(idx15))})
+                           "p1": target, "p2": target})
         br.to_csv(d / f"{user}-260101-260110.csv", index=False)
     # 推理用户：只有总线
     uk_new = "800080270003_4200000000003"
@@ -150,21 +152,30 @@ def test_pooled_task_smoke(tmp_path):
 
     scans = {r.user_key: r for r in scan_root(data_root / "trains", "train") if r.ok}
     assert len(scans) == 2
-    user_cfgs = {uk: {"target_col": "p1", "on_thr_w": 10.0, "split_ratios": [0.6, 0.2, 0.2],
-                      "split_strategy": "stratified_by_state", "post_min_on": 1,
-                      "post_fill_short_off": 3, "branch_scale": 1.0} for uk in scans}
+    user_cfgs = {
+        uk: {"target_col": ("p1" if uk.endswith("0001") else "p2"),
+             "target_semantic": "device_x_active_power",
+             "on_thr_w": 10.0, "split_ratios": [0.6, 0.2, 0.2],
+             "split_strategy": "stratified_by_state", "post_min_on": 1,
+             "post_fill_short_off": 3, "branch_scale": 1.0}
+        for uk in scans
+    }
     out_root = tmp_path / "outputs"
     res = run_pooled_train(sorted(scans.keys()), scans, user_cfgs, base_cfg,
                            out_root, target_col="p1", loo=False)
     assert res.status == "OK", res.message
     assert (Path(res.output_dir) / "meta.json").exists()
+    pooled_meta = __import__("json").loads((Path(res.output_dir) / "meta.json").read_text(encoding="utf-8"))
+    assert pooled_meta["target_semantic"] == "device_x_active_power"
+    assert set(pooled_meta["target_col_by_user"].values()) == {"p1", "p2"}
     assert (Path(res.output_dir) / "models" / "ridge.pkl").exists()
     assert (Path(res.output_dir) / "metrics_by_user.csv").exists()
 
     infer_scans = {r.user_key: r for r in scan_root(data_root / "infers", "infer") if r.ok}
     assert uk_new in infer_scans
     res2 = run_pooled_infer(uk_new, infer_scans[uk_new],
-                            {"target_col": "p1", "on_thr_w": 10.0, "post_min_on": 1,
+                            {"target_col": "p1", "target_semantic": "device_x_active_power",
+                             "on_thr_w": 10.0, "post_min_on": 1,
                              "post_fill_short_off": 3, "branch_scale": 1.0},
                             base_cfg, out_root, target_col="p1")
     assert res2.status == "OK", res2.message

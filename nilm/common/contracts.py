@@ -159,6 +159,8 @@ POSTPROC_MODES = ("auto",)
 CONFIG_RULES: dict[str, dict] = {
     # field: default, validator 说明（具体校验见 pipeline/user_config.py）
     "target_col":            {"default": None},
+    # 规范目标语义：不同用户可使用不同 target_col，但须经业务确认代表同一物理目标。
+    "target_semantic":       {"default": None},
     # 阈值口径 kW（全链路功率 kW）：总线一次侧 kW、分路一次侧 kW、阈值 kW。
     # 支持显式正数或 "auto"（基于训练范围分路功率对数域双峰寻谷自动定阈，黄色/红色日志提示；
     # 硬编码缺省保持 10.0 完全向后兼容，显式配置 100% 优先）。
