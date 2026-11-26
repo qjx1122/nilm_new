@@ -205,6 +205,33 @@ def test_auto_split_prefers_high_quality_days_for_val_and_test():
     assert summary["by_split"]["train"]["tier_c_days"] == 5
 
 
+def test_auto_split_middle_off_day_cluster_preserves_training_coverage():
+    # 15 all-on, 21 mixed (11 off), 14 all-on: contiguous val/test blocks
+    # cannot both cover off-days without extracting nearly the whole middle cluster.
+    idx = pd.date_range("2026-05-21", periods=50 * 96, freq="15min")
+    daily_on = np.ones(50, dtype=bool)
+    daily_on[15:36] = np.array([
+        False, False, True, False, False, False, True, True, False, True, True,
+        False, True, True, False, True, True, False, False, True, False,
+    ])
+    target = pd.Series(np.repeat(np.where(daily_on, 100.0, 0.0), 96), index=idx)
+    masks, meta = resolve_auto_quality_split(idx, [0.6, 0.2, 0.2], target=target, on_thr_w=50.0)
+    _check(masks)
+
+    split_off = {}
+    for name, mask in masks.items():
+        day_mask = pd.Series(mask.to_numpy(), index=idx).groupby(idx.normalize()).any()
+        split_off[name] = sum(
+            not daily_on[(day - idx[0].normalize()).days]
+            for day in day_mask.index[day_mask]
+        )
+    assert meta["train_off_days"] >= 6
+    assert meta["train_off_floor"] == 6
+    assert meta["off_rate_spread"] <= 0.20
+    assert split_off["train"] >= 6
+    assert sum(split_off.values()) == 11
+
+
 @pytest.mark.parametrize("n_off,expected_scarcity,expected_min_off", [
     (0, "zero_off_days", (0, 0, 0)),
     (1, "single_off_day_reserved_for_train", (1, 0, 0)),
