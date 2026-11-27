@@ -1053,6 +1053,17 @@ python scripts/run_batch_users.py --time-filter-config configs/time_filters.json
 - 是否进入 REPORT.md：否（未达标，不入稳定结论）
 - 遗留问题：①778 `ct150 vs 160` 以实跑 `160` 为准，预检期望文本待同步；②`_default` 缺 `pt/ct/branch` 键（靠默认 `1.0` 兜底，建议补显式）；③856离线指标待贴；④`A扩池/B分组` 待拍板
 
+### 补充回归复测（模式 B，用户回传实录；终端显示 2026-11-27）
+
+- **环境/工作树**：PowerShell `test_gpu`，Python 环境显示 torch `2.3.1+cu121`、RTX 3080；分支 `arena/01a0896c-nilm-new`，HEAD `cc9ffd8`。用户本机 `configs/time_filters.json` 有未提交修改及本地备份/数据/outputs 文件，均为用户本地状态，本记录不要求覆盖或清理。
+- **配置实测**：2844 `p2 / pt100 / ct120 / branch1 / on_thr10 / decision_thr200`；778 `p2 / pt100 / ct160 / branch1 / on_thr60 / decision_thr44.16`。因此此前文档中 778 `ct150/on_thr50`、2844 `decision30` 等预期与此次运行配置不同；本轮以终端实测配置为准。两用户都 `target_col=p2`，未见本轮需要不同列映射；训练输出路径 `outputs/universal/CAC_P/...` 暗示启用了规范语义，实际值和逐户映射待用折内 `meta.json` 核实。
+- **数据预处理实录**：trains 扫描 108/108 合法；infers 65 合法/66目录。2844 对齐点 15648、无效日剔 70、day_gate 剔 3、有效样本 `n=4314`、cap `5099.6`；778 对齐点 6766、有效样本 `n=2581`、cap `5441.1`。两用户均出现 `ub/ib/pfb` 字段缺失置 0 告警；需核实是否为源 CSV 本来缺项或 `bus_field_map` 不匹配。2844 清洗后仍记录大量长缺口 NaN，但训练样本阶段剔除 6 行；778 样本阶段剔除 11 行。
+- **非 LOO（`outputs/universal/CAC_P/train/20261127_095421`）**：ridge train `F1=.7736/R²=.8553`、val `.7441/.6410`；transformer train `.9606/.9597`、val `.8110/.6508`，早停 epoch 46。Transformer train-val 落差明显，普通 pooled val 较好不能代替跨用户结论。
+- **LOUO（`outputs/universal/CAC_P/train/20261127_095628`；已检查远端 `output_tmp` 产物）**：两折 `meta.json` 均确认 `target_semantic=CAC_P`，两户均使用 `target_col=p2`、解析列 `p2`；PT/CT 为 2844 `100/120`、778 `100/160`，`on_thr_map` 为 `10/60`。顶层 `meta.json.target_col` 却显示 `p1`（基础配置默认值），与逐用户映射不一致；解释时应以 `target_col_by_user/target_cols_by_user` 为准，后续宜修正 metadata 字段避免误导。
+- 留 2844：ridge test `F1=.5188/R²=-9.0820`，Transformer `.5684/.1374`。混淆数显示 Ridge `TP=1509, FP=2798, FN=1, TN=6`，Transformer `1510/2293/0/511`，均严重偏向判开。留 778：Ridge `F1=.4629/R²=-.3101`、`TP=387, FP=0, FN=898, TN=1296`；Transformer `F1=0/R²=-.7006`、`TP=0, FP=0, FN=1285, TN=1296`，完全漏掉开机点。汇总 ridge `F1 mean=.4909/min=.4629, R² mean=-4.6960`；Transformer `F1 mean=.2842/min=0, R² mean=-.2816`。**LOUO 未通过泛化门槛；两方向呈相反状态偏置，Transformer 在留 778 折全关塌缩。**
+- `decision_thr_w` 的 200/44.16 不用于 pooled LOUO 这里的 `F1`（评估按每户 `on_thr_w` 判真值和模型状态）；不能靠改 `decision_thr_w` 修复此 LOUO 分数。用户阈值 `on_thr_w=10/60` 的巨大差异会影响状态标签定义，应核对物理意义，但负 R² 说明回归幅值问题也存在。
+- **下一步（不据此盲调超参）**：先核实 `ub/ib/pfb` 是否应当存在于两户源 CSV；两折 scaler 中这几列是常量零输入，若因字段映射错误而丢失信息，应先修正字段契约并重跑基线。再统计两户 p2 真值零值率、分位数、最大值、开机功率区间，并核查 on_thr 与单位/设备范围。仅有两用户时每折训练集只含另一户，不足以有效调参；下一轮应从 108 个合法训练目录、94 个配置用户中筛选更多同一真实目标语义与量纲的候选户，并保留独立审计户。若扩池后仍明显按容量/阈值分层，拆分适用范围另建池；不可反复在这两户 LOUO 上挑参并宣称无偏泛化。
+
 
 ## [2026-09-10] 专题：五大核心参数（pbus_mode / on_thr_w / decision_thr_w / post_min_on / post_fill_short_off）自动定参体系架构与典型用户实证边界专题分析
 
